@@ -1,34 +1,24 @@
-#this code will login to the root ip and will recursively lldp across all the neighbors until it reaches #a non-cisco ip that it cannot ssh into, it will log it as child and move forward. 
-
-#written by yazan (yazanh@google.com)
-
 #!/usr/bin/env python3
 import paramiko
 import time
 import re
 import json
 
-# ─── USER CONFIGURATION ────────────────────────────────────────────────────────
+# ─── USER CONFIG ─────────────────────────────────────────────────────────────
 USERNAME = "admin"
 PASSWORD = "cisco"
 ROOT_IP  = "192.168.1.1"
-TIMEOUT  = 10           # seconds to wait for prompts
-MAX_READ = 65535        # max bytes to read per recv()
-# ────────────────────────────────────────────────────────────────────────────────
+TIMEOUT  = 10
+MAX_READ = 65535
+# ───────────────────────────────────────────────────────────────────────────────
 
 visited = set()
 
 def expect_prompt(shell, patterns, timeout=TIMEOUT):
-    """
-    Read until one of the given patterns appears in the buffer or timeout.
-    Returns everything read.
-    """
-    buff = ""
-    end_time = time.time() + timeout
-    while time.time() < end_time:
+    buff, end = "", time.time()+timeout
+    while time.time()<end:
         if shell.recv_ready():
-            data = shell.recv(MAX_READ).decode("utf-8", errors="ignore")
-            buff += data
+            buff += shell.recv(MAX_READ).decode("utf-8","ignore")
             for p in patterns:
                 if p in buff:
                     return buff
@@ -36,25 +26,38 @@ def expect_prompt(shell, patterns, timeout=TIMEOUT):
             time.sleep(0.1)
     return buff
 
-def send_cmd(shell, cmd, patterns=("#", ">"), timeout=TIMEOUT):
-    """
-    Send a command and wait for one of the patterns to appear.
-    """
-    shell.send(cmd + "\n")
+def send_cmd(shell, cmd, patterns=("#",">"), timeout=TIMEOUT):
+    shell.send(cmd+"\n")
     return expect_prompt(shell, patterns, timeout)
 
 def connect_switch(ip):
-    """
-    SSH to the given switch IP, disable paging, and return (client, shell).
-    """
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(ip, username=USERNAME, password=PASSWORD,
                    look_for_keys=False, allow_agent=False)
     shell = client.invoke_shell()
-    expect_prompt(shell, patterns=("#", ">"))
+    expect_prompt(shell, patterns=("#",">"))
     send_cmd(shell, "terminal length 0", patterns=("#",))
     return client, shell
+
+def get_root_name(shell):
+    """
+    Send a blank line to elicit the prompt (e.g. 'SW1#'), then
+    capture output and parse the hostname from the prompt.
+    """
+    # send a newline to cause the switch to re-display its prompt
+    shell.send("\n")
+    buff = expect_prompt(shell, patterns=("#", ">"), timeout=5)
+
+    # scan from the bottom up for a prompt line
+    for line in reversed(buff.splitlines()):
+        line = line.strip()
+        m = re.match(r"^([^#>]+)[#>]", line)
+        if m:
+            return m.group(1)
+
+    # fallback
+    return ROOT_IP
 
 def hop_to_neighbor(shell, ip):
     """
@@ -141,16 +144,36 @@ def build_topology(shell, ip):
 
     return topo
 
+def get_hostname(shell):
+    """
+    Runs 'show run | include ^hostname' on the current shell
+    and returns the parsed hostname.
+    """
+    out = send_cmd(shell, "show running-config | include ^hostname", patterns=("#",), timeout=5)
+    # out will look like 'hostname SW1\n\r\nSW1#'
+    m = re.search(r"hostname\s+(\S+)", out)
+    return m.group(1) if m else ROOT_IP
+
+
 if __name__ == "__main__":
     visited.add(ROOT_IP)
     client, shell = connect_switch(ROOT_IP)
 
-    full_topo = { ROOT_IP: build_topology(shell, ROOT_IP) }
+    # 1) pull the hostname from the prompt
+    root_name = get_root_name(shell)
+
+    # 2) build the LLDP topology
+    neighbors = build_topology(shell, ROOT_IP)
     client.close()
 
-    with open("topology.json", "w") as f:
+    # 3) assemble and write out JSON
+    full_topo = {
+        root_name: {
+            "management_ip": ROOT_IP,
+            "neighbors":     neighbors
+        }
+    }
+    with open("topology.json","w") as f:
         json.dump(full_topo, f, indent=2)
 
-    print("✅ Topology written to topology.json")
-
-
+    print(f"✅ Topology written for root switch '{root_name}'")
