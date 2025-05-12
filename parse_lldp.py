@@ -1,3 +1,32 @@
+"""
+intent:
+learn the network topology by logging to a root switch on aggregate or core layer, all connection wil be done from the root switch, the topology will be formatted in json format
+
+==============
+|    core    |________________
+==============                \
+       |                        \
+================        ================
+| distribution |--------| distribution |. . . . . . 
+================        ================
+        |                        |
+================        =================
+|    access    |        |     access    | . . . . . .
+================        =================
+        |                        |
+    ========                 ==========
+    |device|                 | device | . . . . . . .
+    ========                 ==========
+
+
+code flow:
+
+1- login to core switch 
+2- from core learn the name of the root as well as the neighbors -> issue command #show lldp neighbor detail, save output into array 
+3- login to every neighbor distribution/access and identify -> cisco switch -> ssh to that -> issue show lldp neighbor -> end device found, log that and ssh to distribution/access, log done device so they dont repeat
+4- dump output to json file
+
+"""
 #!/usr/bin/env python3
 import paramiko
 import time
