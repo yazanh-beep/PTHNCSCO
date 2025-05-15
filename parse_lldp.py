@@ -1,32 +1,177 @@
-"""
-intent:
-learn the network topology by logging to a root switch on aggregate or core layer, all connection wil be done from the root switch, the topology will be formatted in json format
+'''
+This script drives a single Paramiko shell on your root Cisco switch, crawling LLDP neighbors, hopping SSH from switch to switch, gathering VLAN, version, serial info on first visit, and building a nested JSON map of your Cisco LLDP topology—all fully automated via Python.
 
-==============
-|    core    |________________
-==============                \
-       |                        \
-================        ================
-| distribution |--------| distribution |. . . . . . 
-================        ================
-        |                        |
-================        =================
-|    access    |        |     access    | . . . . . .
-================        =================
-        |                        |
-    ========                 ==========
-    |device|                 | device | . . . . . . .
-    ========                 ==========
+1. Configuration & Global State
+python
+Copy
+Edit
+USERNAME = "admin"
+PASSWORD = "cisco"
+ROOT_IP  = "192.168.1.1"
+TIMEOUT  = 10
+MAX_READ = 65535
 
+visited = set()
+Credentials and root switch IP are hard-coded.
 
-code flow:
+visited tracks which management IPs have already been crawled to avoid loops.
 
-1- login to core switch 
-2- from core learn the name of the root as well as the neighbors -> issue command #show lldp neighbor detail, save output into array 
-3- login to every neighbor distribution/access and identify -> cisco switch -> ssh to that -> issue show lldp neighbor -> end device found, log that and ssh to distribution/access, log done device so they dont repeat
-4- dump output to json file
+2. Core SSH Helpers
+expect_prompt(shell, patterns, timeout)
+Reads from the Paramiko shell until one of the given prompt strings (e.g. "#", ">") appears, or until the timeout.
 
-"""
+Buffers all received text so multi-line prompts or error messages can be matched.
+
+send_cmd(shell, cmd, patterns, timeout)
+Sends cmd + "\n" to the shell.
+
+Calls expect_prompt() to wait for the next prompt.
+
+Returns the full output, which the caller can parse.
+
+3. Initial Connection
+connect_switch(ip)
+SSHes from your PC into the root switch at ip.
+
+Invokes an interactive shell.
+
+Disables paging with terminal length 0 so long outputs stream without --More-- pauses.
+
+Returns the Paramiko client and shell for further commands.
+
+4. Prompt‐Based Hostname
+get_root_name(shell)
+Sends a blank line to redraw the prompt (e.g. SW1#).
+
+Scans the returned buffer backwards to find the first line ending in # or >, and treats the text before it as the hostname.
+
+Falls back to ROOT_IP if parsing fails.
+
+5. In-Shell Neighbor Hopping
+hop_to_neighbor(shell, ip)
+From the current switch’s CLI, runs ssh -l admin <ip>.
+
+Answers any “yes/no” host-key prompt.
+
+Sends the password when asked.
+
+If it lands in user-exec (>), issues enable + the same password to get into privileged mode (#).
+
+Disables paging again on the neighbor.
+
+Leaves you at the neighbor’s # prompt, ready for further commands, all within the same Paramiko shell.
+
+6. LLDP Parsing
+parse_lldp_detail(raw)
+Splits the output of show lldp neighbors detail on dashed separators (------…).
+
+For each block containing Local Intf:, extracts:
+
+Local interface
+
+Port ID
+
+Remote system name
+
+System description (for filtering)
+
+Management IP
+
+Returns a list of neighbor dictionaries.
+
+7. Recursive Topology Assembly
+build_topology(shell, ip)
+Log & Hostname
+
+Prints [INFO] Mapping <ip>
+
+Determines the device’s hostname from the prompt.
+
+First-Visit Data Collection
+
+If ip not in visited:
+
+Adds it to visited.
+
+Collects:
+
+show interface vlan 100 → VLAN-100 IP/subnet & MAC
+
+show version → IOS version & system serial
+
+Otherwise skips those.
+
+LLDP Neighbor Discovery
+
+Always runs show lldp neighbors detail
+
+Parses into all_nbrs and prints the raw list for debugging.
+
+Filter & Recurse
+
+python
+Copy
+Edit
+if (n["mgmt_ip"]
+    and "cisco" in n["sys_descr"].lower()
+    and n["mgmt_ip"] not in visited):
+    # hop & recurse
+Skips neighbors without a management IP.
+
+Skips non-Cisco devices (sys_descr must contain “cisco”).
+
+Skips already-visited IPs.
+
+For each remaining neighbor:
+
+Calls hop_to_neighbor() to SSH into it.
+
+Recursively calls build_topology() on that IP.
+
+(Optional) Would exit back up—though the exit line is currently commented out, so the script stays at the deepest level.
+
+Return Structure
+
+Builds a list of entries with:
+
+json
+Copy
+Edit
+{
+  "local_interface": "...",
+  "remote_name":     "...",
+  "remote_port":     "...",
+  "port_description":"...",    # if parsed
+  "management_ip":   "...",
+  "system_description":"...",
+  "neighbors":      [ ... ]    # recursively built
+}
+Returns the list as topo under each recursion.
+
+8. Main Execution
+python
+Copy
+Edit
+if __name__ == "__main__":
+    visited.add(ROOT_IP)
+    client, shell = connect_switch(ROOT_IP)
+    root_name = get_root_name(shell)
+    neighbors = build_topology(shell, ROOT_IP)
+    client.close()
+    # Assemble JSON:
+    # { "<root-name>": { "management_ip": ROOT_IP, "neighbors": [ ... ] } }
+    with open("topology.json","w") as f:
+        json.dump({root_name: {"management_ip": ROOT_IP, "neighbors": neighbors}}, f, indent=2)
+    print(f"✅ Topology written for root switch '{root_name}'")
+SSHes once into the root switch.
+
+Populates visited with the root IP.
+
+Discovers and parses the entire topology recursively.
+
+Dumps the final nested structure to topology.json.
+
+'''
 #!/usr/bin/env python3
 import paramiko
 import time
