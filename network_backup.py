@@ -273,6 +273,36 @@ Edit
 containing the full show running-config output.
 
 """
+#!/usr/bin/env python3
+
+import paramiko
+import time
+import re
+
+# USER CONFIG
+AGG_IP = "192.168.1.1"           # The aggregation switch (jump host)
+USERNAME = "admin"
+PASSWORD = "cisco"
+TARGET_SWITCHES = [
+"10.2.129.62", "10.2.129.82",  "10.21.129.82"
+]
+TIMEOUT = 10
+MAX_READ = 65535
+
+# Utility to wait for CLI prompt
+def expect_prompt(shell, patterns=("#", ">"), timeout=TIMEOUT):
+    buf, end = "", time.time() + timeout
+    while time.time() < end:
+        if shell.recv_ready():
+            data = shell.recv(MAX_READ).decode("utf-8", "ignore")
+            buf += data
+            for p in patterns:
+                if p in buf:
+                    return buf
+        else:
+            time.sleep(0.1)
+    return buf
+
 # Send command + wait for prompt
 def send_cmd(shell, cmd, patterns=("#", ">"), timeout=TIMEOUT):
     shell.send(cmd + "\n")
@@ -340,4 +370,5 @@ if __name__ == "__main__":
 
     client.close()
     print("\nAll backups completed.")
+
 
