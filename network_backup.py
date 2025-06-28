@@ -1,19 +1,19 @@
 """
-🟣 1️⃣ Imports
+Imports
 python
 Copy
 Edit
 import paramiko
 import time
 import re
-✅ paramiko is the SSH library (for Python).
-✅ time is used for timeouts and sleep loops.
-✅ re is for regular expressions (prompt matching etc.).
+paramiko is the SSH library (for Python).
+time is used for timeouts and sleep loops.
+re is for regular expressions (prompt matching etc.).
 
 Why?
 Paramiko gives you programmatic SSH. It can open an interactive shell session on the agg-switch, just like you would manually.
 
-🟣 2️⃣ User Configuration Section
+User Configuration Section
 python
 Copy
 Edit
@@ -27,7 +27,7 @@ TARGET_SWITCHES = [
 ]
 TIMEOUT = 10
 MAX_READ = 65535
-✅ These variables define all your inputs:
+These variables define all your inputs:
 
 AGG_IP – IP address of the aggregation switch. Your PC only connects to this.
 
@@ -39,7 +39,7 @@ TIMEOUT – How long to wait for prompts.
 
 MAX_READ – How much data to buffer from SSH output.
 
-🟣 3️⃣ expect_prompt() function
+expect_prompt() function
 python
 Copy
 Edit
@@ -55,10 +55,10 @@ def expect_prompt(shell, patterns=("#", ">"), timeout=TIMEOUT):
         else:
             time.sleep(0.1)
     return buf
-✅ Purpose:
+Purpose:
 Waits for the CLI prompt in an interactive shell.
 
-✅ How it works:
+How it works:
 
 Continuously reads SSH output.
 
@@ -68,20 +68,20 @@ Checks if any of the patterns (e.g. #, >, assword:) is seen in the output.
 
 Returns the entire buffer when it sees the prompt.
 
-✅ Why?
+Why?
 You can't just "send a command and hope it finishes". You have to know when the switch CLI is ready for the next command. This waits until it sees a known prompt.
 
-🟣 4️⃣ send_cmd()
+send_cmd()
 python
 Copy
 Edit
 def send_cmd(shell, cmd, patterns=("#", ">"), timeout=TIMEOUT):
     shell.send(cmd + "\n")
     return expect_prompt(shell, patterns, timeout)
-✅ Purpose:
+Purpose:
 Sends a command to the interactive shell, and waits for the prompt.
 
-✅ How it works:
+How it works:
 
 Sends the command (with newline).
 
@@ -89,7 +89,7 @@ Calls expect_prompt() to wait until the switch finishes and shows prompt again.
 
 Returns all output (including command echo and results).
 
-✅ Why?
+Why?
 So you can sequentially automate CLI commands like:
 
 pgsql
@@ -103,7 +103,7 @@ enable
 password
 terminal length 0
 show running-config
-🟣 5️⃣ connect_to_agg()
+connect_to_agg()
 python
 Copy
 Edit
@@ -119,30 +119,30 @@ def connect_to_agg():
     send_cmd(shell, PASSWORD, patterns=("#",))
     send_cmd(shell, "terminal length 0", patterns=("#",))
     return client, shell
-✅ Purpose:
+Purpose:
 Log in to the aggregation switch from your PC, and prepare the CLI for use.
 
-✅ Step by step:
-1️⃣ Creates SSH client and ignores missing host key checks.
-2️⃣ Connects using AGG_IP, USERNAME, PASSWORD.
-3️⃣ Invokes an interactive shell.
-4️⃣ Waits for initial prompt.
-5️⃣ Enters enable mode (and handles password prompt).
-6️⃣ Turns off paging with terminal length 0.
+Step by step:
+Creates SSH client and ignores missing host key checks.
+Connects using AGG_IP, USERNAME, PASSWORD.
+Invokes an interactive shell.
+Waits for initial prompt.
+Enters enable mode (and handles password prompt).
+Turns off paging with terminal length 0.
 
-✅ Why?
+Why?
 This sets up your jump host session, so you can issue commands from within the agg-switch CLI to hop to other switches.
 
-🟣 6️⃣ get_running_config()
+get_running_config()
 python
 Copy
 Edit
 def get_running_config(shell, target_ip):
     ...
-✅ Purpose:
+Purpose:
 SSH from inside the agg-switch CLI to the target switch, run show running-config, and capture the output.
 
-✅ Detailed steps:
+Detailed steps:
 
 ➜ A. SSH from agg-switch to target
 python
@@ -203,9 +203,9 @@ Edit
 send_cmd(shell, "exit", ...)
 Closes the CLI SSH session to target, returning to agg-switch prompt.
 
-✅ Returns the entire running-config output as a single string.
+Returns the entire running-config output as a single string.
 
-🟣 7️⃣ Main script block
+Main script block
 python
 Copy
 Edit
@@ -215,8 +215,8 @@ if __name__ == "__main__":
     for target in TARGET_SWITCHES:
         ...
     client.close()
-    print("\n✅ All backups completed.")
-✅ Purpose:
+    print("\n All backups completed.")
+Purpose:
 
 Establishes SSH connection from your PC to the agg-switch.
 
@@ -264,7 +264,7 @@ except Exception as e:
     print(f"[ERROR] Failed to backup {target}: {e}")
 Catches and logs errors per target, without stopping the whole process.
 
-✅ Example File Output
+Example File Output
 For switch 10.1.1.2, you'd get:
 
 Copy
