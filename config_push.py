@@ -14,24 +14,16 @@ Enter config mode, send all config commands from file (in order), then issue do 
 Exit back to agg, continue to next device.
 
 Sample Usage
-sh
-Copy
-Edit
 python3 push_config.py devices.txt commands.txt
 Where:
 
 devices.txt contains:
 
-Copy
-Edit
 10.2.129.62
 10.2.129.82
 10.21.129.82
 commands.txt contains:
 
-kotlin
-Copy
-Edit
 interface GigabitEthernet1/0/10
 shutdown
 description TEST-AUTOMATION
