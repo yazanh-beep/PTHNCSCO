@@ -198,7 +198,7 @@ $ python3 mac_lldp_crawl.py
 ...
 [HOP] to neighbor 192.168.1.9
 ...
-✅ MAC table crawl complete; output in mac_tables.json
+MAC table crawl complete; output in mac_tables.json
 Open mac_tables.json to inspect structured tables for each switch.
 
 7. Next-Steps & Extensions
@@ -386,4 +386,4 @@ if __name__ == "__main__":
     with open("mac_tables.json", "w") as f:
         json.dump(mac_tables, f, indent=2)
 
-    print("\n✅ MAC table crawl complete; output in mac_tables.json")
+    print("\nMAC table crawl complete; output in mac_tables.json")
