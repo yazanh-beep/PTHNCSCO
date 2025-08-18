@@ -1,296 +1,74 @@
-"""
-Imports
-python
-Copy
-Edit
-import paramiko
-import time
-import re
-paramiko is the SSH library (for Python).
-time is used for timeouts and sleep loops.
-re is for regular expressions (prompt matching etc.).
+'''
+Purpose
 
-Why?
-Paramiko gives you programmatic SSH. It can open an interactive shell session on the agg-switch, just like you would manually.
+This script logs into a root Cisco switch, then SSH-hops to its LLDP neighbors (Cisco only). On the first visit to each device, it captures show running-config and saves it locally as:
 
-User Configuration Section
-python
-Copy
-Edit
-AGG_IP = "192.168.1.1"           # The aggregation switch (jump host)
-USERNAME = "admin"
-PASSWORD = "cisco"
-TARGET_SWITCHES = [
-    "10.1.1.2",
-    "10.1.1.3",
-    "10.1.1.4",
-]
-TIMEOUT = 10
-MAX_READ = 65535
-These variables define all your inputs:
+backups/YYYY-MM-DD_<management-ip>_<hostname>.txt
 
-AGG_IP – IP address of the aggregation switch. Your PC only connects to this.
 
-USERNAME/PASSWORD – SSH credentials. Used for the agg-switch and also when hopping to target switches.
+It prevents loops with a visited set and returns to the parent device after each hop.
 
-TARGET_SWITCHES – List of IPs of the switches whose configs you want.
+Features
 
-TIMEOUT – How long to wait for prompts.
+Single Paramiko session to the root device; all other hops occur device-to-device.
 
-MAX_READ – How much data to buffer from SSH output.
+Auto-elevation to privileged EXEC (enable) on each device.
 
-expect_prompt() function
-python
-Copy
-Edit
-def expect_prompt(shell, patterns=("#", ">"), timeout=TIMEOUT):
-    buf, end = "", time.time() + timeout
-    while time.time() < end:
-        if shell.recv_ready():
-            data = shell.recv(MAX_READ).decode("utf-8", "ignore")
-            buf += data
-            for p in patterns:
-                if p in buf:
-                    return buf
-        else:
-            time.sleep(0.1)
-    return buf
-Purpose:
-Waits for the CLI prompt in an interactive shell.
+Paging disabled (terminal length 0) before long outputs.
 
-How it works:
+Robust LLDP parsing heuristic to find management IP, system name, and system description.
 
-Continuously reads SSH output.
+Skips:
 
-Appends data to buf.
+Devices already visited
 
-Checks if any of the patterns (e.g. #, >, assword:) is seen in the output.
+Neighbors without management IP
 
-Returns the entire buffer when it sees the prompt.
+Non-Cisco neighbors (based on system description)
 
-Why?
-You can't just "send a command and hope it finishes". You have to know when the switch CLI is ready for the next command. This waits until it sees a known prompt.
+Backups are time-stamped and sanitized for filesystem safety.
 
-send_cmd()
-python
-Copy
-Edit
-def send_cmd(shell, cmd, patterns=("#", ">"), timeout=TIMEOUT):
-    shell.send(cmd + "\n")
-    return expect_prompt(shell, patterns, timeout)
-Purpose:
-Sends a command to the interactive shell, and waits for the prompt.
+Requirements
+Environment
 
-How it works:
+Python 3.8+
 
-Sends the command (with newline).
+paramiko library
 
-Calls expect_prompt() to wait until the switch finishes and shows prompt again.
+pip install paramiko
 
-Returns all output (including command echo and results).
 
-Why?
-So you can sequentially automate CLI commands like:
+If your environment requires legacy KEX/ciphers (older Cisco images), you may need to adjust Paramiko’s SSH negotiation preferences in code or upgrade device crypto settings.
 
-pgsql
-Copy
-Edit
-ssh -l admin 10.1.1.2
-<wait for password prompt>
-password
-<wait for prompt>
-enable
-password
-terminal length 0
-show running-config
-connect_to_agg()
-python
-Copy
-Edit
-def connect_to_agg():
-    print(f"[CONNECT] SSH to aggregation switch: {AGG_IP}")
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(AGG_IP, username=USERNAME, password=PASSWORD,
-                   look_for_keys=False, allow_agent=False, timeout=10)
-    shell = client.invoke_shell()
-    expect_prompt(shell, ("#", ">"))
-    send_cmd(shell, "enable", patterns=("assword:", "#"))
-    send_cmd(shell, PASSWORD, patterns=("#",))
-    send_cmd(shell, "terminal length 0", patterns=("#",))
-    return client, shell
-Purpose:
-Log in to the aggregation switch from your PC, and prepare the CLI for use.
+Network Assumptions
 
-Step by step:
-Creates SSH client and ignores missing host key checks.
-Connects using AGG_IP, USERNAME, PASSWORD.
-Invokes an interactive shell.
-Waits for initial prompt.
-Enters enable mode (and handles password prompt).
-Turns off paging with terminal length 0.
+You can SSH to the root switch from your workstation.
 
-Why?
-This sets up your jump host session, so you can issue commands from within the agg-switch CLI to hop to other switches.
+From that switch, you can SSH to neighbor switches (in-band device-to-device SSH is allowed).
 
-get_running_config()
-python
-Copy
-Edit
-def get_running_config(shell, target_ip):
-    ...
-Purpose:
-SSH from inside the agg-switch CLI to the target switch, run show running-config, and capture the output.
+The enable password equals the login password (or adjust the code).
 
-Detailed steps:
-
-➜ A. SSH from agg-switch to target
-python
-Copy
-Edit
-out = send_cmd(shell, f"ssh -l {USERNAME} {target_ip}", ...)
-Runs Cisco CLI command:
-
-nginx
-Copy
-Edit
-ssh -l admin 10.1.1.2
-Expects prompts for "yes/no", "password", errors, #, >.
-
-➜ B. Handle host-key confirmation
-python
-Copy
-Edit
-if "(yes/no)?" in out or "yes/no" in out:
-    out = send_cmd(shell, "yes", ...)
-Answers "yes" if asked to confirm the remote SSH key.
-
-➜ C. Handle password prompt
-python
-Copy
-Edit
-if "assword:" in out:
-    out = send_cmd(shell, PASSWORD, ...)
-Sends the password when prompted.
-
-➜ D. Enter enable mode if needed
-python
-Copy
-Edit
-if out.strip().endswith(">"):
-    send_cmd(shell, "enable", ...)
-    send_cmd(shell, PASSWORD, ...)
-If landed in user-exec mode (>), promotes to enable mode (#).
-
-➜ E. Disable paging on target
-python
-Copy
-Edit
-send_cmd(shell, "terminal length 0", ...)
-Avoids --More-- pagination when collecting large configs.
-
-➜ F. Run show running-config
-python
-Copy
-Edit
-running_config = send_cmd(shell, "show running-config", ...)
-Gets the entire configuration output.
-
-➜ G. Exit back to aggregation switch
-python
-Copy
-Edit
-send_cmd(shell, "exit", ...)
-Closes the CLI SSH session to target, returning to agg-switch prompt.
-
-Returns the entire running-config output as a single string.
-
-Main script block
-python
-Copy
-Edit
-if __name__ == "__main__":
-    client, shell = connect_to_agg()
-
-    for target in TARGET_SWITCHES:
-        ...
-    client.close()
-    print("\n All backups completed.")
-Purpose:
-
-Establishes SSH connection from your PC to the agg-switch.
-
-Opens the interactive shell.
-
-Loops over each target switch in the list.
-
-Calls get_running_config() to SSH hop from agg → target, run commands, and get config.
-
-Saves output to a local text file.
-
-Closes the SSH session at the end.
-
-➜ Target loop
-python
-Copy
-Edit
-for target in TARGET_SWITCHES:
-    ...
-Iterates over your list of switches.
-
-➜ Calling get_running_config
-python
-Copy
-Edit
-config_output = get_running_config(shell, target)
-Runs the entire hopping logic.
-
-➜ Saving to file
-python
-Copy
-Edit
-fname = f"{target.replace('.', '_')}_running_config.txt"
-with open(fname, "w") as f:
-    f.write(config_output)
-Replaces dots in IP with underscores for filenames.
-
-Saves config output to uniquely named text file.
-
-➜ Error Handling
-python
-Copy
-Edit
-except Exception as e:
-    print(f"[ERROR] Failed to backup {target}: {e}")
-Catches and logs errors per target, without stopping the whole process.
-
-Example File Output
-For switch 10.1.1.2, you'd get:
-
-Copy
-Edit
-10_1_1_2_running_config.txt
-containing the full show running-config output.
-
-"""
+show lldp neighbors detail is enabled and populated across your Cisco estate.'''
 #!/usr/bin/env python3
-
 import paramiko
 import time
 import re
+import os
+from pathlib import Path
 
-# USER CONFIG
-AGG_IP = "192.168.1.1"           # The aggregation switch (jump host)
-USERNAME = "admin"
-PASSWORD = "cisco"
-TARGET_SWITCHES = [
-"10.2.129.62", "10.2.129.82",  "10.21.129.82"
-]
-TIMEOUT = 10
-MAX_READ = 65535
+# ─── USER CONFIG ─────────────────────────────────────────────────────────────
+USERNAME  = "admin"
+PASSWORD  = "cisco"
+ROOT_IP   = "192.168.1.1"
+TIMEOUT   = 10
+MAX_READ  = 65535
+BACKUP_DIR = Path("backups")
+DATE_STR   = time.strftime("%Y-%m-%d")  # file date component
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Utility to wait for CLI prompt
-def expect_prompt(shell, patterns=("#", ">"), timeout=TIMEOUT):
+visited = set()
+
+def expect_prompt(shell, patterns, timeout=TIMEOUT):
     buf, end = "", time.time() + timeout
     while time.time() < end:
         if shell.recv_ready():
@@ -303,72 +81,152 @@ def expect_prompt(shell, patterns=("#", ">"), timeout=TIMEOUT):
             time.sleep(0.1)
     return buf
 
-# Send command + wait for prompt
-def send_cmd(shell, cmd, patterns=("#", ">"), timeout=TIMEOUT):
+def send_cmd(shell, cmd, patterns=("#", ">"), timeout=TIMEOUT, sensitive=False):
+    if not sensitive:
+        print(f"[CMD] {cmd}")
     shell.send(cmd + "\n")
-    return expect_prompt(shell, patterns, timeout)
+    out = expect_prompt(shell, patterns, timeout)
+    last = out.splitlines()[-1] if out else "<no output>"
+    if not sensitive:
+        print(f"[OUT] {last}")
+    return out
 
-# Connect from PC to aggregation switch
-def connect_to_agg():
-    print(f"[CONNECT] SSH to aggregation switch: {AGG_IP}")
+def connect_switch(ip):
+    """SSH from PC into the root switch, enable + disable paging."""
+    print(f"[CONNECT] → {ip}")
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(AGG_IP, username=USERNAME, password=PASSWORD,
+    client.connect(ip, username=USERNAME, password=PASSWORD,
                    look_for_keys=False, allow_agent=False, timeout=10)
     shell = client.invoke_shell()
     expect_prompt(shell, ("#", ">"))
     send_cmd(shell, "enable", patterns=("assword:", "#"))
-    send_cmd(shell, PASSWORD, patterns=("#",))
+    send_cmd(shell, PASSWORD, patterns=("#",), sensitive=True)
     send_cmd(shell, "terminal length 0", patterns=("#",))
     return client, shell
 
-# From agg-shell, SSH to target, get running-config, return output
-def get_running_config(shell, target_ip):
-    print(f"\n[HOP] ssh to {target_ip}")
-    out = send_cmd(shell, f"ssh -l {USERNAME} {target_ip}",
-                    patterns=("Destination","(yes/no)?","assword:","%","#",">"),
-                    timeout=15)
-
+def hop_to_neighbor(shell, ip):
+    """SSH from inside current device shell into <ip>, then enable + disable paging."""
+    print(f"[HOP] ssh → {ip}")
+    out = send_cmd(shell, f"ssh -l {USERNAME} {ip}",
+                   patterns=("Destination","(yes/no)?","assword:","%","#",">"),
+                   timeout=20)
     if "(yes/no)?" in out or "yes/no" in out:
         out = send_cmd(shell, "yes", patterns=("assword:","%","#",">"), timeout=15)
     if "assword:" in out:
-        out = send_cmd(shell, PASSWORD, patterns=("%","#",">"), timeout=15)
+        out = send_cmd(shell, PASSWORD, patterns=("%","#",">"), timeout=15, sensitive=True)
     if out.strip().endswith(">"):
         send_cmd(shell, "enable", patterns=("assword:","#"), timeout=15)
-        send_cmd(shell, PASSWORD, patterns=("#",), timeout=15)
-
+        send_cmd(shell, PASSWORD, patterns=("#",), timeout=15, sensitive=True)
     send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
-    print(f"[CONNECTED] at {target_ip}#")
+    print(f"[HOP] now at {ip}#\n")
 
-    # Run show running-config
-    print("[INFO] Running 'show running-config'")
-    running_config = send_cmd(shell, "show running-config", patterns=("#",), timeout=30)
+def get_hostname(shell):
+    """Extract the hostname from the current prompt (e.g. 'SW1#')."""
+    shell.send("\n")
+    buff = expect_prompt(shell, ("#", ">"), timeout=5)
+    for line in reversed(buff.splitlines()):
+        if m := re.match(r"^([^#>]+)[#>]", line.strip()):
+            return m.group(1)
+    return "unknown"
 
-    # Exit back to agg-switch
-    send_cmd(shell, "exit", patterns=("#",">"), timeout=5)
-    print(f"[EXITED] back to aggregation switch prompt")
+def parse_lldp_detail(raw):
+    """Parse 'show lldp neighbors detail' into a list of neighbor dicts."""
+    nbrs = []
+    blocks = re.split(r"^-{2,}", raw, flags=re.M)
+    for blk in blocks:
+        if "Local Intf:" not in blk:
+            continue
+        entry = {
+            "local_intf":    None,
+            "port_id":       None,
+            "remote_name":   None,
+            "mgmt_ip":       None,
+            "sys_descr":     ""
+        }
+        if m := re.search(r"Local Intf:\s*(\S+)", blk):
+            entry["local_intf"] = m.group(1)
+        if m := re.search(r"Port id:\s*(\S+)", blk, re.IGNORECASE):
+            entry["port_id"] = m.group(1)
+        if m := re.search(r"System Name:\s*(\S+)", blk, re.IGNORECASE):
+            entry["remote_name"] = m.group(1)
+        if m := re.search(r"System Description:\s*([\s\S]+?)\n\s*\n", blk, re.IGNORECASE):
+            entry["sys_descr"] = m.group(1).strip()
+        if m := re.search(
+            r"Management Addresses:[\s\S]*?IP:\s*(\d+\.\d+\.\d+\.\d+)",
+            blk, re.IGNORECASE
+        ):
+            entry["mgmt_ip"] = m.group(1)
+        nbrs.append(entry)
+    return nbrs
 
-    return running_config
+def sanitize_filename(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_")
+
+def backup_running_config(shell, mgmt_ip: str, hostname: str):
+    """Run 'show running-config' and save to backups/YYYY-MM-DD_ip_hostname.txt."""
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    safe_host = sanitize_filename(hostname) or "unknown"
+    fn = BACKUP_DIR / f"{DATE_STR}_{mgmt_ip}_{safe_host}.txt"
+    print(f"[BACKUP] {hostname} ({mgmt_ip}) → {fn}")
+    # Some devices page anyway; make sure paging is off before the dump
+    send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
+    # Running config can be long; allow generous timeout
+    raw = send_cmd(shell, "show running-config", patterns=("#",), timeout=90)
+    with open(fn, "w", encoding="utf-8", errors="ignore") as f:
+        f.write(raw)
+    print("[OK] Saved.\n")
+
+def crawl(shell, ip):
+    """
+    From the current device shell:
+      - capture hostname
+      - if first time, back up running-config
+      - parse LLDP neighbors
+      - hop into unvisited Cisco neighbors and repeat
+      - 'exit' back one hop after each child
+    """
+    print(f"\n[INFO] Visiting {ip}")
+    hostname = get_hostname(shell)
+
+    first_time = ip not in visited
+    if first_time:
+        visited.add(ip)
+        backup_running_config(shell, ip, hostname)
+    else:
+        print(f"[SKIP] Already backed up {ip}")
+
+    lldp_raw = send_cmd(shell, "show lldp neighbors detail", patterns=("#",), timeout=15)
+    neighbors = parse_lldp_detail(lldp_raw)
+
+    for n in neighbors:
+        rem_ip   = n.get("mgmt_ip")
+        rem_name = n.get("remote_name") or "unknown"
+        sysdesc  = (n.get("sys_descr") or "").lower()
+
+        print(f"[FOUND] {rem_name} @ {rem_ip} via {n.get('local_intf')}")
+        if not rem_ip:
+            print("  [SKIP] no management IP")
+            continue
+        if rem_ip in visited:
+            print("  [SKIP] already visited")
+            continue
+        if "cisco" not in sysdesc:
+            print(f"  [SKIP] non-Cisco neighbor ({n.get('sys_descr', '')[:30]})")
+            continue
+
+        print(f"  [HOP] → {rem_ip}")
+        hop_to_neighbor(shell, rem_ip)
+        try:
+            crawl(shell, rem_ip)
+        finally:
+            # Return to parent device
+            send_cmd(shell, "exit", patterns=("#", ">"), timeout=5)
 
 if __name__ == "__main__":
-    client, shell = connect_to_agg()
-
-    for target in TARGET_SWITCHES:
-        try:
-            print(f"\n=== Backing up {target} ===")
-            config_output = get_running_config(shell, target)
-
-            # Clean filename
-            fname = f"{target.replace('.', '_')}_running_config.txt"
-            with open(fname, "w") as f:
-                f.write(config_output)
-
-            print(f"[SUCCESS] Backup saved to {fname}")
-
-        except Exception as e:
-            print(f"[ERROR] Failed to backup {target}: {e}")
-
-    client.close()
-    print("\nAll backups completed.")
-
-
+    client, shell = connect_switch(ROOT_IP)
+    try:
+        crawl(shell, ROOT_IP)
+    finally:
+        client.close()
+    print("\n✅ Backups complete. Files are in ./backups/")
