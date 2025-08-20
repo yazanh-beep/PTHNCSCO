@@ -1,7 +1,36 @@
 '''
 
+Usage example (with your jump at 192.168.1.11):
+
+python3 vlan100_assign.py \
+  --devices devices.txt \
+  --agg-ip 192.168.1.11 \
+  --username admin \
+  --password cisco \
+  --new-prefix 10.2.240 \
+  --mask 255.255.255.0 \
+  --force-legacy-kex
 
 
+where devices.txt contains one IP per line (e.g. 192.168.100.2, 192.168.100.3, …).
+
+1. Overview
+
+This Python script automates re-IP of VLAN 100 SVIs on multiple Cisco switches.
+
+It logs into a jump (aggregation) switch first.
+
+From the jump, it SSH hops into each device in the provided list.
+
+For each device, it:
+
+Determines its hostname.
+
+Builds a new VLAN100 IP address based on the last octet of its current management IP.
+
+Configures interface Vlan100 with the new IP/mask.
+
+Saves the configuration.
 '''
 #!/usr/bin/env python3
 import paramiko
