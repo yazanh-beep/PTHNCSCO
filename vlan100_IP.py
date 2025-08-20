@@ -1,52 +1,50 @@
 '''
+Purpose
 
-Usage example (with your jump at 192.168.1.11):
+This script automates migrating the IP address of VLAN interfaces (SVIs) on Cisco switches by hopping through an aggregate/jump switch.
+It works in a pairwise mapping manner:
 
-python3 vlan100_assign.py \
-  --devices devices.txt \
-  --agg-ip 192.168.1.11 \
-  --username admin \
-  --password cisco \
-  --new-prefix 10.2.240 \
-  --mask 255.255.255.0 \
-  --force-legacy-kex
+devices.txt → list of current management IPs (one per line).
 
+new_ips.txt → list of the new IPs (one per line, same order).
+Each current IP in line N is mapped to the new IP in line N.
 
-where devices.txt contains one IP per line (e.g. 192.168.100.2, 192.168.100.3, …).
+The script connects to the jump switch, then uses ssh -l <user> <target> to reach each device, update Vlan<id>, save the config, and (optionally) verify.
 
-1. Overview
+Features
 
-This Python script automates re-IP of VLAN 100 SVIs on multiple Cisco switches.
+Persistent jump switch session (no reconnecting for each device).
 
-It logs into a jump (aggregation) switch first.
+Handles legacy key exchange (diffie-hellman-group-exchange-sha1) if needed.
 
-From the jump, it SSH hops into each device in the provided list.
+Automatically enters enable mode on both jump and target.
 
-For each device, it:
+Idempotent configuration (no ip address before assigning new one).
 
-Determines its hostname.
+Saves the configuration (write memory).
 
-Builds a new VLAN100 IP address based on the last octet of its current management IP.
+Optional verification of SVI configuration after change.
 
-Configures interface Vlan100 with the new IP/mask.
-
-Saves the configuration.
+Robust error handling (continues to next device if one fails).
 '''
 #!/usr/bin/env python3
+import argparse
+import ipaddress
 import paramiko
 import time
-import argparse
 from datetime import datetime
-import ipaddress
 
-# Defaults (override with CLI flags)
-AGG_IP   = "192.168.1.1"
+# Defaults (override with flags)
+AGG_IP   = "192.168.1.11"
 USERNAME = "admin"
 PASSWORD = "cisco"
+ENABLE_PWD = "cisco"
+MASK     = "255.255.255.0"
+VLAN     = 100
 TIMEOUT  = 12
 MAX_READ = 65535
 
-def now_str():
+def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def expect_prompt(shell, patterns=("#", ">"), timeout=TIMEOUT):
@@ -55,6 +53,7 @@ def expect_prompt(shell, patterns=("#", ">"), timeout=TIMEOUT):
         if shell.recv_ready():
             data = shell.recv(MAX_READ).decode("utf-8", "ignore")
             buf += data
+            # fail-fast on common IOS errors
             if "Permission denied" in data or "\n%" in data:
                 return buf
             for p in patterns:
@@ -64,149 +63,154 @@ def expect_prompt(shell, patterns=("#", ">"), timeout=TIMEOUT):
             time.sleep(0.1)
     return buf
 
-def send_cmd(shell, cmd, patterns=("#", ">"), timeout=TIMEOUT):
+def send(shell, cmd, patterns=("#", ">"), timeout=TIMEOUT):
     shell.send(cmd + "\n")
     return expect_prompt(shell, patterns, timeout)
 
 def force_legacy_kex(transport):
-    sec = transport.get_security_options()
-    if 'diffie-hellman-group-exchange-sha1' in sec.kex:
-        sec.kex = ['diffie-hellman-group-exchange-sha1'] + [k for k in sec.kex if k != 'diffie-hellman-group-exchange-sha1']
+    try:
+        sec = transport.get_security_options()
+        if 'diffie-hellman-group-exchange-sha1' in sec.kex:
+            sec.kex = ['diffie-hellman-group-exchange-sha1'] + [k for k in sec.kex if k != 'diffie-hellman-group-exchange-sha1']
+    except Exception:
+        pass
 
-def connect_to_agg(agg_ip, username, password, force_legacy=False):
-    print(f"[CONNECT] SSH to jump/agg {agg_ip} as {username}")
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        agg_ip, username=username, password=password,
-        look_for_keys=False, allow_agent=False, timeout=10
-    )
-    transport = client.get_transport()
-    if transport:
-        transport.set_keepalive(30)
-        if force_legacy:
-            force_legacy_kex(transport)
-    shell = client.invoke_shell()
-    expect_prompt(shell, ("#", ">"))
-    out = send_cmd(shell, "enable", patterns=("assword:", "#"))
+def connect_to_jump(agg_ip, username, password, enable_pwd, legacy_kex=False):
+    print(f"[JUMP] SSH {agg_ip} as {username}")
+    cli = paramiko.SSHClient()
+    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    cli.connect(agg_ip, username=username, password=password,
+                look_for_keys=False, allow_agent=False, timeout=10)
+    tr = cli.get_transport()
+    if tr:
+        tr.set_keepalive(30)
+        if legacy_kex:
+            force_legacy_kex(tr)
+    sh = cli.invoke_shell()
+    expect_prompt(sh, ("#", ">"))
+    # enter enable on jump
+    out = send(sh, "enable", patterns=("assword:", "#"))
     if "assword:" in out:
-        send_cmd(shell, password, patterns=("#",))
-    send_cmd(shell, "terminal length 0", patterns=("#",))
-    print("[READY] Jump session established")
-    return client, shell
+        send(sh, enable_pwd, patterns=("#",))
+    send(sh, "terminal length 0", patterns=("#",))
+    print("[JUMP] Ready")
+    return cli, sh
 
-def hop_to_target(shell, username, password, ip):
+def hop_to_target(shell, username, password, enable_pwd, ip):
     print(f"\n[HOP] ssh {ip}")
-    out = send_cmd(shell, f"ssh -l {username} {ip}",
-                   patterns=("yes/no", "(yes/no)?", "assword:", "Permission denied", "%", "#", ">"),
-                   timeout=20)
+    out = send(shell, f"ssh -l {username} {ip}",
+               patterns=("yes/no", "(yes/no)?", "assword:", "Permission denied", "%", "#", ">"),
+               timeout=20)
     if "(yes/no)?" in out or "yes/no" in out:
-        out = send_cmd(shell, "yes", patterns=("assword:", "%", "#", ">"), timeout=15)
+        out = send(shell, "yes", patterns=("assword:", "%", "#", ">"), timeout=15)
     if "assword:" in out:
-        out = send_cmd(shell, password, patterns=("Permission denied", "%", "#", ">"), timeout=20)
+        out = send(shell, password, patterns=("Permission denied", "%", "#", ">"), timeout=20)
     if "Permission denied" in out or "\n%" in out:
         raise RuntimeError(f"SSH/auth error on {ip}:\n{out.strip()[-200:]}")
+    # if user exec mode, elevate
     if out.strip().endswith(">"):
-        out = send_cmd(shell, "enable", patterns=("assword:", "#"), timeout=15)
+        out = send(shell, "enable", patterns=("assword:", "#"), timeout=12)
         if "assword:" in out:
-            send_cmd(shell, password, patterns=("#",), timeout=15)
-    send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
+            send(shell, enable_pwd, patterns=("#",), timeout=8)
+    send(shell, "terminal length 0", patterns=("#",), timeout=5)
     return True
 
 def get_hostname(shell):
-    out = send_cmd(shell, "show run | i ^hostname", patterns=("#",), timeout=8)
+    out = send(shell, "show run | i ^hostname", patterns=("#",), timeout=8)
     for line in out.splitlines():
         if line.strip().startswith("hostname "):
             return line.strip().split(None, 1)[1]
     return "unknown"
 
-def build_vlan100_cmds(target_ip, new_prefix, mask):
-    """
-    Keep last octet from target_ip, apply to new_prefix.X
-    """
-    try:
-        ip_obj = ipaddress.ip_address(target_ip)
-    except ValueError:
-        raise ValueError(f"Invalid IP in devices file: {target_ip}")
-
-    last_octet = int(str(ip_obj).split(".")[-1])
-    base_parts = new_prefix.split(".")
-    if len(base_parts) != 3:
-        raise ValueError("--new-prefix must be like A.B.C (e.g., 10.2.240)")
-    new_ip = ".".join(base_parts + [str(last_octet)])
+def set_vlan_ip(shell, vlan, ip, mask):
+    out = send(shell, "configure terminal", patterns=("(config)#", "%", "#"))
+    if "\n%" in out:
+        raise RuntimeError("Failed to enter config mode")
 
     cmds = [
-        "vlan 100",
+        f"vlan {vlan}",
         "exit",
-        "interface Vlan100",
-        "no ip address",  # idempotent; clears any previous IP if present
-        f"ip address {new_ip} {mask}",
+        f"interface Vlan{vlan}",
+        "no ip address",                 # idempotent reset
+        f"ip address {ip} {mask}",
         "no shutdown",
-        f"description SVI migrated by tool {now_str()}",
+        f"description management SVI",
     ]
-    return new_ip, cmds
-
-def push_vlan100(shell, target_ip, new_prefix, mask):
-    hop_to_target(shell, args.username, args.password, target_ip)
-    hostname = get_hostname(shell)
-    if hostname == "unknown":
-      raise RuntimeError(f"Hostname could not be determined on {target_ip}. Stopping script.")
-    print(f"[TARGET] {hostname} ({target_ip})")
-
-    new_ip, cmds = build_vlan100_cmds(target_ip, new_prefix, mask)
-
-    out = send_cmd(shell, "configure terminal", patterns=("(config)#", "#", "%"), timeout=10)
-    if "\n%" in out:
-        raise RuntimeError(f"Failed to enter config mode on {target_ip}:\n{out.strip()[-200:]}")
-
     for c in cmds:
         print(f"[CONFIG] {c}")
-        out = send_cmd(shell, c, patterns=("(config)#", "%", "#"), timeout=12)
+        out = send(shell, c, patterns=("(config)#", "(config-if)#", "%", "#"), timeout=12)
         if "\n%" in out:
-            print(f"[WARN] Device reported an issue with '{c}':\n{out.strip()[-200:]}")
+            raise RuntimeError(f"Command failed: {c}\n{out.strip()[-200:]}")
 
-    # Save config
+    send(shell, "end", patterns=("#",))
     print("[SAVE] write memory")
-    out = send_cmd(shell, "do write", patterns=("(config)#", "#", "%"), timeout=25)
+    out = send(shell, "write memory", patterns=("#", "%"), timeout=25)
     if "\n%" in out:
-        send_cmd(shell, "end", patterns=("#",), timeout=6)
-        send_cmd(shell, "write memory", patterns=("#",), timeout=25)
-    else:
-        send_cmd(shell, "end", patterns=("#",), timeout=6)
+        raise RuntimeError(f"write memory returned error:\n{out.strip()[-200:]}")
 
-    send_cmd(shell, "exit", patterns=("#", ">"), timeout=6)  # back to jump
-    print(f"[DONE] {hostname} VLAN100 set to {new_ip}")
+def verify_vlan_ip(shell, vlan, ip, mask):
+    out = send(shell, f"show run interface Vlan{vlan} | i ip address", patterns=("#",), timeout=8)
+    line = next((l for l in out.splitlines() if "ip address" in l), "")
+    ok = (ip in line) and (mask in line)
+    print(f"[VERIFY] {'OK' if ok else 'MISMATCH'}: {line.strip() or 'no ip address line'}")
+    return ok
 
-def read_targets(path):
+def read_list(path, label):
     with open(path, "r") as f:
-        return [ln.strip() for ln in f if ln.strip()]
+        items = [ln.strip() for ln in f if ln.strip()]
+    if not items:
+        raise ValueError(f"{label} file is empty: {path}")
+    return items
 
 def main():
-    global args
-    parser = argparse.ArgumentParser(description="Assign VLAN100 SVI based on device IP last octet via jump host.")
-    parser.add_argument("--devices", required=True, help="File with device IPs (one per line)")
-    parser.add_argument("--agg-ip", default=AGG_IP)
-    parser.add_argument("--username", default=USERNAME)
-    parser.add_argument("--password", default=PASSWORD)
-    parser.add_argument("--new-prefix", required=True, help="New /24 prefix (first 3 octets), e.g., 10.2.240")
-    parser.add_argument("--mask", default="255.255.255.0")
-    parser.add_argument("--force-legacy-kex", action="store_true")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Pairwise Vlan SVI IP migration via aggregate jump switch.")
+    p.add_argument("--devices", required=True, help="File with current device IPs (one per line)")
+    p.add_argument("--new-ips", required=True, help="File with new IPs (one per line, same order as devices)")
+    p.add_argument("--agg-ip", default=AGG_IP, help="Aggregate/jump switch IP")
+    p.add_argument("--username", default=USERNAME)
+    p.add_argument("--password", default=PASSWORD)
+    p.add_argument("--enable", dest="enable_pwd", default=ENABLE_PWD)
+    p.add_argument("--mask", default=MASK)
+    p.add_argument("--vlan", type=int, default=VLAN)
+    p.add_argument("--verify", action="store_true", help="Verify SVI IP after change")
+    p.add_argument("--force-legacy-kex", action="store_true", help="Force diffie-hellman-group-exchange-sha1 on jump")
+    args = p.parse_args()
 
-    targets = read_targets(args.devices)
-    client, shell = connect_to_agg(args.agg_ip, args.username, args.password, args.force_legacy_kex)
+    # Validate lists
+    devs = read_list(args.devices, "Devices")
+    news = read_list(args.new_ips, "New IPs")
+    if len(devs) != len(news):
+        raise ValueError(f"Line count mismatch: {len(devs)} devices vs {len(news)} new IPs")
+
+    # Validate IP syntax early
+    for i, ip in enumerate(devs):
+        try: ipaddress.ip_address(ip)
+        except ValueError: raise ValueError(f"Invalid device IP on line {i+1}: {ip}")
+    for i, ip in enumerate(news):
+        try: ipaddress.ip_address(ip)
+        except ValueError: raise ValueError(f"Invalid new IP on line {i+1}: {ip}")
+
+    # Single persistent jump session
+    jump_cli, jump_sh = connect_to_jump(args.agg_ip, args.username, args.password, args.enable_pwd, args.force_legacy_kex)
 
     try:
-        for ip in targets:
+        for cur_ip, new_ip in zip(devs, news):
+            print(f"\n=== {cur_ip} -> {new_ip} (Vlan{args.vlan}/{args.mask}) ===")
             try:
-                print(f"\n=== Processing {ip} ===")
-                push_vlan100(shell, ip, args.new_prefix, args.mask)
+                hop_to_target(jump_sh, args.username, args.password, args.enable_pwd, cur_ip)
+                host = get_hostname(jump_sh)
+                print(f"[TARGET] {host} ({cur_ip})")
+                set_vlan_ip(jump_sh, args.vlan, new_ip, args.mask)
+                if args.verify:
+                    verify_vlan_ip(jump_sh, args.vlan, new_ip, args.mask)
             except Exception as e:
-                print(f"[ERROR] {ip}: {e}")
-                # stay on jump and continue
+                print(f"[ERROR] {cur_ip}: {e}")
+            finally:
+                # Back to jump (close remote session) without tearing down the jump itself
+                send(jump_sh, "exit", patterns=("#", ">"), timeout=6)
     finally:
-        client.close()
-        print("\n[DONE] All targets processed.")
+        jump_cli.close()
+        print("\n[DONE] All pairs processed.")
 
 if __name__ == "__main__":
     main()
