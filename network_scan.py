@@ -314,7 +314,7 @@ def build_topology(shell, ip):
         print(f"  [HOP] Cisco neighbor → hopping to {n['mgmt_ip']}")
         hop_to_neighbor(shell, n["mgmt_ip"])
         child = build_topology(shell, n["mgmt_ip"])
-        send_cmd(shell, "exit", patterns=("#", ">"), timeout=5)
+        #send_cmd(shell, "exit", patterns=("#", ">"), timeout=5)
 
         entry = {
             "local_interface": n["local_intf"],
