@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+import paramiko
+import time
+import re
+import json
+import csv
+
+# --- USER CONFIG -------------------------------------------------------------
+USERNAME = "admin"
+PASSWORD = "cisco"
+ROOT_IP = "192.168.1.1"
+TIMEOUT = 10
+MAX_READ = 65535
+
+# List of aggregate switch IPs to start discovery from
+AGGREGATE_IPS = [
+    "10.29.128.1",
+    "10.29.128.6",
+    # Add more aggregate switch IPs here
+]
+# -----------------------------------------------------------------------------
+
+visited_switches = set()
+camera_data = []
+
+
+def expect_prompt(shell, patterns, timeout=TIMEOUT):
+    """Wait for expected prompt patterns in shell output"""
+    buf, end = "", time.time() + timeout
+    while time.time() < end:
+        if shell.recv_ready():
+            data = shell.recv(MAX_READ).decode("utf-8", "ignore")
+            buf += data
+            for p in patterns:
+                if p in buf:
+                    return buf
+        else:
+            time.sleep(0.1)
+    return buf
+
+
+def send_cmd(shell, cmd, patterns=("#", ">"), timeout=TIMEOUT):
+    """Send command and wait for response"""
+    print(f"[CMD] {cmd}")
+    shell.send(cmd + "\n")
+    out = expect_prompt(shell, patterns, timeout)
+    return out
+
+
+def connect_switch(ip):
+    """Connect to switch via SSH and enter privileged mode"""
+    print(f"\n[CONNECT] → {ip}")
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(ip, username=USERNAME, password=PASSWORD,
+                       look_for_keys=False, allow_agent=False, timeout=15)
+        shell = client.invoke_shell()
+        expect_prompt(shell, ("#", ">"))
+        send_cmd(shell, "enable", patterns=("assword:", "#"))
+        send_cmd(shell, PASSWORD, patterns=("#",))
+        send_cmd(shell, "terminal length 0", patterns=("#",))
+        return client, shell
+    except Exception as e:
+        print(f"[ERROR] Failed to connect to {ip}: {e}")
+        return None, None
+
+
+def hop_to_neighbor(shell, ip):
+    """SSH hop from current switch to neighbor"""
+    print(f"[HOP] ssh → {ip}")
+    out = send_cmd(shell, f"ssh -l {USERNAME} {ip}",
+                   patterns=("Destination", "(yes/no)?", "assword:", "%", "#", ">"),
+                   timeout=20)
+    if "(yes/no)?" in out or "yes/no" in out:
+        out = send_cmd(shell, "yes", patterns=("assword:", "%", "#", ">"), timeout=15)
+    if "assword:" in out:
+        out = send_cmd(shell, PASSWORD, patterns=("%", "#", ">"), timeout=15)
+    if out.strip().endswith(">"):
+        send_cmd(shell, "enable", patterns=("assword:", "#"), timeout=15)
+        send_cmd(shell, PASSWORD, patterns=("#",), timeout=15)
+    send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
+    print(f"[HOP] now at {ip}#")
+
+
+def get_hostname(shell):
+    """Extract hostname from current CLI prompt"""
+    shell.send("\n")
+    buff = expect_prompt(shell, ("#", ">"), timeout=5)
+    for line in reversed(buff.splitlines()):
+        if m := re.match(r"^([^#>]+)[#>]", line.strip()):
+            return m.group(1)
+    return "unknown"
+
+
+def is_edge_switch(hostname):
+    """Check if switch is an edge switch (ACC or IE)"""
+    if not hostname:
+        return False
+    upper = hostname.upper()
+    # Check for access switches (ACC) or industrial ethernet (IE)
+    return "ACC" in upper or ("IE" in upper and "IEP" in upper)
+
+
+def is_aggregate_switch(hostname):
+    """Check if switch is an aggregate switch"""
+    if not hostname:
+        return False
+    return "AGG" in hostname.upper()
+
+
+def is_server_switch(hostname):
+    """Check if switch is a server switch"""
+    if not hostname:
+        return False
+    return "SRV" in hostname.upper()
+
+
+def convert_mac_format(mac_cisco):
+    """Convert MAC from xxxx.xxxx.xxxx to XX:XX:XX:XX:XX:XX"""
+    # Remove dots and convert to uppercase
+    mac_clean = mac_cisco.replace(".", "").upper()
+    # Insert colons every 2 characters
+    return ":".join([mac_clean[i:i+2] for i in range(0, 12, 2)])
+
+
+def parse_lldp_detail(raw):
+    """Parse LLDP neighbor detail output"""
+    nbrs = []
+    blocks = re.split(r"^-{2,}", raw, flags=re.M)
+    
+    for blk in blocks:
+        if "Local Intf:" not in blk:
+            continue
+            
+        entry = {
+            "local_intf": None,
+            "port_id": None,
+            "remote_name": None,
+            "mgmt_ip": None,
+            "sys_descr": ""
+        }
+        
+        if m := re.search(r"Local Intf:\s*(\S+)", blk):
+            entry["local_intf"] = m.group(1)
+        if m := re.search(r"Port id:\s*(\S+)", blk, re.IGNORECASE):
+            entry["port_id"] = m.group(1)
+        if m := re.search(r"System Name:\s*(\S+)", blk, re.IGNORECASE):
+            entry["remote_name"] = m.group(1)
+        if m := re.search(r"System Description:\s*([\s\S]+?)(?:\n\s*\n|Time remaining)", blk, re.IGNORECASE):
+            entry["sys_descr"] = m.group(1).strip()
+        if m := re.search(r"Management Addresses:[\s\S]*?IP:\s*(\d+\.\d+\.\d+\.\d+)", blk, re.IGNORECASE):
+            entry["mgmt_ip"] = m.group(1)
+            
+        nbrs.append(entry)
+    
+    return nbrs
+
+
+def get_interface_status(shell):
+    """Get list of UP interfaces"""
+    out = send_cmd(shell, "show ip interface brief", timeout=10)
+    up_interfaces = []
+    
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or "Interface" in line or line.startswith("Vlan"):
+            continue
+        
+        parts = re.split(r"\s+", line)
+        if len(parts) >= 5:
+            intf, ip, ok, method, status, protocol = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5] if len(parts) > 5 else ""
+            # Check if interface is up
+            if status.lower() == "up":
+                # Only include physical interfaces (Gig, Ten, etc)
+                if re.match(r"(Gig|Ten|FastEthernet|Ethernet)", intf, re.IGNORECASE):
+                    up_interfaces.append(intf)
+    
+    return up_interfaces
+
+
+def parse_mac_table_interface(raw):
+    """Parse MAC address table for specific interface"""
+    entries = []
+    
+    for line in raw.splitlines():
+        line = line.strip()
+        # Skip headers, separators, empty lines, and total lines
+        if not line or "Mac Address Table" in line or line.startswith("---") or \
+           line.lower().startswith("vlan") or line.startswith("Total") or \
+           "Mac Address" in line or "----" in line:
+            continue
+        
+        # Parse: Vlan    Mac Address       Type        Ports
+        parts = re.split(r"\s+", line)
+        if len(parts) >= 4:
+            vlan = parts[0]
+            mac = parts[1]
+            mac_type = parts[2]
+            port = parts[3]
+            
+            # Only include DYNAMIC entries (actual learned MACs)
+            if "DYNAMIC" in mac_type.upper():
+                entries.append({
+                    "vlan": vlan,
+                    "mac_address": mac,
+                    "type": mac_type,
+                    "port": port
+                })
+    
+    return entries
+
+
+def map_ie_port(port_id):
+    """Map IE switch port-00X to GigX/X format"""
+    # port-001 -> Gi1/1, port-002 -> Gi1/2, etc.
+    if m := re.match(r"port-(\d+)", port_id, re.IGNORECASE):
+        port_num = int(m.group(1))
+        return f"Gi1/{port_num}"
+    return None
+
+
+def get_uplink_ports_from_lldp(shell):
+    """Get all uplink ports by checking LLDP neighbors on edge switch"""
+    print(f"\n[UPLINK DETECTION] Running 'show lldp neighbors detail'...")
+    
+    lldp_raw = send_cmd(shell, "show lldp neighbors detail", patterns=("#",), timeout=20)
+    
+    # Debug: print raw output to see what we got
+    print(f"[DEBUG] LLDP output length: {len(lldp_raw)} chars")
+    
+    neighbors = parse_lldp_detail(lldp_raw)
+    print(f"[UPLINK DETECTION] Found {len(neighbors)} LLDP neighbors")
+    
+    uplink_ports = []
+    for nbr in neighbors:
+        remote_name = nbr.get("remote_name", "")
+        local_intf = nbr.get("local_intf", "")
+        port_id = nbr.get("port_id", "")
+        
+        print(f"[DEBUG] Neighbor: {remote_name}, Local Intf: {local_intf}, Port ID: {port_id}")
+        
+        # If neighbor is an aggregate or server switch, this is an uplink
+        if remote_name and (is_aggregate_switch(remote_name) or is_server_switch(remote_name)):
+            uplink_port = local_intf
+            
+            # If local_intf is empty but we have port_id, this might be an IE switch
+            if not uplink_port and port_id:
+                print(f"[DEBUG] No local_intf, attempting to map port_id: {port_id}")
+                mapped_port = map_ie_port(port_id)
+                if mapped_port:
+                    uplink_port = mapped_port
+                    print(f"[DEBUG] Mapped {port_id} → {uplink_port}")
+            
+            if uplink_port:
+                uplink_ports.append(uplink_port)
+                print(f"[UPLINK DETECTED] {uplink_port} → {remote_name}")
+            else:
+                print(f"[WARNING] Could not determine uplink port for neighbor {remote_name}")
+        else:
+            print(f"[DEBUG] Skipping neighbor {remote_name} (not AGG/SRV)")
+    
+    print(f"[UPLINK DETECTION] Total uplinks identified: {len(uplink_ports)}")
+    return uplink_ports
+
+
+def normalize_interface_name(intf):
+    """Normalize interface name for comparison (handles abbreviated forms)"""
+    if not intf:
+        return ""
+    
+    # Handle common abbreviations
+    normalized = intf
+    normalized = re.sub(r'^Gi(\d)', r'GigabitEthernet\1', normalized)
+    normalized = re.sub(r'^Te(\d)', r'TenGigabitEthernet\1', normalized)
+    normalized = re.sub(r'^Fa(\d)', r'FastEthernet\1', normalized)
+    
+    # Also create a short version for matching
+    return normalized.lower()
+
+
+def is_same_interface(intf1, intf2):
+    """Check if two interface names refer to the same interface"""
+    if not intf1 or not intf2:
+        return False
+    
+    # Normalize both
+    norm1 = normalize_interface_name(intf1)
+    norm2 = normalize_interface_name(intf2)
+    
+    # Direct match
+    if norm1 == norm2:
+        return True
+    
+    # Extract the interface type and numbers for comparison
+    # e.g., "gigabitethernet1/1" should match "gi1/1"
+    pattern = r'(gigabitethernet|tengigabitethernet|fastethernet|ethernet)(\d+/\d+|\d+)'
+    
+    match1 = re.search(pattern, norm1)
+    match2 = re.search(pattern, norm2)
+    
+    if match1 and match2:
+        type1, num1 = match1.groups()
+        type2, num2 = match2.groups()
+        
+        # Map types
+        type_map = {
+            'gigabitethernet': 'gi',
+            'tengigabitethernet': 'te',
+            'fastethernet': 'fa',
+            'ethernet': 'eth'
+        }
+        
+        short_type1 = type_map.get(type1, type1)
+        short_type2 = type_map.get(type2, type2)
+        
+        # Compare type and number
+        return short_type1 == short_type2 and num1 == num2
+    
+    return False
+
+
+def discover_cameras_from_edge(shell, edge_hostname):
+    """Collect camera MAC addresses from edge switch"""
+    print(f"\n[CAMERA SCAN] Scanning edge switch: {edge_hostname}")
+    
+    # First, identify ALL uplink ports by checking LLDP neighbors
+    uplink_ports = get_uplink_ports_from_lldp(shell)
+    
+    if not uplink_ports:
+        print(f"[WARNING] No uplink ports detected via LLDP on {edge_hostname}")
+        print(f"[WARNING] This means ALL ports will be scanned - this may be incorrect!")
+    else:
+        print(f"\n[CAMERA SCAN] Uplink ports to exclude: {uplink_ports}")
+    
+    # Get all UP interfaces
+    up_interfaces = get_interface_status(shell)
+    print(f"[CAMERA SCAN] Found {len(up_interfaces)} UP interfaces total")
+    
+    camera_count = 0
+    scanned_count = 0
+    
+    for intf in up_interfaces:
+        # Check if this interface is an uplink using improved matching
+        is_uplink = False
+        for uplink in uplink_ports:
+            if is_same_interface(intf, uplink):
+                is_uplink = True
+                print(f"[SKIP] {intf} - UPLINK PORT (matches {uplink})")
+                break
+        
+        if is_uplink:
+            continue
+        
+        scanned_count += 1
+        
+        # Get MAC table for this interface on VLAN 800
+        cmd = f"show mac address-table interface {intf} vlan 800"
+        mac_out = send_cmd(shell, cmd, timeout=10)
+        entries = parse_mac_table_interface(mac_out)
+        
+        if entries:
+            print(f"[FOUND] {len(entries)} MAC(s) on {intf}")
+            for entry in entries:
+                mac_formatted = convert_mac_format(entry["mac_address"])
+                camera_info = {
+                    "switch_name": edge_hostname,
+                    "port": entry["port"],
+                    "mac_address": mac_formatted,
+                    "vlan": entry["vlan"]
+                }
+                camera_data.append(camera_info)
+                camera_count += 1
+                print(f"  → Camera MAC: {mac_formatted} on port {entry['port']}")
+        else:
+            print(f"[NO DATA] {intf} - no MAC entries in VLAN 800")
+    
+    print(f"\n[CAMERA SCAN] Summary for {edge_hostname}:")
+    print(f"  - Total UP interfaces: {len(up_interfaces)}")
+    print(f"  - Uplink ports excluded: {len(uplink_ports)}")
+    print(f"  - Ports scanned: {scanned_count}")
+    print(f"  - Cameras found: {camera_count}")
+
+
+def process_edge_switch(shell, agg_ip, neighbor_info):
+    """Process an edge switch connected to aggregate"""
+    edge_ip = neighbor_info["mgmt_ip"]
+    edge_name = neighbor_info["remote_name"]
+    local_intf = neighbor_info["local_intf"]
+    
+    if not edge_ip or edge_ip in visited_switches:
+        return
+    
+    print(f"\n{'='*80}")
+    print(f"[EDGE SWITCH] Processing: {edge_name} ({edge_ip})")
+    print(f"[EDGE SWITCH] Connected via aggregate port: {local_intf}")
+    print(f"{'='*80}")
+    
+    visited_switches.add(edge_ip)
+    
+    # Hop to edge switch
+    try:
+        hop_to_neighbor(shell, edge_ip)
+        
+        # Discover cameras - uplinks will be auto-detected from LLDP
+        discover_cameras_from_edge(shell, edge_name)
+        
+        # Return to aggregate switch
+        send_cmd(shell, "exit", patterns=("#", ">"), timeout=5)
+        print(f"[HOP] Returned to aggregate switch")
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to process edge switch {edge_name}: {e}")
+
+
+def scan_aggregate_switch(shell, agg_ip):
+    """Scan aggregate switch for connected edge switches"""
+    if agg_ip in visited_switches:
+        print(f"[SKIP] Aggregate {agg_ip} already visited")
+        return
+    
+    visited_switches.add(agg_ip)
+    hostname = get_hostname(shell)
+    
+    print(f"\n{'#'*80}")
+    print(f"[AGGREGATE] Scanning: {hostname} ({agg_ip})")
+    print(f"{'#'*80}")
+    
+    # Get LLDP neighbors
+    lldp_raw = send_cmd(shell, "show lldp neighbors detail", patterns=("#",), timeout=20)
+    neighbors = parse_lldp_detail(lldp_raw)
+    
+    print(f"[AGGREGATE] Found {len(neighbors)} LLDP neighbors")
+    
+    edge_count = 0
+    for nbr in neighbors:
+        remote_name = nbr.get("remote_name", "")
+        
+        # Skip if no name or IP
+        if not remote_name or not nbr.get("mgmt_ip"):
+            continue
+        
+        # Filter: only process edge switches (ACC or IE)
+        if is_edge_switch(remote_name):
+            edge_count += 1
+            print(f"\n[EDGE DETECTED] {remote_name} - {nbr.get('mgmt_ip')}")
+            process_edge_switch(shell, agg_ip, nbr)
+        elif is_aggregate_switch(remote_name):
+            print(f"[SKIP] Aggregate switch: {remote_name}")
+        elif is_server_switch(remote_name):
+            print(f"[SKIP] Server switch: {remote_name}")
+        else:
+            print(f"[SKIP] Other device: {remote_name}")
+    
+    print(f"\n[AGGREGATE] Processed {edge_count} edge switches from {hostname}")
+
+
+def main():
+    """Main execution function"""
+    print("\n" + "="*80)
+    print("CAMERA DISCOVERY SCRIPT")
+    print("="*80)
+    
+    # Connect to root switch (this is our only direct connection)
+    client, shell = connect_switch(ROOT_IP)
+    if not client:
+        print("[ERROR] Failed to connect to root switch. Exiting.")
+        return
+    
+    try:
+        # All work must be done from the root switch shell by SSH hopping
+        # Process each aggregate switch by hopping from root
+        for agg_ip in AGGREGATE_IPS:
+            print(f"\n\n{'*'*80}")
+            print(f"PROCESSING AGGREGATE: {agg_ip}")
+            print(f"{'*'*80}")
+            
+            # Always hop to aggregate from root
+            hop_to_neighbor(shell, agg_ip)
+            
+            scan_aggregate_switch(shell, agg_ip)
+            
+            # Return to root switch
+            send_cmd(shell, "exit", patterns=("#", ">"), timeout=5)
+            print(f"[HOP] Returned to root switch")
+        
+    finally:
+        client.close()
+    
+    # Output results
+    print("\n" + "="*80)
+    print(f"DISCOVERY COMPLETE - Found {len(camera_data)} cameras")
+    print("="*80)
+    
+    # Save to JSON
+    with open("camera_inventory.json", "w") as f:
+        json.dump(camera_data, f, indent=2)
+    print("\n[SAVED] camera_inventory.json")
+    
+    # Save to CSV
+    if camera_data:
+        with open("camera_inventory.csv", "w", newline="") as f:
+            fieldnames = ["switch_name", "port", "mac_address", "vlan"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(camera_data)
+        print("[SAVED] camera_inventory.csv")
+    
+    # Print summary
+    print("\n" + "-"*80)
+    print("SUMMARY")
+    print("-"*80)
+    for camera in camera_data:
+        print(f"{camera['switch_name']:<50} {camera['port']:<15} {camera['mac_address']}")
+
+
+if __name__ == "__main__":
+    main()
