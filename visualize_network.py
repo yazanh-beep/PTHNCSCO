@@ -92,7 +92,7 @@ def generate_drawio_xml(devices, output_file="network_topology.drawio"):
     # Layout parameters
     node_width = 220
     node_height = 90
-    h_spacing = 400
+    h_spacing = 500  # Increased from 400 to 500 for more space between access switches
     
     total_access_switches = len(access_field)
     total_width = total_access_switches * h_spacing
@@ -227,7 +227,7 @@ def generate_drawio_xml(devices, output_file="network_topology.drawio"):
     
     # Add connections
     print("\nCreating connections...")
-    connections = set()
+    connections = {}
     connection_count = 0
     
     for device in devices:
@@ -236,10 +236,12 @@ def generate_drawio_xml(devices, output_file="network_topology.drawio"):
             if not neighbor_ip or neighbor_ip not in device_cells:
                 continue
             
-            conn_key = tuple(sorted([device["management_ip"], neighbor_ip]))
+            # Create connection identifier
+            conn_key = (device["management_ip"], neighbor_ip, neighbor.get('local_interface', ''), neighbor.get('remote_interface', ''))
+            reverse_key = (neighbor_ip, device["management_ip"], neighbor.get('remote_interface', ''), neighbor.get('local_interface', ''))
             
-            if conn_key not in connections:
-                connections.add(conn_key)
+            if conn_key not in connections and reverse_key not in connections:
+                connections[conn_key] = True
                 connection_count += 1
                 
                 source_id = device_cells[device["management_ip"]]
@@ -251,12 +253,15 @@ def generate_drawio_xml(devices, output_file="network_topology.drawio"):
                 local_short = local_intf.replace('TenGigabitEthernet', 'Te').replace('GigabitEthernet', 'Gi')
                 remote_short = remote_intf.replace('TenGigabitEthernet', 'Te').replace('GigabitEthernet', 'Gi')
                 
-                edge_label = f"{local_short} ↔ {remote_short}"
+                edge_label = f"{local_short} <-> {remote_short}"
+                
+                # Simple straight lines
+                style = "endArrow=none;html=1;rounded=0;strokeWidth=2;strokeColor=#4A90E2;fontSize=8;fontColor=#333333;labelBackgroundColor=#FFFFFF;"
                 
                 edge = ET.SubElement(root, 'mxCell',
                                    id=str(cell_id),
                                    value=edge_label,
-                                   style="endArrow=none;html=1;rounded=0;strokeWidth=2;strokeColor=#4A90E2;fontSize=9;fontColor=#333333;labelBackgroundColor=#FFFFFF;labelDistance=10;",
+                                   style=style,
                                    edge="1",
                                    parent="1",
                                    source=str(source_id),
