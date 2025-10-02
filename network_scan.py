@@ -13,13 +13,15 @@ from collections import deque
 # ─── USER CONFIG ─────────────────────────────────────────────────────────────
 USERNAME = "admin"
 PASSWORD = "cisco"
-AGGREGATE_ENTRY_IP = "192.168.1.1"  # Entry point from server
+AGGREGATE_ENTRY_IP = "192.168.100.1"  # Entry point from server
 AGGREGATE_MGMT_IPS = [
     # Add your aggregate switch management IPs here (VLAN 100 IPs)
     # Example: "10.0.100.1", "10.0.100.2"
 ]
 TIMEOUT = 10
 MAX_READ = 65535
+SSH_RETRY_ATTEMPTS = 2  # Number of times to retry SSH connection on failure
+SSH_RETRY_DELAY = 5  # Seconds to wait between retry attempts
 # ─────────────────────────────────────────────────────────────────────────────
 
 class NetworkDiscovery:
@@ -27,6 +29,7 @@ class NetworkDiscovery:
         self.devices = {}  # Key: mgmt_ip, Value: device_info
         self.to_visit = deque()  # Queue of IPs to visit
         self.visited = set()  # IPs we've already processed
+        self.hostname_to_ip = {}  # Key: hostname, Value: authoritative mgmt IP (CDP takes priority)
         self.seed_aggregate_ip = None  # IP of the initial aggregate switch
         self.agg_shell = None  # Persistent shell to aggregate switch
         self.agg_client = None
@@ -78,10 +81,14 @@ class NetworkDiscovery:
         """Send command and wait for prompt"""
         if not silent:
             self.log(f"CMD: {cmd}", "DEBUG")
-        shell.send(cmd + "\n")
-        time.sleep(0.3)  # Small delay for command to process
-        out = self.expect_prompt(shell, patterns, timeout)
-        return out
+        try:
+            shell.send(cmd + "\n")
+            time.sleep(0.3)  # Small delay for command to process
+            out = self.expect_prompt(shell, patterns, timeout)
+            return out
+        except Exception as e:
+            self.log(f"Exception in send_cmd: {e}", "ERROR")
+            return ""
 
     def connect_to_aggregate(self):
         """Initial SSH connection from server to aggregate switch"""
@@ -118,56 +125,136 @@ class NetworkDiscovery:
             self.log(f"Failed to connect to aggregate: {e}", "ERROR")
             raise
 
-    def ssh_to_device(self, shell, target_ip):
-        """SSH from aggregate switch to target device"""
-        self.log(f"SSH hop to {target_ip}")
+    def ssh_to_device(self, shell, target_ip, attempt=1):
+        """SSH from aggregate switch to target device with retry logic"""
+        self.log(f"SSH hop to {target_ip} (attempt {attempt}/{SSH_RETRY_ATTEMPTS})")
         try:
             out = self.send_cmd(shell, f"ssh -l {USERNAME} {target_ip}",
-                               patterns=("Destination", "(yes/no)?", "assword:", "%", "#", ">"),
-                               timeout=20, silent=True)
+                               patterns=("Destination", "(yes/no)?", "assword:", "%", "#", ">", "Connection refused", "Connection timed out"),
+                               timeout=60, silent=True)
+            
+            # Check for immediate connection failures
+            if "Connection refused" in out or "Unable to connect" in out or "% Connection" in out or "Connection timed out" in out:
+                self.log(f"SSH connection failed to {target_ip} - connection refused/timed out", "ERROR")
+                # Send Ctrl+C to cancel the SSH attempt and clear the line
+                shell.send("\x03")  # Ctrl+C
+                time.sleep(1)
+                shell.send("\n")
+                time.sleep(0.5)
+                # Clear any remaining output
+                if shell.recv_ready():
+                    shell.recv(MAX_READ)
+                
+                # Retry if we haven't exhausted attempts
+                if attempt < SSH_RETRY_ATTEMPTS:
+                    self.log(f"Retrying SSH to {target_ip} in {SSH_RETRY_DELAY} seconds...", "WARN")
+                    time.sleep(SSH_RETRY_DELAY)
+                    return self.ssh_to_device(shell, target_ip, attempt + 1)
+                else:
+                    self.log(f"SSH to {target_ip} failed after {SSH_RETRY_ATTEMPTS} attempts", "ERROR")
+                    return False
             
             # Handle SSH key acceptance
             if "(yes/no)?" in out or "yes/no" in out:
                 out = self.send_cmd(shell, "yes", 
                                    patterns=("assword:", "%", "#", ">"), 
-                                   timeout=15, silent=True)
+                                   timeout=30, silent=True)
             
             # Handle password prompt
             if "assword:" in out:
                 out = self.send_cmd(shell, PASSWORD, 
-                                   patterns=("%", "#", ">"), 
-                                   timeout=15, silent=True)
+                                   patterns=("%", "#", ">", "Permission denied", "Authentication failed"), 
+                                   timeout=30, silent=True)
             
-            # Check for connection refused or unreachable
-            if "Connection refused" in out or "Unable to connect" in out or "% Connection" in out:
-                self.log(f"SSH connection refused to {target_ip}", "ERROR")
-                return False
+            # Check for authentication failures
+            if "Permission denied" in out or "Authentication failed" in out or "% Authentication" in out:
+                self.log(f"SSH authentication failed to {target_ip}", "ERROR")
+                # Try to get back to aggregate prompt
+                shell.send("\x03")  # Ctrl+C
+                time.sleep(1)
+                shell.send("exit\n")
+                time.sleep(1)
+                
+                # Retry if we haven't exhausted attempts
+                if attempt < SSH_RETRY_ATTEMPTS:
+                    self.log(f"Retrying SSH to {target_ip} in {SSH_RETRY_DELAY} seconds...", "WARN")
+                    time.sleep(SSH_RETRY_DELAY)
+                    return self.ssh_to_device(shell, target_ip, attempt + 1)
+                else:
+                    self.log(f"SSH authentication to {target_ip} failed after {SSH_RETRY_ATTEMPTS} attempts", "ERROR")
+                    return False
             
-            # Enter enable mode if needed
-            if out.strip().endswith(">"):
-                self.send_cmd(shell, "enable", 
-                             patterns=("assword:", "#"), 
-                             timeout=10, silent=True)
-                self.send_cmd(shell, PASSWORD, 
-                             patterns=("#",), 
-                             timeout=10, silent=True)
-            
-            # Disable paging
-            self.send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5, silent=True)
-            self.log(f"Successfully connected to {target_ip}")
-            return True
+            # Check if we got a prompt (success)
+            if "#" in out or ">" in out:
+                # Enter enable mode if needed
+                if out.strip().endswith(">"):
+                    self.send_cmd(shell, "enable", 
+                                 patterns=("assword:", "#"), 
+                                 timeout=15, silent=True)
+                    self.send_cmd(shell, PASSWORD, 
+                                 patterns=("#",), 
+                                 timeout=15, silent=True)
+                
+                # Disable paging
+                self.send_cmd(shell, "terminal length 0", patterns=("#",), timeout=10, silent=True)
+                self.log(f"Successfully connected to {target_ip}")
+                return True
+            else:
+                self.log(f"Failed to get prompt from {target_ip}", "ERROR")
+                # Try to recover
+                shell.send("\x03")  # Ctrl+C
+                time.sleep(1)
+                
+                # Retry if we haven't exhausted attempts
+                if attempt < SSH_RETRY_ATTEMPTS:
+                    self.log(f"Retrying SSH to {target_ip} in {SSH_RETRY_DELAY} seconds...", "WARN")
+                    time.sleep(SSH_RETRY_DELAY)
+                    return self.ssh_to_device(shell, target_ip, attempt + 1)
+                else:
+                    self.log(f"SSH to {target_ip} failed to get prompt after {SSH_RETRY_ATTEMPTS} attempts", "ERROR")
+                    return False
             
         except Exception as e:
-            self.log(f"Failed to SSH to {target_ip}: {e}", "ERROR")
-            return False
+            self.log(f"Exception during SSH to {target_ip}: {e}", "ERROR")
+            # Attempt to recover the shell
+            try:
+                shell.send("\x03")  # Ctrl+C
+                time.sleep(1)
+                shell.send("exit\n")
+                time.sleep(1)
+                # Clear buffer
+                if shell.recv_ready():
+                    shell.recv(MAX_READ)
+            except:
+                pass
+            
+            # Retry if we haven't exhausted attempts
+            if attempt < SSH_RETRY_ATTEMPTS:
+                self.log(f"Retrying SSH to {target_ip} in {SSH_RETRY_DELAY} seconds...", "WARN")
+                time.sleep(SSH_RETRY_DELAY)
+                return self.ssh_to_device(shell, target_ip, attempt + 1)
+            else:
+                self.log(f"SSH to {target_ip} failed with exception after {SSH_RETRY_ATTEMPTS} attempts", "ERROR")
+                return False
 
     def exit_device(self, shell):
         """Exit from current SSH session"""
         try:
-            self.send_cmd(shell, "exit", patterns=("#", ">", "closed"), timeout=5, silent=True)
-            time.sleep(0.5)
-        except:
-            pass
+            self.send_cmd(shell, "exit", patterns=("#", ">", "closed", "Connection"), timeout=5, silent=True)
+            time.sleep(1)
+            # Clear any remaining output
+            if shell.recv_ready():
+                shell.recv(MAX_READ)
+        except Exception as e:
+            self.log(f"Exception during exit: {e}", "DEBUG")
+            # Try to force exit with Ctrl+C
+            try:
+                shell.send("\x03")  # Ctrl+C
+                time.sleep(0.5)
+                shell.send("exit\n")
+                time.sleep(0.5)
+            except:
+                pass
 
     def get_hostname(self, shell):
         """Extract hostname from prompt"""
@@ -379,11 +466,11 @@ class NetworkDiscovery:
         return neighbor_groups
 
     def discover_neighbors(self, shell, current_device_ip):
-        """Discover neighbors using BOTH CDP and LLDP, merge results intelligently"""
-        all_neighbors_by_ip = {}  # Key: mgmt_ip, Value: list of neighbor entries
+        """Discover neighbors using BOTH CDP and LLDP, merge by hostname with CDP priority"""
+        all_neighbors_by_hostname = {}  # Key: hostname, Value: list of neighbor entries
         protocols_used = []
         
-        # Try CDP first
+        # Try CDP first - CDP IPs are considered authoritative
         self.log("Checking CDP neighbors...")
         cdp_output = self.send_cmd(shell, "show cdp neighbors detail", timeout=20, silent=True)
         
@@ -393,11 +480,18 @@ class NetworkDiscovery:
                 self.log(f"Found {len(cdp_neighbors)} CDP neighbors")
                 protocols_used.append("CDP")
                 for nbr in cdp_neighbors:
-                    if nbr["mgmt_ip"]:
+                    if nbr["hostname"] and nbr["mgmt_ip"]:
                         nbr["discovered_via"] = "CDP"
-                        if nbr["mgmt_ip"] not in all_neighbors_by_ip:
-                            all_neighbors_by_ip[nbr["mgmt_ip"]] = []
-                        all_neighbors_by_ip[nbr["mgmt_ip"]].append(nbr)
+                        
+                        # Register this hostname-to-IP mapping (CDP is authoritative)
+                        if nbr["hostname"] not in self.hostname_to_ip:
+                            self.hostname_to_ip[nbr["hostname"]] = nbr["mgmt_ip"]
+                            self.log(f"  Registered: {nbr['hostname']} → {nbr['mgmt_ip']} (CDP)", "DEBUG")
+                        
+                        # Use hostname as key
+                        if nbr["hostname"] not in all_neighbors_by_hostname:
+                            all_neighbors_by_hostname[nbr["hostname"]] = []
+                        all_neighbors_by_hostname[nbr["hostname"]].append(nbr)
         else:
             self.log("CDP not enabled or available")
         
@@ -411,36 +505,53 @@ class NetworkDiscovery:
                 self.log(f"Found {len(lldp_neighbors)} LLDP neighbors")
                 protocols_used.append("LLDP")
                 for nbr in lldp_neighbors:
-                    if nbr["mgmt_ip"]:
+                    if nbr["hostname"] and nbr["mgmt_ip"]:
                         nbr["discovered_via"] = "LLDP"
-                        if nbr["mgmt_ip"] not in all_neighbors_by_ip:
-                            all_neighbors_by_ip[nbr["mgmt_ip"]] = []
+                        
+                        # Check if hostname already has an authoritative IP from CDP
+                        if nbr["hostname"] in self.hostname_to_ip:
+                            authoritative_ip = self.hostname_to_ip[nbr["hostname"]]
+                            if authoritative_ip != nbr["mgmt_ip"]:
+                                self.log(f"  Note: {nbr['hostname']} has different IPs - CDP: {authoritative_ip}, LLDP: {nbr['mgmt_ip']} - using CDP IP", "DEBUG")
+                                # Replace LLDP IP with CDP IP for consistency
+                                nbr["lldp_ip"] = nbr["mgmt_ip"]  # Store original LLDP IP
+                                nbr["mgmt_ip"] = authoritative_ip  # Use CDP IP
                         else:
-                            # Check if this is a duplicate of a CDP entry (same interface)
-                            is_duplicate = False
-                            for existing in all_neighbors_by_ip[nbr["mgmt_ip"]]:
+                            # First time seeing this hostname - register LLDP IP
+                            self.hostname_to_ip[nbr["hostname"]] = nbr["mgmt_ip"]
+                            self.log(f"  Registered: {nbr['hostname']} → {nbr['mgmt_ip']} (LLDP)", "DEBUG")
+                        
+                        # Check if this hostname was already found via CDP on same interface
+                        if nbr["hostname"] in all_neighbors_by_hostname:
+                            existing_entries = all_neighbors_by_hostname[nbr["hostname"]]
+                            is_duplicate_interface = False
+                            
+                            for existing in existing_entries:
                                 if (existing.get("local_intf") == nbr["local_intf"] and 
                                     existing.get("discovered_via") == "CDP"):
-                                    is_duplicate = True
+                                    is_duplicate_interface = True
                                     self.log(f"  Skipping LLDP entry for {nbr['hostname']} on {nbr['local_intf']} - already found via CDP")
                                     break
-                            if is_duplicate:
-                                continue
-                        
-                        all_neighbors_by_ip[nbr["mgmt_ip"]].append(nbr)
+                            
+                            if not is_duplicate_interface:
+                                # Different interface to same device - add it
+                                all_neighbors_by_hostname[nbr["hostname"]].append(nbr)
+                        else:
+                            # New hostname - add it
+                            all_neighbors_by_hostname[nbr["hostname"]] = [nbr]
         else:
             self.log("LLDP not enabled or available")
         
-        if not all_neighbors_by_ip:
+        if not all_neighbors_by_hostname:
             self.log("No neighbors found via CDP or LLDP", "WARN")
             return [], None
         
-        # Process neighbor groups and detect multiple links to same device
+        # Flatten the structure and detect multiple links to same device
         all_neighbors = []
-        for neighbor_ip, links in all_neighbors_by_ip.items():
+        for hostname, links in all_neighbors_by_hostname.items():
             if len(links) > 1:
                 # Multiple links to same device
-                self.log(f"  ⚠️  Multiple links detected to {links[0]['hostname']} ({neighbor_ip}): {len(links)} links")
+                self.log(f"  ⚠️  Multiple links detected to {hostname}: {len(links)} links")
                 
                 # Add all links with a note
                 for idx, nbr in enumerate(links, 1):
@@ -469,6 +580,18 @@ class NetworkDiscovery:
             if not self.ssh_to_device(self.agg_shell, mgmt_ip):
                 ssh_accessible = False
                 self.log(f"⚠️  Cannot SSH to {mgmt_ip} - marking as inaccessible", "WARN")
+                
+                # Verify we're back at the aggregate prompt
+                self.log("Verifying connection to aggregate switch...", "DEBUG")
+                try:
+                    self.agg_shell.send("\n")
+                    time.sleep(1)
+                    if self.agg_shell.recv_ready():
+                        buff = self.agg_shell.recv(MAX_READ).decode("utf-8", "ignore")
+                        self.log(f"Current prompt: {buff[-100:]}", "DEBUG")
+                except Exception as e:
+                    self.log(f"Shell verification exception: {e}", "ERROR")
+                
                 # Return minimal device info
                 return {
                     "hostname": "Unknown",
@@ -491,6 +614,11 @@ class NetworkDiscovery:
             if not actual_mgmt_ip:
                 actual_mgmt_ip = mgmt_ip
             self.log(f"Management IP (VLAN 100): {actual_mgmt_ip}")
+            
+            # Update hostname-to-IP mapping with actual discovered IP
+            if hostname not in self.hostname_to_ip:
+                self.hostname_to_ip[hostname] = actual_mgmt_ip
+                self.log(f"Registered: {hostname} → {actual_mgmt_ip}", "DEBUG")
             
             serial = self.get_serial_number(self.agg_shell)
             self.log(f"Serial Number: {serial}")
@@ -544,12 +672,16 @@ class NetworkDiscovery:
                 
                 device_info["neighbors"].append(neighbor_entry)
                 
-                # Add to visit queue if not already visited and not the seed aggregate
+                # Add to visit queue if not already visited and not already in queue
                 if (nbr["mgmt_ip"] not in self.visited and 
-                    nbr["mgmt_ip"] not in [d for d in self.to_visit] and
                     nbr["mgmt_ip"] != self.seed_aggregate_ip):
-                    self.to_visit.append(nbr["mgmt_ip"])
-                    self.log(f"    Added {nbr['mgmt_ip']} to discovery queue")
+                    # Check if already in queue
+                    already_queued = any(ip == nbr["mgmt_ip"] for ip in self.to_visit)
+                    if not already_queued:
+                        self.to_visit.append(nbr["mgmt_ip"])
+                        self.log(f"    Added {nbr['mgmt_ip']} to discovery queue")
+                    else:
+                        self.log(f"    {nbr['mgmt_ip']} already in discovery queue")
                 elif nbr["mgmt_ip"] == self.seed_aggregate_ip:
                     self.log(f"    Skipping seed aggregate {nbr['mgmt_ip']} - already discovered")
             
@@ -599,10 +731,13 @@ class NetworkDiscovery:
             self.log(f"  → Found neighbor: {nbr['hostname']} ({nbr['mgmt_ip']}) "
                     f"via {nbr['local_intf']} ↔ {nbr['remote_intf']} [{discovery_method}]{note_str}")
             
-            # Add to visit queue
-            if nbr["mgmt_ip"] not in self.to_visit:
+            # Add to visit queue - check if already queued
+            already_queued = any(ip == nbr["mgmt_ip"] for ip in self.to_visit)
+            if not already_queued:
                 self.to_visit.append(nbr["mgmt_ip"])
                 self.log(f"    Added {nbr['mgmt_ip']} to discovery queue")
+            else:
+                self.log(f"    {nbr['mgmt_ip']} already in discovery queue")
         
         # Add any additional aggregate IPs from config (but not the seed)
         for ip in AGGREGATE_MGMT_IPS:
@@ -749,6 +884,13 @@ class NetworkDiscovery:
             
             if multiple_link_count > 0:
                 f.write(f"Connections with multiple links: {multiple_link_count}\n")
+            
+            # Write hostname-to-IP mapping
+            f.write("\n" + "="*60 + "\n")
+            f.write("HOSTNAME TO IP MAPPING\n")
+            f.write("="*60 + "\n")
+            for hostname, ip in sorted(self.hostname_to_ip.items()):
+                f.write(f"{hostname} → {ip}\n")
             
         self.log(f"📊 Metadata saved to {filename}")
 
