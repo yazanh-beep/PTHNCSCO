@@ -10,14 +10,15 @@ from datetime import datetime
 # --- USER CONFIG -------------------------------------------------------------
 USERNAME = "admin"
 PASSWORD = "cisco"
-ROOT_IP = "192.168.1.8"
+ROOT_IP = "192.168.100.11"
 TIMEOUT = 10
 MAX_READ = 65535
+SSH_RETRY_ATTEMPTS = 2  # Number of times to retry SSH connection on failure
+SSH_RETRY_DELAY = 5  # Seconds to wait between retry attempts
 
 # List of aggregate switch IPs to start discovery from
 AGGREGATE_IPS = [
-    "10.29.128.1",
-    "10.29.128.2",
+    "10.21.128.3" , "10.21.128.4"
     # Add more aggregate switch IPs here
 ]
 # -----------------------------------------------------------------------------
@@ -39,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 def expect_prompt(shell, patterns, timeout=TIMEOUT):
-    """Wait for expected prompt patterns in shell output"""
+    """Wait for specific patterns in shell output"""
     buf, end = "", time.time() + timeout
     while time.time() < end:
         if shell.recv_ready():
@@ -56,9 +57,14 @@ def expect_prompt(shell, patterns, timeout=TIMEOUT):
 def send_cmd(shell, cmd, patterns=("#", ">"), timeout=TIMEOUT):
     """Send command and wait for response"""
     logger.debug(f"CMD: {cmd}")
-    shell.send(cmd + "\n")
-    out = expect_prompt(shell, patterns, timeout)
-    return out
+    try:
+        shell.send(cmd + "\n")
+        time.sleep(0.3)  # Small delay for command to process
+        out = expect_prompt(shell, patterns, timeout)
+        return out
+    except Exception as e:
+        logger.error(f"Exception in send_cmd: {e}")
+        return ""
 
 
 def connect_switch(ip):
@@ -81,25 +87,137 @@ def connect_switch(ip):
         return None, None
 
 
-def hop_to_neighbor(shell, ip):
-    """SSH hop from current switch to neighbor"""
-    logger.info(f"SSH hopping to {ip}")
-    out = send_cmd(shell, f"ssh -l {USERNAME} {ip}",
-                   patterns=("Destination", "(yes/no)?", "assword:", "%", "#", ">"),
-                   timeout=20)
-    if "(yes/no)?" in out or "yes/no" in out:
-        out = send_cmd(shell, "yes", patterns=("assword:", "%", "#", ">"), timeout=15)
-    if "assword:" in out:
-        out = send_cmd(shell, PASSWORD, patterns=("%", "#", ">"), timeout=15)
-    if out.strip().endswith(">"):
-        send_cmd(shell, "enable", patterns=("assword:", "#"), timeout=15)
-        send_cmd(shell, PASSWORD, patterns=("#",), timeout=15)
-    send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
-    logger.info(f"Successfully hopped to {ip}")
+def hop_to_neighbor(shell, ip, attempt=1):
+    """SSH hop from current switch to neighbor with retry logic - returns True if successful, False otherwise"""
+    logger.info(f"SSH hopping to {ip} (attempt {attempt}/{SSH_RETRY_ATTEMPTS})")
+    try:
+        out = send_cmd(shell, f"ssh -l {USERNAME} {ip}",
+                       patterns=("Destination", "(yes/no)?", "assword:", "%", "#", ">", 
+                                "Connection refused", "Connection timed out", "Unable to connect"),
+                       timeout=60)
+        
+        # Check for immediate connection failures
+        if "Connection refused" in out or "Unable to connect" in out or "% Connection" in out or "Connection timed out" in out:
+            logger.error(f"SSH connection failed to {ip} - connection refused/timed out")
+            # Send Ctrl+C to cancel the SSH attempt
+            shell.send("\x03")
+            time.sleep(1)
+            shell.send("\n")
+            time.sleep(0.5)
+            # Clear any remaining output
+            if shell.recv_ready():
+                shell.recv(MAX_READ)
+            
+            # Retry if we haven't exhausted attempts
+            if attempt < SSH_RETRY_ATTEMPTS:
+                logger.warning(f"Retrying SSH to {ip} in {SSH_RETRY_DELAY} seconds...")
+                time.sleep(SSH_RETRY_DELAY)
+                return hop_to_neighbor(shell, ip, attempt + 1)
+            else:
+                logger.error(f"SSH to {ip} failed after {SSH_RETRY_ATTEMPTS} attempts")
+                return False
+        
+        # Handle SSH key acceptance
+        if "(yes/no)?" in out or "yes/no" in out:
+            out = send_cmd(shell, "yes", 
+                          patterns=("assword:", "%", "#", ">"), 
+                          timeout=30)
+        
+        # Handle password prompt
+        if "assword:" in out:
+            out = send_cmd(shell, PASSWORD, 
+                          patterns=("%", "#", ">", "Permission denied", "Authentication failed"), 
+                          timeout=30)
+        
+        # Check for authentication failures
+        if "Permission denied" in out or "Authentication failed" in out or "% Authentication" in out:
+            logger.error(f"SSH authentication failed to {ip}")
+            # Try to get back to previous prompt
+            shell.send("\x03")
+            time.sleep(1)
+            shell.send("exit\n")
+            time.sleep(1)
+            
+            # Retry if we haven't exhausted attempts
+            if attempt < SSH_RETRY_ATTEMPTS:
+                logger.warning(f"Retrying SSH to {ip} in {SSH_RETRY_DELAY} seconds...")
+                time.sleep(SSH_RETRY_DELAY)
+                return hop_to_neighbor(shell, ip, attempt + 1)
+            else:
+                logger.error(f"SSH authentication to {ip} failed after {SSH_RETRY_ATTEMPTS} attempts")
+                return False
+        
+        # Check if we got a prompt (success)
+        if "#" in out or ">" in out:
+            # Enter enable mode if needed
+            if out.strip().endswith(">"):
+                send_cmd(shell, "enable", patterns=("assword:", "#"), timeout=15)
+                send_cmd(shell, PASSWORD, patterns=("#",), timeout=15)
+            
+            send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
+            logger.info(f"Successfully hopped to {ip}")
+            return True
+        else:
+            logger.error(f"Failed to get prompt from {ip}")
+            # Try to recover
+            shell.send("\x03")
+            time.sleep(1)
+            
+            # Retry if we haven't exhausted attempts
+            if attempt < SSH_RETRY_ATTEMPTS:
+                logger.warning(f"Retrying SSH to {ip} in {SSH_RETRY_DELAY} seconds...")
+                time.sleep(SSH_RETRY_DELAY)
+                return hop_to_neighbor(shell, ip, attempt + 1)
+            else:
+                logger.error(f"SSH to {ip} failed to get prompt after {SSH_RETRY_ATTEMPTS} attempts")
+                return False
+            
+    except Exception as e:
+        logger.error(f"Exception during SSH to {ip}: {e}")
+        # Attempt to recover the shell
+        try:
+            shell.send("\x03")
+            time.sleep(1)
+            shell.send("exit\n")
+            time.sleep(1)
+            # Clear buffer
+            if shell.recv_ready():
+                shell.recv(MAX_READ)
+        except:
+            pass
+        
+        # Retry if we haven't exhausted attempts
+        if attempt < SSH_RETRY_ATTEMPTS:
+            logger.warning(f"Retrying SSH to {ip} in {SSH_RETRY_DELAY} seconds...")
+            time.sleep(SSH_RETRY_DELAY)
+            return hop_to_neighbor(shell, ip, attempt + 1)
+        else:
+            logger.error(f"SSH to {ip} failed with exception after {SSH_RETRY_ATTEMPTS} attempts")
+            return False
+
+
+def exit_device(shell):
+    """Exit from current SSH session"""
+    try:
+        send_cmd(shell, "exit", patterns=("#", ">", "closed", "Connection"), timeout=5)
+        time.sleep(1)
+        # Clear any remaining output
+        if shell.recv_ready():
+            shell.recv(MAX_READ)
+    except Exception as e:
+        logger.debug(f"Exception during exit: {e}")
+        # Try to force exit with Ctrl+C
+        try:
+            shell.send("\x03")  # Ctrl+C
+            time.sleep(0.5)
+            shell.send("exit\n")
+            time.sleep(0.5)
+        except:
+            pass
 
 
 def get_hostname(shell):
-    """Extract hostname from current CLI prompt"""
+    """Extract hostname from prompt"""
     shell.send("\n")
     buff = expect_prompt(shell, ("#", ">"), timeout=5)
     for line in reversed(buff.splitlines()):
@@ -181,7 +299,7 @@ def parse_lldp_detail(raw):
             entry["port_id"] = m.group(1)
         if m := re.search(r"System Name:\s*(\S+)", blk, re.IGNORECASE):
             entry["remote_name"] = m.group(1)
-        if m := re.search(r"System Description:\s*([\s\S]+?)(?:\n\s*\n|Time remaining)", blk, re.IGNORECASE):
+        if m := re.search(r"System Description:\s*([\s\S]+?)(?=\n\s*\n|Time remaining)", blk, re.IGNORECASE):
             entry["sys_descr"] = m.group(1).strip()
         if m := re.search(r"Management Addresses:[\s\S]*?IP:\s*(\d+\.\d+\.\d+\.\d+)", blk, re.IGNORECASE):
             entry["mgmt_ip"] = m.group(1)
@@ -203,7 +321,8 @@ def get_interface_status(shell):
         
         parts = re.split(r"\s+", line)
         if len(parts) >= 5:
-            intf, ip, ok, method, status, protocol = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5] if len(parts) > 5 else ""
+            intf, ip, ok, method, status = parts[0], parts[1], parts[2], parts[3], parts[4]
+            protocol = parts[5] if len(parts) > 5 else ""
             # Check if interface is up
             if status.lower() == "up":
                 # Only include physical interfaces (Gig, Ten, etc)
@@ -271,49 +390,6 @@ def map_ie_port(port_id):
     return None
 
 
-def get_uplink_ports_from_lldp(shell):
-    """Get all uplink ports by checking LLDP neighbors on edge switch"""
-    logger.info("Running 'show lldp neighbors detail' to detect uplinks")
-    
-    lldp_raw = send_cmd(shell, "show lldp neighbors detail", patterns=("#",), timeout=20)
-    
-    logger.debug(f"LLDP output length: {len(lldp_raw)} chars")
-    
-    neighbors = parse_lldp_detail(lldp_raw)
-    logger.info(f"Found {len(neighbors)} LLDP neighbors")
-    
-    uplink_ports = []
-    for nbr in neighbors:
-        remote_name = nbr.get("remote_name", "")
-        local_intf = nbr.get("local_intf", "")
-        port_id = nbr.get("port_id", "")
-        
-        logger.debug(f"Neighbor: {remote_name}, Local Intf: {local_intf}, Port ID: {port_id}")
-        
-        # If neighbor is an aggregate or server switch, this is an uplink
-        if remote_name and (is_aggregate_switch(remote_name) or is_server_switch(remote_name)):
-            uplink_port = local_intf
-            
-            # If local_intf is empty but we have port_id, this might be an IE switch
-            if not uplink_port and port_id:
-                logger.debug(f"No local_intf, attempting to map port_id: {port_id}")
-                mapped_port = map_ie_port(port_id)
-                if mapped_port:
-                    uplink_port = mapped_port
-                    logger.debug(f"Mapped {port_id} → {uplink_port}")
-            
-            if uplink_port:
-                uplink_ports.append(uplink_port)
-                logger.info(f"UPLINK DETECTED: {uplink_port} → {remote_name}")
-            else:
-                logger.warning(f"Could not determine uplink port for neighbor {remote_name}")
-        else:
-            logger.debug(f"Skipping neighbor {remote_name} (not AGG/SRV)")
-    
-    logger.info(f"Total uplinks identified: {len(uplink_ports)}")
-    return uplink_ports
-
-
 def normalize_interface_name(intf):
     """Normalize interface name for comparison (handles abbreviated forms)"""
     if not intf:
@@ -370,11 +446,54 @@ def is_same_interface(intf1, intf2):
     return False
 
 
+def get_uplink_ports_from_lldp(shell):
+    """Get all uplink ports by checking LLDP neighbors on edge switch"""
+    logger.info("Running 'show lldp neighbors detail' to detect uplinks")
+    
+    lldp_raw = send_cmd(shell, "show lldp neighbors detail", patterns=("#",), timeout=20)
+    
+    logger.debug(f"LLDP output length: {len(lldp_raw)} chars")
+    
+    neighbors = parse_lldp_detail(lldp_raw)
+    logger.info(f"Found {len(neighbors)} LLDP neighbors")
+    
+    uplink_ports = []
+    for nbr in neighbors:
+        remote_name = nbr.get("remote_name", "")
+        local_intf = nbr.get("local_intf", "")
+        port_id = nbr.get("port_id", "")
+        
+        logger.debug(f"Neighbor: {remote_name}, Local Intf: {local_intf}, Port ID: {port_id}")
+        
+        # If neighbor is an aggregate or server switch, this is an uplink
+        if remote_name and (is_aggregate_switch(remote_name) or is_server_switch(remote_name)):
+            uplink_port = local_intf
+            
+            # If local_intf is empty but we have port_id, this might be an IE switch
+            if not uplink_port and port_id:
+                logger.debug(f"No local_intf, attempting to map port_id: {port_id}")
+                mapped_port = map_ie_port(port_id)
+                if mapped_port:
+                    uplink_port = mapped_port
+                    logger.debug(f"Mapped {port_id} → {uplink_port}")
+            
+            if uplink_port:
+                uplink_ports.append(uplink_port)
+                logger.info(f"UPLINK DETECTED: {uplink_port} → {remote_name}")
+            else:
+                logger.warning(f"Could not determine uplink port for neighbor {remote_name}")
+        else:
+            logger.debug(f"Skipping neighbor {remote_name} (not AGG/SRV)")
+    
+    logger.info(f"Total uplinks identified: {len(uplink_ports)}")
+    return uplink_ports
+
+
 def discover_cameras_from_edge(shell, edge_hostname):
     """Collect camera MAC addresses from edge switch"""
-    logger.info(f"='*80")
+    logger.info("="*80)
     logger.info(f"Scanning edge switch: {edge_hostname}")
-    logger.info(f"='*80")
+    logger.info("="*80)
     
     # Clear dynamic MAC address table to get fresh data
     logger.info("Clearing dynamic MAC address table...")
@@ -388,7 +507,7 @@ def discover_cameras_from_edge(shell, edge_hostname):
     
     if not uplink_ports:
         logger.warning(f"No uplink ports detected via LLDP on {edge_hostname}")
-        logger.warning(f"This means ALL ports will be scanned - this may be incorrect!")
+        logger.warning("This means ALL ports will be scanned - this may be incorrect!")
     else:
         logger.info(f"Uplink ports to exclude: {uplink_ports}")
     
@@ -434,13 +553,13 @@ def discover_cameras_from_edge(shell, edge_hostname):
         else:
             logger.debug(f"No MAC entries in VLAN 800 on {intf}")
     
-    logger.info(f"")
+    logger.info("")
     logger.info(f"Summary for {edge_hostname}:")
     logger.info(f"  - Total UP interfaces: {len(up_interfaces)}")
     logger.info(f"  - Uplink ports excluded: {len(uplink_ports)}")
     logger.info(f"  - Ports scanned: {scanned_count}")
     logger.info(f"  - Cameras found: {camera_count}")
-    logger.info(f"='*80")
+    logger.info("="*80)
 
 
 def process_edge_switch(shell, agg_ip, neighbor_info):
@@ -452,27 +571,48 @@ def process_edge_switch(shell, agg_ip, neighbor_info):
     if not edge_ip or edge_ip in visited_switches:
         return
     
-    logger.info(f"")
-    logger.info(f"={'*'*80}")
+    logger.info("")
+    logger.info("*"*80)
     logger.info(f"Processing EDGE SWITCH: {edge_name} ({edge_ip})")
     logger.info(f"Connected via aggregate port: {local_intf}")
-    logger.info(f"={'*'*80}")
+    logger.info("*"*80)
     
     visited_switches.add(edge_ip)
     
-    # Hop to edge switch
-    try:
-        hop_to_neighbor(shell, edge_ip)
+    # Hop to edge switch with retry logic
+    ssh_success = hop_to_neighbor(shell, edge_ip)
+    
+    if not ssh_success:
+        logger.error(f"Cannot SSH to {edge_name} ({edge_ip}) - SKIPPING after all retry attempts")
+        logger.info("Verifying connection to aggregate switch...")
         
+        # Verify we're back at the aggregate prompt
+        try:
+            shell.send("\n")
+            time.sleep(1)
+            if shell.recv_ready():
+                buff = shell.recv(MAX_READ).decode("utf-8", "ignore")
+                logger.debug(f"Current prompt after failed SSH: {buff[-100:]}")
+        except Exception as e:
+            logger.error(f"Shell verification exception: {e}")
+        
+        return
+    
+    # Successfully connected - proceed with discovery
+    try:
         # Discover cameras - uplinks will be auto-detected from LLDP
         discover_cameras_from_edge(shell, edge_name)
         
-        # Return to aggregate switch
-        send_cmd(shell, "exit", patterns=("#", ">"), timeout=5)
-        logger.info(f"Returned to aggregate switch")
-        
     except Exception as e:
-        logger.error(f"Failed to process edge switch {edge_name}: {e}", exc_info=True)
+        logger.error(f"Error during camera discovery on {edge_name}: {e}", exc_info=True)
+    finally:
+        # Always try to exit back to aggregate
+        try:
+            exit_device(shell)
+            time.sleep(1)
+            logger.info("Returned to aggregate switch")
+        except Exception as e:
+            logger.error(f"Error exiting from {edge_name}: {e}")
 
 
 def scan_aggregate_switch(shell, agg_ip):
@@ -484,10 +624,10 @@ def scan_aggregate_switch(shell, agg_ip):
     visited_switches.add(agg_ip)
     hostname = get_hostname(shell)
     
-    logger.info(f"")
-    logger.info(f"{'#'*80}")
+    logger.info("")
+    logger.info("#"*80)
     logger.info(f"Scanning AGGREGATE: {hostname} ({agg_ip})")
-    logger.info(f"{'#'*80}")
+    logger.info("#"*80)
     
     # Get LLDP neighbors
     lldp_raw = send_cmd(shell, "show lldp neighbors detail", patterns=("#",), timeout=20)
@@ -535,19 +675,24 @@ def main():
         # All work must be done from the root switch shell by SSH hopping
         # Process each aggregate switch by hopping from root
         for agg_ip in AGGREGATE_IPS:
-            logger.info(f"")
-            logger.info(f"{'*'*80}")
+            logger.info("")
+            logger.info("*"*80)
             logger.info(f"PROCESSING AGGREGATE: {agg_ip}")
-            logger.info(f"{'*'*80}")
+            logger.info("*"*80)
             
             # Always hop to aggregate from root
-            hop_to_neighbor(shell, agg_ip)
+            hop_success = hop_to_neighbor(shell, agg_ip)
+            
+            if not hop_success:
+                logger.error(f"Failed to connect to aggregate {agg_ip} - skipping")
+                continue
             
             scan_aggregate_switch(shell, agg_ip)
             
             # Return to root switch
-            send_cmd(shell, "exit", patterns=("#", ">"), timeout=5)
-            logger.info(f"Returned to root switch")
+            exit_device(shell)
+            time.sleep(1)
+            logger.info("Returned to root switch")
         
     except Exception as e:
         logger.error(f"Fatal error during discovery: {e}", exc_info=True)
