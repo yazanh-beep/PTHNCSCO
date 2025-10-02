@@ -13,7 +13,7 @@ from collections import deque
 # ─── USER CONFIG ─────────────────────────────────────────────────────────────
 USERNAME = "admin"
 PASSWORD = "cisco"
-AGGREGATE_ENTRY_IP = "192.168.100.1"  # Entry point from server
+AGGREGATE_ENTRY_IP = "192.168.100.11"  # Entry point from server
 AGGREGATE_MGMT_IPS = [
     # Add your aggregate switch management IPs here (VLAN 100 IPs)
     # Example: "10.0.100.1", "10.0.100.2"
@@ -453,17 +453,32 @@ class NetworkDiscovery:
                     
         return neighbors
 
-    def group_links_by_neighbor(self, neighbors):
-        """Group neighbors by IP to detect multiple links to same device"""
-        neighbor_groups = {}
+    def normalize_interface_name(self, interface):
+        """Normalize interface names for comparison (Te1/1/1 = TenGigabitEthernet1/1/1)"""
+        if not interface:
+            return interface
         
-        for nbr in neighbors:
-            neighbor_ip = nbr["mgmt_ip"]
-            if neighbor_ip not in neighbor_groups:
-                neighbor_groups[neighbor_ip] = []
-            neighbor_groups[neighbor_ip].append(nbr)
+        # Mapping of short forms to full forms
+        replacements = {
+            'Te': 'TenGigabitEthernet',
+            'Gi': 'GigabitEthernet',
+            'Fa': 'FastEthernet',
+            'Et': 'Ethernet',
+            'Po': 'Port-channel',
+            'Vl': 'Vlan'
+        }
         
-        return neighbor_groups
+        interface = interface.strip()
+        
+        # Try to match and replace short forms
+        for short, full in replacements.items():
+            if interface.startswith(short) and len(interface) > len(short):
+                # Check if next character is a digit or slash
+                next_char = interface[len(short)]
+                if next_char.isdigit() or next_char == '/':
+                    return interface.replace(short, full, 1)
+        
+        return interface
 
     def discover_neighbors(self, shell, current_device_ip):
         """Discover neighbors using BOTH CDP and LLDP, merge by hostname with CDP priority"""
@@ -711,38 +726,94 @@ class NetworkDiscovery:
         # Connect to aggregate
         agg_mgmt_ip = self.connect_to_aggregate()
         
-        # Mark seed aggregate as visited but DON'T collect its info
+        # Collect full info from seed aggregate first
         self.log("\n" + "="*60)
-        self.log(f"Seed aggregate: {agg_mgmt_ip} - Skipping detailed collection")
+        self.log(f"Collecting seed aggregate information: {agg_mgmt_ip}")
         self.log("="*60)
         
-        self.visited.add(agg_mgmt_ip)
-        
-        # Discover neighbors from seed aggregate to populate the queue
-        self.log("Discovering neighbors from seed aggregate...")
-        neighbors, protocol = self.discover_neighbors(self.agg_shell, agg_mgmt_ip)
-        
-        # Add neighbors to discovery queue
-        for nbr in neighbors:
-            discovery_method = nbr.get("discovered_via", "Unknown")
-            link_note = nbr.get("link_note", "")
-            note_str = f" [{link_note}]" if link_note else ""
+        try:
+            # Collect device information from seed aggregate
+            hostname = self.get_hostname(self.agg_shell)
+            self.log(f"Hostname: {hostname}")
             
-            self.log(f"  → Found neighbor: {nbr['hostname']} ({nbr['mgmt_ip']}) "
-                    f"via {nbr['local_intf']} ↔ {nbr['remote_intf']} [{discovery_method}]{note_str}")
+            # Register hostname-to-IP mapping
+            if hostname not in self.hostname_to_ip:
+                self.hostname_to_ip[hostname] = agg_mgmt_ip
+                self.log(f"Registered: {hostname} → {agg_mgmt_ip}", "DEBUG")
             
-            # Add to visit queue - check if already queued
-            already_queued = any(ip == nbr["mgmt_ip"] for ip in self.to_visit)
-            if not already_queued:
-                self.to_visit.append(nbr["mgmt_ip"])
-                self.log(f"    Added {nbr['mgmt_ip']} to discovery queue")
-            else:
-                self.log(f"    {nbr['mgmt_ip']} already in discovery queue")
+            serial = self.get_serial_number(self.agg_shell)
+            self.log(f"Serial Number: {serial}")
+            
+            ios_version = self.get_ios_version(self.agg_shell)
+            self.log(f"IOS Version: {ios_version}")
+            
+            switch_model = self.get_switch_model(self.agg_shell)
+            self.log(f"Switch Model: {switch_model}")
+            
+            device_role = self.determine_device_role(hostname)
+            self.log(f"Device Role: {device_role}")
+            
+            # Discover neighbors from seed aggregate
+            neighbors, protocol = self.discover_neighbors(self.agg_shell, agg_mgmt_ip)
+            
+            # Build device info for seed aggregate
+            seed_device_info = {
+                "hostname": hostname,
+                "management_ip": agg_mgmt_ip,
+                "serial_number": serial,
+                "ios_version": ios_version,
+                "switch_model": switch_model,
+                "device_role": device_role,
+                "discovery_protocol": protocol,
+                "notes": "Seed aggregate switch",
+                "neighbors": []
+            }
+            
+            # Process neighbors and add them to discovery queue
+            for nbr in neighbors:
+                discovery_method = nbr.get("discovered_via", "Unknown")
+                link_note = nbr.get("link_note", "")
+                note_str = f" [{link_note}]" if link_note else ""
+                
+                self.log(f"  → Neighbor: {nbr['hostname']} ({nbr['mgmt_ip']}) "
+                        f"via {nbr['local_intf']} ↔ {nbr['remote_intf']} [{discovery_method}]{note_str}")
+                
+                neighbor_entry = {
+                    "neighbor_hostname": nbr["hostname"],
+                    "neighbor_mgmt_ip": nbr["mgmt_ip"],
+                    "local_interface": nbr["local_intf"],
+                    "remote_interface": nbr["remote_intf"],
+                    "discovered_via": discovery_method
+                }
+                
+                if "link_note" in nbr:
+                    neighbor_entry["link_note"] = nbr["link_note"]
+                
+                seed_device_info["neighbors"].append(neighbor_entry)
+                
+                # Add to visit queue
+                already_queued = any(ip == nbr["mgmt_ip"] for ip in self.to_visit)
+                if not already_queued:
+                    self.to_visit.append(nbr["mgmt_ip"])
+                    self.log(f"    Added {nbr['mgmt_ip']} to discovery queue")
+                else:
+                    self.log(f"    {nbr['mgmt_ip']} already in discovery queue")
+            
+            # Store seed aggregate
+            self.devices[agg_mgmt_ip] = seed_device_info
+            self.visited.add(agg_mgmt_ip)
+            
+        except Exception as e:
+            self.log(f"Error collecting seed aggregate info: {e}", "ERROR")
+            import traceback
+            traceback.print_exc()
         
         # Add any additional aggregate IPs from config (but not the seed)
         for ip in AGGREGATE_MGMT_IPS:
-            if ip != agg_mgmt_ip and ip not in self.to_visit:
-                self.to_visit.append(ip)
+            if ip != agg_mgmt_ip and ip not in self.visited:
+                already_queued = any(queue_ip == ip for queue_ip in self.to_visit)
+                if not already_queued:
+                    self.to_visit.append(ip)
         
         # Discovery loop for remaining devices
         while self.to_visit:
