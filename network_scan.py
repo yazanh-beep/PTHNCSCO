@@ -537,23 +537,28 @@ class NetworkDiscovery:
                             self.log(f"  Registered: {nbr['hostname']} → {nbr['mgmt_ip']} (LLDP)", "DEBUG")
                         
                         # Check if this hostname was already found via CDP on same interface
+                        is_duplicate_interface = False
+                        
                         if nbr["hostname"] in all_neighbors_by_hostname:
                             existing_entries = all_neighbors_by_hostname[nbr["hostname"]]
-                            is_duplicate_interface = False
+                            
+                            # Normalize interface names for comparison
+                            lldp_intf_normalized = self.normalize_interface_name(nbr["local_intf"])
                             
                             for existing in existing_entries:
-                                if (existing.get("local_intf") == nbr["local_intf"] and 
+                                existing_intf_normalized = self.normalize_interface_name(existing.get("local_intf"))
+                                
+                                if (existing_intf_normalized == lldp_intf_normalized and 
                                     existing.get("discovered_via") == "CDP"):
                                     is_duplicate_interface = True
-                                    self.log(f"  Skipping LLDP entry for {nbr['hostname']} on {nbr['local_intf']} - already found via CDP")
+                                    self.log(f"  Skipping LLDP entry for {nbr['hostname']} on {nbr['local_intf']} - already found via CDP as {existing.get('local_intf')}", "DEBUG")
                                     break
-                            
-                            if not is_duplicate_interface:
-                                # Different interface to same device - add it
-                                all_neighbors_by_hostname[nbr["hostname"]].append(nbr)
-                        else:
-                            # New hostname - add it
-                            all_neighbors_by_hostname[nbr["hostname"]] = [nbr]
+                        
+                        # Only add if not a duplicate interface
+                        if not is_duplicate_interface:
+                            if nbr["hostname"] not in all_neighbors_by_hostname:
+                                all_neighbors_by_hostname[nbr["hostname"]] = []
+                            all_neighbors_by_hostname[nbr["hostname"]].append(nbr)
         else:
             self.log("LLDP not enabled or available")
         
