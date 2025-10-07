@@ -10,20 +10,15 @@ from datetime import datetime
 # --- USER CONFIG -------------------------------------------------------------
 USERNAME = "admin"
 PASSWORD = "cisco"
-ROOT_IP = "192.168.100.11"
+SEED_SWITCH_IP = "192.168.1.8"  # Starting aggregate switch IP
 TIMEOUT = 10
 MAX_READ = 65535
 SSH_RETRY_ATTEMPTS = 2  # Number of times to retry SSH connection on failure
 SSH_RETRY_DELAY = 5  # Seconds to wait between retry attempts
-
-# List of aggregate switch IPs to start discovery from
-AGGREGATE_IPS = [
-    "10.21.128.3" , "10.21.128.4"
-    # Add more aggregate switch IPs here
-]
 # -----------------------------------------------------------------------------
 
 visited_switches = set()
+discovered_aggregates = set()  # Track discovered aggregate switches
 camera_data = []
 
 # Setup logging
@@ -615,13 +610,43 @@ def process_edge_switch(shell, agg_ip, neighbor_info):
             logger.error(f"Error exiting from {edge_name}: {e}")
 
 
+def discover_aggregate_neighbors(shell, current_agg_hostname):
+    """Discover other aggregate switches from current aggregate"""
+    logger.info("Discovering neighboring aggregate switches...")
+    
+    lldp_raw = send_cmd(shell, "show lldp neighbors detail", patterns=("#",), timeout=20)
+    neighbors = parse_lldp_detail(lldp_raw)
+    
+    aggregate_neighbors = []
+    for nbr in neighbors:
+        remote_name = nbr.get("remote_name", "")
+        mgmt_ip = nbr.get("mgmt_ip", "")
+        
+        # Skip if no name or IP
+        if not remote_name or not mgmt_ip:
+            continue
+        
+        # Check if this is another aggregate switch
+        if is_aggregate_switch(remote_name):
+            # Don't add ourselves
+            if remote_name != current_agg_hostname:
+                aggregate_neighbors.append({
+                    "hostname": remote_name,
+                    "mgmt_ip": mgmt_ip
+                })
+                logger.info(f"  Found aggregate neighbor: {remote_name} ({mgmt_ip})")
+    
+    return aggregate_neighbors
+
+
 def scan_aggregate_switch(shell, agg_ip):
-    """Scan aggregate switch for connected edge switches"""
+    """Scan aggregate switch for connected edge switches and discover other aggregates"""
     if agg_ip in visited_switches:
         logger.info(f"Aggregate {agg_ip} already visited, skipping")
-        return
+        return []
     
     visited_switches.add(agg_ip)
+    discovered_aggregates.add(agg_ip)
     hostname = get_hostname(shell)
     
     logger.info("")
@@ -629,11 +654,15 @@ def scan_aggregate_switch(shell, agg_ip):
     logger.info(f"Scanning AGGREGATE: {hostname} ({agg_ip})")
     logger.info("#"*80)
     
-    # Get LLDP neighbors
+    # First, discover other aggregate switches
+    new_aggregates = discover_aggregate_neighbors(shell, hostname)
+    
+    # Get LLDP neighbors for edge switches
+    logger.info("Discovering edge switches...")
     lldp_raw = send_cmd(shell, "show lldp neighbors detail", patterns=("#",), timeout=20)
     neighbors = parse_lldp_detail(lldp_raw)
     
-    logger.info(f"Found {len(neighbors)} LLDP neighbors on aggregate")
+    logger.info(f"Found {len(neighbors)} total LLDP neighbors")
     
     edge_count = 0
     for nbr in neighbors:
@@ -649,61 +678,110 @@ def scan_aggregate_switch(shell, agg_ip):
             logger.info(f"Edge switch detected: {remote_name} - {nbr.get('mgmt_ip')}")
             process_edge_switch(shell, agg_ip, nbr)
         elif is_aggregate_switch(remote_name):
-            logger.debug(f"Skipping aggregate switch: {remote_name}")
+            logger.debug(f"Skipping aggregate switch: {remote_name} (will be processed separately)")
         elif is_server_switch(remote_name):
             logger.debug(f"Skipping server switch: {remote_name}")
         else:
             logger.debug(f"Skipping other device: {remote_name}")
     
     logger.info(f"Processed {edge_count} edge switches from {hostname}")
+    
+    # Return list of new aggregates to process
+    return new_aggregates
 
 
 def main():
     """Main execution function"""
     logger.info("="*80)
     logger.info("CAMERA DISCOVERY SCRIPT STARTED")
+    logger.info(f"Seed switch: {SEED_SWITCH_IP}")
     logger.info(f"Log file: {log_filename}")
     logger.info("="*80)
     
-    # Connect to root switch (this is our only direct connection)
-    client, shell = connect_switch(ROOT_IP)
+    # Connect to seed switch (this is our only direct connection)
+    client, shell = connect_switch(SEED_SWITCH_IP)
     if not client:
-        logger.error("Failed to connect to root switch. Exiting.")
+        logger.error("Failed to connect to seed switch. Exiting.")
         return
     
     try:
-        # All work must be done from the root switch shell by SSH hopping
-        # Process each aggregate switch by hopping from root
-        for agg_ip in AGGREGATE_IPS:
+        aggregates_to_process = []
+        
+        logger.info("")
+        logger.info("="*80)
+        logger.info("PHASE 1: DISCOVERING AGGREGATE SWITCHES")
+        logger.info("="*80)
+        
+        # Start with seed switch - it should be on an aggregate already
+        # Scan the seed aggregate and discover other aggregates
+        new_aggregates = scan_aggregate_switch(shell, SEED_SWITCH_IP)
+        
+        # Add discovered aggregates to processing queue
+        for agg in new_aggregates:
+            if agg["mgmt_ip"] not in discovered_aggregates:
+                aggregates_to_process.append(agg["mgmt_ip"])
+                logger.info(f"Added aggregate to queue: {agg['hostname']} ({agg['mgmt_ip']})")
+        
+        logger.info("")
+        logger.info("="*80)
+        logger.info(f"PHASE 2: PROCESSING {len(aggregates_to_process)} ADDITIONAL AGGREGATES")
+        logger.info("="*80)
+        
+        # Process all discovered aggregates
+        while aggregates_to_process:
+            agg_ip = aggregates_to_process.pop(0)
+            
+            if agg_ip in discovered_aggregates:
+                logger.info(f"Aggregate {agg_ip} already processed, skipping")
+                continue
+            
             logger.info("")
             logger.info("*"*80)
             logger.info(f"PROCESSING AGGREGATE: {agg_ip}")
             logger.info("*"*80)
             
-            # Always hop to aggregate from root
+            # Return to seed switch first
+            logger.info("Returning to seed switch...")
+            exit_device(shell)
+            time.sleep(1)
+            
+            # Hop to this aggregate
             hop_success = hop_to_neighbor(shell, agg_ip)
             
             if not hop_success:
                 logger.error(f"Failed to connect to aggregate {agg_ip} - skipping")
                 continue
             
-            scan_aggregate_switch(shell, agg_ip)
+            # Scan this aggregate and discover more aggregates
+            new_aggregates = scan_aggregate_switch(shell, agg_ip)
             
-            # Return to root switch
-            exit_device(shell)
-            time.sleep(1)
-            logger.info("Returned to root switch")
+            # Add any newly discovered aggregates
+            for agg in new_aggregates:
+                if agg["mgmt_ip"] not in discovered_aggregates and agg["mgmt_ip"] not in aggregates_to_process:
+                    aggregates_to_process.append(agg["mgmt_ip"])
+                    logger.info(f"Added new aggregate to queue: {agg['hostname']} ({agg['mgmt_ip']})")
+        
+        # Return to seed switch
+        logger.info("")
+        logger.info("Returning to seed switch...")
+        exit_device(shell)
+        time.sleep(1)
         
     except Exception as e:
         logger.error(f"Fatal error during discovery: {e}", exc_info=True)
     finally:
         client.close()
-        logger.info("Closed connection to root switch")
+        logger.info("Closed connection to seed switch")
     
     # Output results
     logger.info("")
     logger.info("="*80)
-    logger.info(f"DISCOVERY COMPLETE - Found {len(camera_data)} cameras")
+    logger.info("DISCOVERY COMPLETE")
+    logger.info("="*80)
+    logger.info(f"Aggregates discovered: {len(discovered_aggregates)}")
+    for agg_ip in sorted(discovered_aggregates):
+        logger.info(f"  - {agg_ip}")
+    logger.info(f"Total cameras found: {len(camera_data)}")
     logger.info("="*80)
     
     # Save to JSON
