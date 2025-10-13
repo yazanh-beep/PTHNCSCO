@@ -19,7 +19,8 @@ AGG_RETRY_DELAY = 5
 # Retry configuration for target device connections
 TARGET_MAX_RETRIES = 1  # Don't retry if device is unreachable - just skip
 TARGET_RETRY_DELAY = 5
-TARGET_SSH_TIMEOUT = 90  # How long to wait for SSH connection to target device
+TARGET_SSH_TIMEOUT = 60  # How long Python waits for SSH response (max useful value ~60s)
+TARGET_TCP_TIMEOUT = 30  # Cisco device TCP connection timeout in seconds (practical max 300s)
 
 # Setup logging with live output
 class LiveFormatter(logging.Formatter):
@@ -71,9 +72,10 @@ sys.stdout.reconfigure(line_buffering=True)
 
 class NetworkConnectionError(Exception):
     """Custom exception for network connection issues"""
-    def __init__(self, message, retry_allowed=False):
+    def __init__(self, message, retry_allowed=False, reconnect_needed=False):
         super().__init__(message)
         self.retry_allowed = retry_allowed
+        self.reconnect_needed = reconnect_needed
 
 class ConfigurationError(Exception):
     """Custom exception for configuration issues"""
@@ -159,17 +161,18 @@ def connect_to_agg(retry_count=0):
         logger.info("[CONNECT] Configuring SSH and TCP timeouts...")
         send_cmd(shell, "configure terminal", patterns=("(config)#",))
         
-        # SSH timeout in minutes (Cisco SSH client timeout)
+        # SSH timeout in minutes (Cisco SSH client timeout for established sessions)
         ssh_timeout_minutes = max(1, TARGET_SSH_TIMEOUT // 60)
         send_cmd(shell, f"ip ssh time-out {ssh_timeout_minutes}", patterns=("(config)#",))
         
         # TCP connection timeout in seconds (for connection establishment)
-        # This controls how long TCP waits before giving up
-        tcp_timeout_seconds = TARGET_SSH_TIMEOUT
-        send_cmd(shell, f"ip tcp synwait-time {min(300, tcp_timeout_seconds)}", patterns=("(config)#",))
+        # This is the key setting that controls how long SSH waits for unreachable hosts
+        tcp_timeout_seconds = min(300, TARGET_TCP_TIMEOUT)  # Max 300s on Cisco
+        logger.info(f"[CONNECT] Setting TCP connection timeout to {tcp_timeout_seconds}s")
+        send_cmd(shell, f"ip tcp synwait-time {tcp_timeout_seconds}", patterns=("(config)#",))
         
         send_cmd(shell, "end", patterns=("#",))
-        logger.info(f"[CONNECT] SSH timeout set to {ssh_timeout_minutes} min, TCP synwait set to {min(300, tcp_timeout_seconds)}s")
+        logger.info(f"[CONNECT] SSH timeout: {ssh_timeout_minutes}min, TCP timeout: {tcp_timeout_seconds}s")
         
         logger.info("[CONNECT] Successfully connected to aggregation switch")
         return client, shell
@@ -637,20 +640,23 @@ def push_config(shell, target_ip, config_commands):
     try:
         # Check if aggregation shell is still alive
         if shell.closed:
-            raise NetworkConnectionError("Connection to aggregation switch lost")
+            raise NetworkConnectionError("Connection to aggregation switch lost", reconnect_needed=True)
         
         # Verify we're at aggregate prompt before starting
         logger.debug(f"[PUSH] Verifying aggregate prompt before connecting to {target_ip}")
-        out = send_cmd(shell, "", patterns=("#",), timeout=3)
-        if "#" not in out:
-            logger.warning("[PUSH] Not at aggregate prompt - attempting to recover")
-            # Try to get back to aggregate
-            for _ in range(3):
-                shell.send("exit\n")
-                time.sleep(0.5)
+        try:
             out = send_cmd(shell, "", patterns=("#",), timeout=3)
             if "#" not in out:
-                raise NetworkConnectionError("Unable to verify aggregate switch prompt")
+                logger.warning("[PUSH] Not at aggregate prompt - attempting to recover")
+                # Try to get back to aggregate
+                for _ in range(3):
+                    shell.send("exit\n")
+                    time.sleep(0.5)
+                out = send_cmd(shell, "", patterns=("#",), timeout=3)
+                if "#" not in out:
+                    raise NetworkConnectionError("Unable to verify aggregate switch prompt", reconnect_needed=True)
+        except OSError:
+            raise NetworkConnectionError("Connection to aggregation switch lost", reconnect_needed=True)
         
         # Verify connectivity first
         if not verify_connectivity(shell, target_ip):
@@ -673,10 +679,13 @@ def push_config(shell, target_ip, config_commands):
     except NetworkConnectionError as e:
         logger.error(f"[ERROR] Failed to configure {target_ip}: {e}")
         
+        # Check if reconnect is needed
+        reconnect_needed = getattr(e, 'reconnect_needed', False)
+        
         # Check if we need to reconnect to aggregation switch
-        if shell.closed or "aggregation switch" in str(e).lower():
-            logger.warning("Connection to aggregation switch lost, this device will be skipped")
-            return False, backup_file
+        if shell.closed or reconnect_needed or "aggregation switch" in str(e).lower():
+            logger.warning("Connection to aggregation switch lost")
+            return False, backup_file, True  # Return reconnect flag
         
         # Attempt to exit gracefully and verify aggregate prompt
         try:
@@ -687,7 +696,7 @@ def push_config(shell, target_ip, config_commands):
         except:
             pass
         
-        return False, backup_file
+        return False, backup_file, False
         
     except ConfigurationError as e:
         logger.error(f"[ERROR] Configuration failed for {target_ip}: {e}")
@@ -699,7 +708,7 @@ def push_config(shell, target_ip, config_commands):
         except:
             pass
         
-        return False, backup_file
+        return False, backup_file, False
 
 def main():
     if len(sys.argv) != 3:
@@ -754,8 +763,12 @@ def main():
             logger.error("Connection to aggregation switch lost!")
             logger.info("Attempting to reconnect...")
             try:
-                client.close()
+                try:
+                    client.close()
+                except:
+                    pass
                 client, shell = connect_to_agg()
+                logger.info("Successfully reconnected to aggregation switch")
             except NetworkConnectionError as e:
                 logger.error(f"Failed to reconnect to aggregation switch: {e}")
                 logger.error("Remaining devices will be skipped")
@@ -763,7 +776,15 @@ def main():
                 break
         
         device_start = time.time()
-        success, backup = push_config(shell, target, config_cmds)
+        result = push_config(shell, target, config_cmds)
+        
+        # Handle result with reconnect flag
+        if len(result) == 3:
+            success, backup, reconnect_needed = result
+        else:
+            success, backup = result
+            reconnect_needed = False
+        
         device_elapsed = time.time() - device_start
         
         if success:
@@ -773,11 +794,21 @@ def main():
             logger.error(f"[FAILED] Could not configure {target} after {device_elapsed:.1f}s")
             failed.append(target)
             
-            # If aggregation connection was lost, break the loop
-            if shell.closed:
-                logger.error("Connection to aggregation switch lost, stopping configuration")
-                failed.extend(target_ips[idx:])
-                break
+            # If reconnect is needed, try to reconnect now
+            if reconnect_needed:
+                logger.info("Attempting to reconnect to aggregation switch...")
+                try:
+                    try:
+                        client.close()
+                    except:
+                        pass
+                    client, shell = connect_to_agg()
+                    logger.info("Successfully reconnected - continuing with remaining devices")
+                except NetworkConnectionError as e:
+                    logger.error(f"Failed to reconnect to aggregation switch: {e}")
+                    logger.error("Stopping configuration for remaining devices")
+                    failed.extend(target_ips[idx:])
+                    break
         
         # Small delay between devices
         time.sleep(2)
