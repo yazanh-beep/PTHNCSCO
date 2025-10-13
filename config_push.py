@@ -129,36 +129,85 @@ def establish_device_session(shell, target_ip, retry_count=0):
     try:
         logger.info(f"[HOP] Attempt {retry_count + 1}/{MAX_RETRIES} - SSH to {target_ip}")
         
+        # Initiate SSH connection
         out = send_cmd(
             shell, 
             f"ssh -l {USERNAME} {target_ip}",
-            patterns=("Destination", "(yes/no)?", "assword:", "%", "#", ">", "Connection refused"),
-            timeout=15
+            patterns=("Destination", "(yes/no)?", "assword:", "%", "#", ">", "Connection refused", "Connection timed out"),
+            timeout=20
         )
         
-        # Handle connection refused
-        if "Connection refused" in out or "Destination" in out:
+        logger.debug(f"[HOP] Initial output: {out[-300:]}")
+        
+        # Check for immediate connection failures
+        if "Connection refused" in out:
             raise NetworkConnectionError(f"SSH connection refused by {target_ip}")
+        
+        if "Connection timed out" in out or "Destination" in out:
+            raise NetworkConnectionError(f"SSH connection timed out to {target_ip}")
+        
+        if "No route to host" in out or "Host is unreachable" in out:
+            raise NetworkConnectionError(f"Network unreachable to {target_ip}")
         
         # Handle host key verification
         if "(yes/no)?" in out or "yes/no" in out:
+            logger.debug("[HOP] Accepting host key")
             out = send_cmd(shell, "yes", patterns=("assword:", "%", "#", ">"), timeout=15)
+            logger.debug(f"[HOP] After host key: {out[-300:]}")
         
         # Handle password prompt
         if "assword:" in out:
-            out = send_cmd(shell, PASSWORD, patterns=("%", "#", ">"), timeout=15)
+            logger.debug("[HOP] Sending password")
+            out = send_cmd(shell, PASSWORD, patterns=("%", "#", ">", "assword:"), timeout=15)
+            logger.debug(f"[HOP] After password: {out[-300:]}")
+            
+            # Check if password was rejected (prompted again or error)
+            if "assword:" in out:
+                raise NetworkConnectionError(f"Authentication failed for {target_ip} - password rejected")
         
-        # Check if authentication failed
-        if "%" in out and "fail" in out.lower():
-            raise NetworkConnectionError(f"Authentication failed for {target_ip}")
+        # Check for authentication/authorization failures
+        if "% Authentication failed" in out or "% Authorization failed" in out:
+            raise NetworkConnectionError(f"Authentication/Authorization failed for {target_ip}")
         
-        # Enter enable mode if needed
-        if out.strip().endswith(">"):
-            send_cmd(shell, "enable", patterns=("assword:", "#"), timeout=15)
-            send_cmd(shell, PASSWORD, patterns=("#",), timeout=15)
+        if "% Bad passwords" in out or "% Login invalid" in out:
+            raise NetworkConnectionError(f"Invalid credentials for {target_ip}")
         
-        # Disable pagination
-        send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
+        # Verify we got a prompt
+        has_prompt = False
+        if "#" in out or ">" in out:
+            # Extract the last line to check for proper prompt
+            lines = out.strip().split('\n')
+            last_line = lines[-1] if lines else ""
+            logger.debug(f"[HOP] Last line: {last_line}")
+            
+            if last_line.endswith("#") or last_line.endswith(">"):
+                has_prompt = True
+        
+        if not has_prompt:
+            raise NetworkConnectionError(f"No valid prompt received from {target_ip}")
+        
+        # Enter enable mode if in user mode (prompt ends with >)
+        if out.strip().endswith(">") or (out.count(">") > out.count("#")):
+            logger.debug("[HOP] Entering enable mode")
+            out = send_cmd(shell, "enable", patterns=("assword:", "#", "%"), timeout=10)
+            
+            if "assword:" in out:
+                out = send_cmd(shell, PASSWORD, patterns=("#", "%"), timeout=10)
+                
+            if "#" not in out:
+                raise NetworkConnectionError(f"Failed to enter enable mode on {target_ip}")
+        
+        # Verify we're in enable mode with a test command
+        logger.debug("[HOP] Verifying enable mode")
+        out = send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
+        
+        if "#" not in out:
+            raise NetworkConnectionError(f"Device session unstable on {target_ip}")
+        
+        # Additional verification - send empty command and check for prompt
+        out = send_cmd(shell, "", patterns=("#",), timeout=3)
+        if "#" not in out:
+            raise NetworkConnectionError(f"Lost prompt connection to {target_ip}")
         
         logger.info(f"[CONNECTED] Successfully connected to {target_ip}")
         return True
@@ -170,9 +219,14 @@ def establish_device_session(shell, target_ip, retry_count=0):
             # Exit from failed session if partially connected
             try:
                 send_cmd(shell, "\x03", patterns=("#",), timeout=2)  # Ctrl+C
-                send_cmd(shell, "exit", patterns=("#", ">"), timeout=2)
-            except:
-                pass
+                time.sleep(0.5)
+                send_cmd(shell, "exit", patterns=("#", ">", "closed", "Connection"), timeout=3)
+                time.sleep(0.5)
+                # Send another exit in case we're still in nested session
+                send_cmd(shell, "exit", patterns=("#",), timeout=2)
+            except Exception as cleanup_error:
+                logger.debug(f"[HOP] Cleanup exception (expected): {cleanup_error}")
+            
             time.sleep(RETRY_DELAY)
             return establish_device_session(shell, target_ip, retry_count + 1)
         else:
