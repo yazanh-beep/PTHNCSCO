@@ -6,7 +6,7 @@ import logging
 from typing import Tuple, List, Optional
 
 # USER CONFIG
-AGG_IP = "192.168.1.8"
+AGG_IP = "192.168.1.1"
 USERNAME = "admin"
 PASSWORD = "cisco"
 TIMEOUT = 10
@@ -17,7 +17,7 @@ AGG_MAX_RETRIES = 3
 AGG_RETRY_DELAY = 5
 
 # Retry configuration for target device connections
-TARGET_MAX_RETRIES = 3
+TARGET_MAX_RETRIES = 1  # Don't retry if device is unreachable - just skip
 TARGET_RETRY_DELAY = 5
 TARGET_SSH_TIMEOUT = 90  # How long to wait for SSH connection to target device
 
@@ -71,7 +71,9 @@ sys.stdout.reconfigure(line_buffering=True)
 
 class NetworkConnectionError(Exception):
     """Custom exception for network connection issues"""
-    pass
+    def __init__(self, message, retry_allowed=False):
+        super().__init__(message)
+        self.retry_allowed = retry_allowed
 
 class ConfigurationError(Exception):
     """Custom exception for configuration issues"""
@@ -153,6 +155,22 @@ def connect_to_agg(retry_count=0):
         logger.info("[CONNECT] Configuring terminal...")
         send_cmd(shell, "terminal length 0", patterns=("#",))
         
+        # Configure IP SSH and TCP timeouts on the aggregation switch
+        logger.info("[CONNECT] Configuring SSH and TCP timeouts...")
+        send_cmd(shell, "configure terminal", patterns=("(config)#",))
+        
+        # SSH timeout in minutes (Cisco SSH client timeout)
+        ssh_timeout_minutes = max(1, TARGET_SSH_TIMEOUT // 60)
+        send_cmd(shell, f"ip ssh time-out {ssh_timeout_minutes}", patterns=("(config)#",))
+        
+        # TCP connection timeout in seconds (for connection establishment)
+        # This controls how long TCP waits before giving up
+        tcp_timeout_seconds = TARGET_SSH_TIMEOUT
+        send_cmd(shell, f"ip tcp synwait-time {min(300, tcp_timeout_seconds)}", patterns=("(config)#",))
+        
+        send_cmd(shell, "end", patterns=("#",))
+        logger.info(f"[CONNECT] SSH timeout set to {ssh_timeout_minutes} min, TCP synwait set to {min(300, tcp_timeout_seconds)}s")
+        
         logger.info("[CONNECT] Successfully connected to aggregation switch")
         return client, shell
         
@@ -203,7 +221,7 @@ def cleanup_failed_session(shell):
     try:
         if shell.closed:
             logger.debug("[CLEANUP] Shell already closed, skipping cleanup")
-            return
+            return False
         
         logger.debug("[CLEANUP] Attempting to clean up failed session")
         
@@ -211,31 +229,52 @@ def cleanup_failed_session(shell):
         try:
             if not shell.closed:
                 shell.send("\x03")
-                time.sleep(0.3)
+                time.sleep(0.5)
         except:
             pass
         
-        # Try to exit nested session
-        for _ in range(3):
+        # Try to exit nested sessions multiple times
+        for attempt in range(3):
             try:
                 if shell.closed:
-                    break
+                    logger.debug("[CLEANUP] Shell closed during cleanup")
+                    return False
+                    
                 shell.send("exit\n")
-                time.sleep(0.5)
+                time.sleep(1)
                 
                 # Check if we're back at aggregation prompt
                 if shell.recv_ready():
                     data = shell.recv(MAX_READ).decode("utf-8", "ignore")
+                    logger.debug(f"[CLEANUP] Received after exit: {data[-200:]}")
+                    
+                    # Look for aggregation switch prompt
                     if "#" in data:
                         logger.debug("[CLEANUP] Successfully returned to aggregation switch")
-                        break
-            except:
+                        return True
+            except Exception as e:
+                logger.debug(f"[CLEANUP] Exit attempt {attempt + 1} exception: {e}")
                 break
         
-        logger.debug("[CLEANUP] Cleanup completed")
+        # Final verification - send empty command and check for prompt
+        try:
+            if not shell.closed:
+                shell.send("\n")
+                time.sleep(0.5)
+                if shell.recv_ready():
+                    data = shell.recv(MAX_READ).decode("utf-8", "ignore")
+                    if "#" in data:
+                        logger.debug("[CLEANUP] Verified aggregation switch prompt")
+                        return True
+        except:
+            pass
+        
+        logger.warning("[CLEANUP] Could not verify return to aggregation switch")
+        return False
         
     except Exception as e:
-        logger.debug(f"[CLEANUP] Cleanup exception (may be expected): {e}")
+        logger.debug(f"[CLEANUP] Cleanup exception: {e}")
+        return False
 
 def establish_device_session(shell, target_ip, retry_count=0):
     """Establish SSH session to target device with retry logic"""
@@ -259,15 +298,15 @@ def establish_device_session(shell, target_ip, retry_count=0):
         
         logger.debug(f"[HOP] Initial output: {out[-300:]}")
         
-        # Check for immediate connection failures
+        # Check for connection failures - these should NOT be retried (device is unreachable)
         if "Connection refused" in out:
-            raise NetworkConnectionError(f"SSH connection refused by {target_ip}")
+            raise NetworkConnectionError(f"SSH connection refused by {target_ip} - skipping device")
         
         if "Connection timed out" in out or "Destination" in out:
-            raise NetworkConnectionError(f"SSH connection timed out to {target_ip}")
+            raise NetworkConnectionError(f"SSH connection timed out to {target_ip} - device unreachable, skipping")
         
         if "No route to host" in out or "Host is unreachable" in out:
-            raise NetworkConnectionError(f"Network unreachable to {target_ip}")
+            raise NetworkConnectionError(f"Network unreachable to {target_ip} - skipping device")
         
         # Handle host key verification
         if "(yes/no)?" in out or "yes/no" in out:
@@ -283,14 +322,15 @@ def establish_device_session(shell, target_ip, retry_count=0):
             
             # Check if password was rejected (prompted again or error)
             if "assword:" in out:
-                raise NetworkConnectionError(f"Authentication failed for {target_ip} - password rejected")
+                # Authentication failure - might be worth retrying
+                raise NetworkConnectionError(f"Authentication failed for {target_ip} - password rejected", retry_allowed=True)
         
         # Check for authentication/authorization failures
         if "% Authentication failed" in out or "% Authorization failed" in out:
-            raise NetworkConnectionError(f"Authentication/Authorization failed for {target_ip}")
+            raise NetworkConnectionError(f"Authentication/Authorization failed for {target_ip}", retry_allowed=True)
         
         if "% Bad passwords" in out or "% Login invalid" in out:
-            raise NetworkConnectionError(f"Invalid credentials for {target_ip}")
+            raise NetworkConnectionError(f"Invalid credentials for {target_ip}", retry_allowed=True)
         
         # Verify we got a prompt
         has_prompt = False
@@ -304,7 +344,7 @@ def establish_device_session(shell, target_ip, retry_count=0):
                 has_prompt = True
         
         if not has_prompt:
-            raise NetworkConnectionError(f"No valid prompt received from {target_ip}")
+            raise NetworkConnectionError(f"No valid prompt received from {target_ip}", retry_allowed=True)
         
         # Enter enable mode if in user mode (prompt ends with >)
         if out.strip().endswith(">") or (out.count(">") > out.count("#")):
@@ -315,19 +355,19 @@ def establish_device_session(shell, target_ip, retry_count=0):
                 out = send_cmd(shell, PASSWORD, patterns=("#", "%"), timeout=10)
                 
             if "#" not in out:
-                raise NetworkConnectionError(f"Failed to enter enable mode on {target_ip}")
+                raise NetworkConnectionError(f"Failed to enter enable mode on {target_ip}", retry_allowed=True)
         
         # Verify we're in enable mode with a test command
         logger.debug("[HOP] Verifying enable mode")
         out = send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
         
         if "#" not in out:
-            raise NetworkConnectionError(f"Device session unstable on {target_ip}")
+            raise NetworkConnectionError(f"Device session unstable on {target_ip}", retry_allowed=True)
         
         # Additional verification - send empty command and check for prompt
         out = send_cmd(shell, "", patterns=("#",), timeout=3)
         if "#" not in out:
-            raise NetworkConnectionError(f"Lost prompt connection to {target_ip}")
+            raise NetworkConnectionError(f"Lost prompt connection to {target_ip}", retry_allowed=True)
         
         logger.info(f"[CONNECTED] Successfully connected to {target_ip}")
         return True
@@ -335,16 +375,24 @@ def establish_device_session(shell, target_ip, retry_count=0):
     except NetworkConnectionError as e:
         logger.error(f"[HOP] Connection error: {e}")
         
-        # Clean up failed connection attempt
-        cleanup_failed_session(shell)
+        # Clean up failed connection attempt and verify we're back at aggregate
+        cleanup_successful = cleanup_failed_session(shell)
         
-        if retry_count < TARGET_MAX_RETRIES - 1:
+        if not cleanup_successful and not shell.closed:
+            logger.warning("[HOP] Cleanup verification failed - shell state uncertain")
+        
+        # Check if retry is allowed for this type of error
+        retry_allowed = getattr(e, 'retry_allowed', False)
+        
+        if retry_allowed and retry_count < TARGET_MAX_RETRIES - 1:
             logger.info(f"[RETRY] Waiting {TARGET_RETRY_DELAY} seconds before retry...")
             sys.stdout.flush()
             time.sleep(TARGET_RETRY_DELAY)
             return establish_device_session(shell, target_ip, retry_count + 1)
         else:
-            raise NetworkConnectionError(f"Failed to connect to {target_ip} after {TARGET_MAX_RETRIES} attempts")
+            if not retry_allowed:
+                logger.info(f"[SKIP] Device {target_ip} is unreachable - moving to next device")
+            raise NetworkConnectionError(f"Failed to connect to {target_ip} after {retry_count + 1} attempt(s)")
     except OSError as e:
         logger.error(f"[HOP] Socket error: {e}")
         raise NetworkConnectionError(f"Lost connection to aggregation switch: {e}")
@@ -591,6 +639,19 @@ def push_config(shell, target_ip, config_commands):
         if shell.closed:
             raise NetworkConnectionError("Connection to aggregation switch lost")
         
+        # Verify we're at aggregate prompt before starting
+        logger.debug(f"[PUSH] Verifying aggregate prompt before connecting to {target_ip}")
+        out = send_cmd(shell, "", patterns=("#",), timeout=3)
+        if "#" not in out:
+            logger.warning("[PUSH] Not at aggregate prompt - attempting to recover")
+            # Try to get back to aggregate
+            for _ in range(3):
+                shell.send("exit\n")
+                time.sleep(0.5)
+            out = send_cmd(shell, "", patterns=("#",), timeout=3)
+            if "#" not in out:
+                raise NetworkConnectionError("Unable to verify aggregate switch prompt")
+        
         # Verify connectivity first
         if not verify_connectivity(shell, target_ip):
             raise NetworkConnectionError(f"Device {target_ip} is not reachable")
@@ -617,10 +678,12 @@ def push_config(shell, target_ip, config_commands):
             logger.warning("Connection to aggregation switch lost, this device will be skipped")
             return False, backup_file
         
-        # Attempt to exit gracefully
+        # Attempt to exit gracefully and verify aggregate prompt
         try:
             if not shell.closed:
-                exit_device_session(shell)
+                cleanup_successful = cleanup_failed_session(shell)
+                if not cleanup_successful:
+                    logger.warning("[PUSH] Could not verify clean return to aggregate switch")
         except:
             pass
         
