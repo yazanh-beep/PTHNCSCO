@@ -157,22 +157,6 @@ def connect_to_agg(retry_count=0):
         logger.info("[CONNECT] Configuring terminal...")
         send_cmd(shell, "terminal length 0", patterns=("#",))
         
-        # Configure IP SSH and TCP timeouts on the aggregation switch
-        logger.info("[CONNECT] Configuring SSH and TCP timeouts...")
-        send_cmd(shell, "configure terminal", patterns=("(config)#",))
-        
-        # SSH timeout in minutes (Cisco SSH client timeout for established sessions)
-        ssh_timeout_minutes = max(1, TARGET_SSH_TIMEOUT // 60)
-        send_cmd(shell, f"ip ssh time-out {ssh_timeout_minutes}", patterns=("(config)#",))
-        
-        # TCP connection timeout in seconds (for connection establishment)
-        # This is the key setting that controls how long SSH waits for unreachable hosts
-        tcp_timeout_seconds = min(300, TARGET_TCP_TIMEOUT)  # Max 300s on Cisco
-        logger.info(f"[CONNECT] Setting TCP connection timeout to {tcp_timeout_seconds}s")
-        send_cmd(shell, f"ip tcp synwait-time {tcp_timeout_seconds}", patterns=("(config)#",))
-        
-        send_cmd(shell, "end", patterns=("#",))
-        logger.info(f"[CONNECT] SSH timeout: {ssh_timeout_minutes}min, TCP timeout: {tcp_timeout_seconds}s")
         
         logger.info("[CONNECT] Successfully connected to aggregation switch")
         return client, shell
