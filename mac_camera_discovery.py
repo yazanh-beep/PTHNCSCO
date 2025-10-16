@@ -404,27 +404,33 @@ def get_hostname(shell):
     except:
         return "unknown"
 
+def determine_switch_type(hostname):
+    """Determine the type of switch based on hostname"""
+    if not hostname:
+        return "UNKNOWN"
+    upper = hostname.upper()
+    
+    if "AGG" in upper:
+        return "AGGREGATE"
+    elif "SRV" in upper:
+        return "SERVER"
+    elif "SMS" in upper:
+        # Check for edge switch patterns
+        sms_pos = upper.find("SMS")
+        if upper.find("ACC", sms_pos) > sms_pos or upper.find("IE", sms_pos) > sms_pos:
+            return "EDGE"
+    
+    return "OTHER"
+
 def is_edge_switch(hostname):
     """Check if switch is an edge switch (ACC or IE variants)"""
-    if not hostname:
-        return False
-    upper = hostname.upper()
-    if "SMS" not in upper:
-        return False
-    sms_pos = upper.find("SMS")
-    acc_pos = upper.find("ACC", sms_pos)
-    if acc_pos > sms_pos:
-        return True
-    ie_pos = upper.find("IE", sms_pos)
-    if ie_pos > sms_pos:
-        return True
-    return False
+    return determine_switch_type(hostname) == "EDGE"
 
 def is_aggregate_switch(hostname):
-    return bool(hostname) and "AGG" in hostname.upper()
+    return determine_switch_type(hostname) == "AGGREGATE"
 
 def is_server_switch(hostname):
-    return bool(hostname) and "SRV" in hostname.upper()
+    return determine_switch_type(hostname) == "SERVER"
 
 def convert_mac_format(mac_cisco):
     mac_clean = mac_cisco.replace(".", "").upper()
@@ -576,29 +582,47 @@ def normalize_interface_name(intf):
 def is_same_interface(intf1, intf2):
     if not intf1 or not intf2:
         return False
-    norm1 = normalize_interface_name(intf1)
-    norm2 = normalize_interface_name(intf2)
+    
+    # Normalize both interfaces
+    norm1 = normalize_interface_name(intf1).lower()
+    norm2 = normalize_interface_name(intf2).lower()
+    
+    # Direct match after normalization
     if norm1 == norm2:
         return True
-    pattern = r'(gigabitethernet|tengigabitethernet|fastethernet|ethernet)(\d+/\d+|\d+)'
+    
+    # Extract type and number for comparison
+    pattern = r'(gigabitethernet|tengigabitethernet|fastethernet|ethernet|port-channel|vlan)[\s/]*(\d+[/\d]*)'
     match1 = re.search(pattern, norm1)
     match2 = re.search(pattern, norm2)
+    
     if match1 and match2:
         type1, num1 = match1.groups()
         type2, num2 = match2.groups()
+        
+        # Normalize the type names
         type_map = {
             'gigabitethernet': 'gi',
             'tengigabitethernet': 'te',
             'fastethernet': 'fa',
-            'ethernet': 'eth'
+            'ethernet': 'eth',
+            'port-channel': 'po',
+            'vlan': 'vl'
         }
+        
         short_type1 = type_map.get(type1, type1)
         short_type2 = type_map.get(type2, type2)
-        return short_type1 == short_type2 and num1 == num2
+        
+        # Normalize the numbers (remove extra slashes/spaces)
+        num1_clean = num1.strip().replace(' ', '')
+        num2_clean = num2.strip().replace(' ', '')
+        
+        return short_type1 == short_type2 and num1_clean == num2_clean
+    
     return False
 
 def get_uplink_ports_from_neighbors(shell):
-    """Return list of uplink ports on the CURRENT device by parsing CDP/LLDP."""
+    """Return list of uplink ports on the CURRENT device by parsing CDP/LLDP - these connect to AGG/SRV switches"""
     logger.info("Discovering uplink ports using CDP and LLDP...")
     uplink_ports = []
     hostname_to_ip = {}
@@ -649,7 +673,7 @@ def get_uplink_ports_from_neighbors(shell):
     else:
         logger.info("LLDP not enabled or available")
 
-    # Any neighbor that is an AGG/SRV is an uplink from the edge perspective
+    # Any neighbor that is an AGG/SRV is an uplink
     for hostname, links in all_neighbors_by_hostname.items():
         if is_aggregate_switch(hostname) or is_server_switch(hostname):
             for nbr in links:
@@ -684,10 +708,10 @@ def select_camera_mac(entries, interface):
             logger.warning(f"    MAC {idx+1}: {entry['mac_address']} on VLAN {entry['vlan']}")
         return entries[0]
 
-def discover_cameras_from_edge(shell, edge_hostname):
-    """Discover cameras on an edge switch - can raise NetworkConnectionError if aggregate connection lost"""
+def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
+    """Discover cameras on any type of switch - can raise NetworkConnectionError if aggregate connection lost"""
     logger.info("="*80)
-    logger.info(f"Scanning edge switch: {edge_hostname}")
+    logger.info(f"Scanning {switch_type} switch: {switch_hostname}")
     logger.info("="*80)
 
     logger.info("Clearing dynamic MAC address table...")
@@ -698,7 +722,7 @@ def discover_cameras_from_edge(shell, edge_hostname):
 
     uplink_ports = get_uplink_ports_from_neighbors(shell)
     if not uplink_ports:
-        logger.warning(f"No uplink ports detected via CDP/LLDP on {edge_hostname}")
+        logger.warning(f"No uplink ports detected via CDP/LLDP on {switch_hostname}")
         logger.warning("This means ALL ports will be scanned - this may be incorrect!")
     else:
         logger.info(f"Uplink ports to exclude: {uplink_ports}")
@@ -708,20 +732,31 @@ def discover_cameras_from_edge(shell, edge_hostname):
 
     camera_count = 0
     scanned_count = 0
+    
     for intf in up_interfaces:
-        if any(is_same_interface(intf, upl) for upl in uplink_ports):
-            logger.info(f"SKIP: {intf} - UPLINK PORT")
+        # Check if this interface matches any uplink port
+        is_uplink = False
+        for upl in uplink_ports:
+            if is_same_interface(intf, upl):
+                is_uplink = True
+                logger.info(f"SKIP: {intf} - UPLINK PORT (matches {upl})")
+                break
+        
+        if is_uplink:
             continue
+        
         scanned_count += 1
         cmd = f"show mac address-table interface {intf}"
         mac_out = send_cmd(shell, cmd, timeout=10)
         entries = parse_mac_table_interface(mac_out)
+        
         if entries:
             selected_entry = select_camera_mac(entries, intf)
             if selected_entry:
                 mac_formatted = convert_mac_format(selected_entry["mac_address"])
                 camera_info = {
-                    "switch_name": edge_hostname,
+                    "switch_name": switch_hostname,
+                    "switch_type": switch_type,
                     "port": selected_entry["port"],
                     "mac_address": mac_formatted,
                     "vlan": selected_entry["vlan"]
@@ -733,74 +768,74 @@ def discover_cameras_from_edge(shell, edge_hostname):
             logger.debug(f"No dynamic MAC entries on {intf}")
 
     logger.info("")
-    logger.info(f"Summary for {edge_hostname}:")
+    logger.info(f"Summary for {switch_hostname}:")
     logger.info(f"  - Total UP interfaces: {len(up_interfaces)}")
     logger.info(f"  - Uplink ports excluded: {len(uplink_ports)}")
     logger.info(f"  - Ports scanned: {scanned_count}")
     logger.info(f"  - Cameras found: {camera_count}")
     logger.info("="*80)
 
-def process_edge_switch(shell, agg_ip, neighbor_info):
-    """Process an edge switch - includes reconnection logic"""
-    edge_ip = neighbor_info["mgmt_ip"]
-    edge_name = neighbor_info["remote_name"]
+def process_switch(shell, parent_ip, neighbor_info, switch_type="UNKNOWN"):
+    """Process any type of switch - includes reconnection logic"""
+    switch_ip = neighbor_info["mgmt_ip"]
+    switch_name = neighbor_info["remote_name"]
     local_intf = neighbor_info["local_intf"]
     
-    if not edge_ip or edge_ip in visited_switches:
+    if not switch_ip or switch_ip in visited_switches:
         return
     
     logger.info("")
     logger.info("*"*80)
-    logger.info(f"Processing EDGE SWITCH: {edge_name} ({edge_ip})")
-    logger.info(f"Connected via aggregate port: {local_intf}")
+    logger.info(f"Processing {switch_type} SWITCH: {switch_name} ({switch_ip})")
+    logger.info(f"Connected via parent port: {local_intf}")
     logger.info("*"*80)
     
-    visited_switches.add(edge_ip)
+    visited_switches.add(switch_ip)
     
-    # Retry loop for connecting to edge switch
+    # Retry loop for connecting to switch
     max_retries = SSH_RETRY_ATTEMPTS
     for attempt in range(max_retries):
         try:
-            # Verify aggregate connection before attempting hop
+            # Verify parent connection before attempting hop
             if not verify_aggregate_connection(shell):
-                raise NetworkConnectionError("Aggregate connection lost before hop", reconnect_needed=True)
+                raise NetworkConnectionError("Parent connection lost before hop", reconnect_needed=True)
             
-            ssh_success = hop_to_neighbor(shell, edge_ip, attempt=1)
+            ssh_success = hop_to_neighbor(shell, switch_ip, attempt=1)
             if not ssh_success:
-                logger.error(f"Cannot SSH to {edge_name} ({edge_ip}) - SKIPPING")
+                logger.error(f"Cannot SSH to {switch_name} ({switch_ip}) - SKIPPING")
                 return
             
             # Successfully connected, now discover cameras
             try:
-                discover_cameras_from_edge(shell, edge_name)
+                discover_cameras_from_switch(shell, switch_name, switch_type)
             except NetworkConnectionError as e:
                 if getattr(e, 'reconnect_needed', False):
-                    logger.error(f"Lost aggregate connection during camera discovery: {e}")
+                    logger.error(f"Lost parent connection during camera discovery: {e}")
                     raise
                 else:
-                    logger.error(f"Error during camera discovery on {edge_name}: {e}")
+                    logger.error(f"Error during camera discovery on {switch_name}: {e}")
             except Exception as e:
-                logger.error(f"Error during camera discovery on {edge_name}: {e}", exc_info=True)
+                logger.error(f"Error during camera discovery on {switch_name}: {e}", exc_info=True)
             
-            # Exit back to aggregate
+            # Exit back to parent
             try:
-                logger.debug(f"[EXIT] Exiting from edge switch {edge_name}")
+                logger.debug(f"[EXIT] Exiting from {switch_type} switch {switch_name}")
                 exit_success = exit_device(shell)
                 
                 if not exit_success:
-                    logger.warning(f"[EXIT] Exit from {edge_name} may have failed, verifying aggregate connection...")
+                    logger.warning(f"[EXIT] Exit from {switch_name} may have failed, verifying parent connection...")
                 
                 time.sleep(1)
-                logger.info("Returned to aggregate switch")
+                logger.info("Returned to parent switch")
                 
-                # Verify we're back at aggregate
+                # Verify we're back at parent
                 if not verify_aggregate_connection(shell):
-                    raise NetworkConnectionError("Lost aggregate connection after exiting edge", reconnect_needed=True)
+                    raise NetworkConnectionError("Lost parent connection after exiting switch", reconnect_needed=True)
                 
             except Exception as e:
-                logger.error(f"Error exiting from {edge_name}: {e}")
+                logger.error(f"Error exiting from {switch_name}: {e}")
                 if not verify_aggregate_connection(shell):
-                    raise NetworkConnectionError("Lost aggregate connection during exit", reconnect_needed=True)
+                    raise NetworkConnectionError("Lost parent connection during exit", reconnect_needed=True)
             
             # Success - break out of retry loop
             return
@@ -809,17 +844,17 @@ def process_edge_switch(shell, agg_ip, neighbor_info):
             reconnect_needed = getattr(e, 'reconnect_needed', False)
             
             if reconnect_needed:
-                logger.error(f"Aggregate connection lost while processing {edge_name}")
+                logger.error(f"Parent connection lost while processing {switch_name}")
                 raise  # Propagate to caller for reconnection
             
             retry_allowed = getattr(e, 'retry_allowed', False)
             is_last_attempt = (attempt >= max_retries - 1)
             
             if retry_allowed and not is_last_attempt:
-                logger.info(f"[RETRY] Will retry edge switch {edge_name} (attempt {attempt + 2}/{max_retries})")
+                logger.info(f"[RETRY] Will retry switch {switch_name} (attempt {attempt + 2}/{max_retries})")
                 continue
             else:
-                logger.error(f"Cannot connect to {edge_name} after {attempt + 1} attempts - SKIPPING")
+                logger.error(f"Cannot connect to {switch_name} after {attempt + 1} attempts - SKIPPING")
                 return
 
 def discover_aggregate_neighbors(shell, current_agg_hostname):
@@ -879,7 +914,7 @@ def discover_aggregate_neighbors(shell, current_agg_hostname):
     return aggregate_neighbors
 
 def scan_aggregate_switch(shell, agg_ip):
-    """Scan aggregate switch for connected edge switches and discover other aggregates"""
+    """Scan aggregate switch for ALL connected switches (not just edges) and discover other aggregates"""
     if agg_ip in visited_switches:
         logger.info(f"Aggregate {agg_ip} already visited, skipping")
         return []
@@ -896,13 +931,18 @@ def scan_aggregate_switch(shell, agg_ip):
     logger.info(f"Scanning AGGREGATE: {hostname} ({agg_ip})")
     logger.info("#"*80)
 
+    # Skip scanning the aggregate itself - aggregates don't have cameras, only downstream switches do
+    logger.info("")
+    logger.info(">>> Skipping camera scan on aggregate switch (aggregates don't have direct camera connections)")
+    
     new_aggregates = discover_aggregate_neighbors(shell, hostname)
-    logger.info("Discovering edge switches...")
+    logger.info("")
+    logger.info(">>> Discovering downstream switches...")
 
     all_neighbors_by_hostname = {}
     hostname_to_ip = {}
 
-    # Reuse neighbor parsing to find edges
+    # Reuse neighbor parsing to find ALL switches
     cdp_output = send_cmd(shell, "show cdp neighbors detail", patterns=("#",), timeout=20)
     if "CDP is not enabled" not in cdp_output and "Invalid input" not in cdp_output:
         cdp_neighbors = parse_cdp_neighbors(cdp_output)
@@ -937,31 +977,43 @@ def scan_aggregate_switch(shell, agg_ip):
 
     logger.info(f"Found {len(all_neighbors_by_hostname)} total neighbors")
 
-    edge_count = 0
+    # Count switches by type
+    switch_counts = {"EDGE": 0, "AGGREGATE": 0, "SERVER": 0, "OTHER": 0}
+    
     for nhost, links in all_neighbors_by_hostname.items():
-        if is_edge_switch(nhost):
-            edge_count += 1
-            mgmt_ip = hostname_to_ip.get(nhost)
-            logger.info(f"Edge switch detected: {nhost} - {mgmt_ip}")
-            for link in links:
-                neighbor_info = {
-                    "remote_name": nhost,
-                    "mgmt_ip": mgmt_ip,
-                    "local_intf": link.get("local_intf")
-                }
-                try:
-                    process_edge_switch(shell, agg_ip, neighbor_info)
-                except NetworkConnectionError as e:
-                    if getattr(e, 'reconnect_needed', False):
-                        logger.error(f"Lost aggregate connection while processing edge {nhost}")
-                        raise  # Propagate to caller for reconnection
-                break
-        elif is_aggregate_switch(nhost):
+        switch_type = determine_switch_type(nhost)
+        mgmt_ip = hostname_to_ip.get(nhost)
+        
+        # Skip aggregates - they'll be processed separately
+        if switch_type == "AGGREGATE":
             logger.debug(f"Skipping aggregate switch: {nhost} (will be processed separately)")
-        elif is_server_switch(nhost):
-            logger.debug(f"Skipping server switch: {nhost}")
+            continue
+        
+        # Process all other switch types
+        switch_counts[switch_type] += 1
+        logger.info(f"{switch_type} switch detected: {nhost} - {mgmt_ip}")
+        
+        for link in links:
+            neighbor_info = {
+                "remote_name": nhost,
+                "mgmt_ip": mgmt_ip,
+                "local_intf": link.get("local_intf")
+            }
+            try:
+                process_switch(shell, agg_ip, neighbor_info, switch_type)
+            except NetworkConnectionError as e:
+                if getattr(e, 'reconnect_needed', False):
+                    logger.error(f"Lost aggregate connection while processing {switch_type} {nhost}")
+                    raise  # Propagate to caller for reconnection
+            break  # Only process first link
 
-    logger.info(f"Processed {edge_count} edge switches from {hostname}")
+    logger.info("")
+    logger.info(f"Summary for {hostname}:")
+    logger.info(f"  - Edge switches: {switch_counts['EDGE']}")
+    logger.info(f"  - Server switches: {switch_counts['SERVER']}")
+    logger.info(f"  - Other switches: {switch_counts['OTHER']}")
+    logger.info(f"  - Total processed: {sum(switch_counts.values())}")
+    
     return new_aggregates
 
 def main():
@@ -1153,7 +1205,7 @@ def main():
     if camera_data:
         csv_file = f"camera_inventory_{len(camera_data)}cameras_{len(discovered_aggregates)}aggs_{timestamp}.csv"
         with open(csv_file, "w", newline="") as f:
-            fieldnames = ["switch_name", "port", "mac_address", "vlan"]
+            fieldnames = ["switch_name", "switch_type", "port", "mac_address", "vlan"]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(camera_data)
@@ -1163,18 +1215,22 @@ def main():
     logger.info("-"*80)
     logger.info("CAMERA INVENTORY SUMMARY")
     logger.info("-"*80)
+    
+    # Group cameras by switch type for summary
+    cameras_by_type = {"EDGE": 0, "AGGREGATE": 0, "SERVER": 0, "OTHER": 0, "UNKNOWN": 0}
     for camera in camera_data:
-        logger.info(f"{camera['switch_name']:<50} {camera['port']:<15} {camera['mac_address']:<20} VLAN {camera['vlan']}")
+        switch_type = camera.get("switch_type", "UNKNOWN")
+        cameras_by_type[switch_type] = cameras_by_type.get(switch_type, 0) + 1
+    
+    logger.info("Cameras by switch type:")
+    for sw_type, count in cameras_by_type.items():
+        if count > 0:
+            logger.info(f"  - {sw_type}: {count}")
     logger.info("")
-    logger.info(f"Total cameras discovered: {len(camera_data)}")
-    logger.info(f"Log file saved: {log_filename}")
-
-    logger.info("")
-    logger.info("-"*80)
-    logger.info("CAMERA INVENTORY SUMMARY")
-    logger.info("-"*80)
+    
     for camera in camera_data:
-        logger.info(f"{camera['switch_name']:<50} {camera['port']:<15} {camera['mac_address']:<20} VLAN {camera['vlan']}")
+        switch_type = camera.get("switch_type", "UNKNOWN")
+        logger.info(f"{camera['switch_name']:<50} [{switch_type:<9}] {camera['port']:<15} {camera['mac_address']:<20} VLAN {camera['vlan']}")
     logger.info("")
     logger.info(f"Total cameras discovered: {len(camera_data)}")
     logger.info(f"Log file saved: {log_filename}")
