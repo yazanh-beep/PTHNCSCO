@@ -328,7 +328,7 @@ def get_interface_status(shell):
 
 
 def parse_mac_table_interface(raw):
-    """Parse MAC address table for specific interface"""
+    """Parse MAC address table for specific interface - returns ALL entries regardless of VLAN"""
     entries = []
     
     for line in raw.splitlines():
@@ -484,6 +484,33 @@ def get_uplink_ports_from_lldp(shell):
     return uplink_ports
 
 
+def select_camera_mac(entries, interface):
+    """
+    Smart MAC selection logic:
+    - If 1 entry: take it (standard case)
+    - If 2 entries: likely private VLAN, take either one
+    - If 3+ entries: log warning and take first (unexpected scenario)
+    
+    Returns: selected entry dict or None
+    """
+    count = len(entries)
+    
+    if count == 0:
+        return None
+    elif count == 1:
+        logger.debug(f"  {interface}: Single MAC found (standard)")
+        return entries[0]
+    elif count == 2:
+        logger.info(f"  {interface}: 2 MACs found - Private VLAN detected (VLANs: {entries[0]['vlan']}, {entries[1]['vlan']})")
+        # Take the first one (either works in PVLAN scenario)
+        return entries[0]
+    else:
+        logger.warning(f"  {interface}: {count} MACs found (unexpected!) - Taking first")
+        for idx, entry in enumerate(entries):
+            logger.warning(f"    MAC {idx+1}: {entry['mac_address']} on VLAN {entry['vlan']}")
+        return entries[0]
+
+
 def discover_cameras_from_edge(shell, edge_hostname):
     """Collect camera MAC addresses from edge switch"""
     logger.info("="*80)
@@ -527,26 +554,28 @@ def discover_cameras_from_edge(shell, edge_hostname):
         
         scanned_count += 1
         
-        # Get MAC table for this interface on VLAN 800
-        cmd = f"show mac address-table interface {intf} vlan 800"
+        # Get MAC table for this interface WITHOUT specifying VLAN
+        cmd = f"show mac address-table interface {intf}"
         mac_out = send_cmd(shell, cmd, timeout=10)
         entries = parse_mac_table_interface(mac_out)
         
         if entries:
-            logger.info(f"FOUND: {len(entries)} MAC(s) on {intf}")
-            for entry in entries:
-                mac_formatted = convert_mac_format(entry["mac_address"])
+            # Use smart selection logic
+            selected_entry = select_camera_mac(entries, intf)
+            
+            if selected_entry:
+                mac_formatted = convert_mac_format(selected_entry["mac_address"])
                 camera_info = {
                     "switch_name": edge_hostname,
-                    "port": entry["port"],
+                    "port": selected_entry["port"],
                     "mac_address": mac_formatted,
-                    "vlan": entry["vlan"]
+                    "vlan": selected_entry["vlan"]
                 }
                 camera_data.append(camera_info)
                 camera_count += 1
-                logger.info(f"  Camera: {mac_formatted} on port {entry['port']}")
+                logger.info(f"  [+] Camera: {mac_formatted} on port {selected_entry['port']} (VLAN {selected_entry['vlan']})")
         else:
-            logger.debug(f"No MAC entries in VLAN 800 on {intf}")
+            logger.debug(f"No dynamic MAC entries on {intf}")
     
     logger.info("")
     logger.info(f"Summary for {edge_hostname}:")
@@ -806,7 +835,7 @@ def main():
     logger.info("CAMERA INVENTORY SUMMARY")
     logger.info("-"*80)
     for camera in camera_data:
-        logger.info(f"{camera['switch_name']:<50} {camera['port']:<15} {camera['mac_address']}")
+        logger.info(f"{camera['switch_name']:<50} {camera['port']:<15} {camera['mac_address']:<20} VLAN {camera['vlan']}")
     
     logger.info("")
     logger.info(f"Total cameras discovered: {len(camera_data)}")
