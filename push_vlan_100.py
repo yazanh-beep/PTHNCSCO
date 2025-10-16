@@ -925,10 +925,6 @@ def main():
         logger.error(f"Failed to connect to seed switch: {e}")
         return
 
-    # Mark seed as already visited/discovered to prevent duplicate processing
-    visited_switches.add(SEED_SWITCH_IP)
-    discovered_aggregates.add(SEED_SWITCH_IP)
-
     try:
         aggregates_to_process = []
         logger.info("")
