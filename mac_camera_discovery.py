@@ -331,18 +331,66 @@ def hop_to_neighbor(shell, ip, attempt=1):
             raise NetworkConnectionError(f"SSH to {ip} failed after {SSH_RETRY_ATTEMPTS} attempts", reconnect_needed=True)
 
 def exit_device(shell):
-    """Exit from current SSH session"""
+    """Exit from current SSH session with robust error handling"""
     try:
-        send_cmd(shell, "exit", patterns=("#", ">", "closed", "Connection"), timeout=5)
+        logger.debug("[EXIT] Attempting to exit current session...")
+        
+        # Send exit command
+        shell.send("exit\n")
         time.sleep(1)
+        
+        # Try to read any response
+        exit_response = ""
         if shell.recv_ready():
-            shell.recv(MAX_READ)
+            exit_response = shell.recv(MAX_READ).decode("utf-8", "ignore")
+            logger.debug(f"[EXIT] Exit response: {exit_response[-200:]}")
+        
+        # Wait a bit more for the session to fully close
+        time.sleep(1)
+        
+        # Verify we're back at a prompt
+        shell.send("\n")
+        time.sleep(0.5)
+        
+        if shell.recv_ready():
+            prompt_response = shell.recv(MAX_READ).decode("utf-8", "ignore")
+            logger.debug(f"[EXIT] Prompt check: {prompt_response[-200:]}")
+            
+            if "#" in prompt_response:
+                logger.debug("[EXIT] Successfully returned to previous device")
+                return True
+            else:
+                logger.warning("[EXIT] Unexpected response after exit")
+                return False
+        else:
+            # No response - might be okay, shell might just be slow
+            logger.debug("[EXIT] No immediate response after exit")
+            time.sleep(1)
+            
+            # Try one more time to verify
+            shell.send("\n")
+            time.sleep(0.5)
+            if shell.recv_ready():
+                final_check = shell.recv(MAX_READ).decode("utf-8", "ignore")
+                logger.debug(f"[EXIT] Final check: {final_check[-200:]}")
+                if "#" in final_check:
+                    return True
+            
+            return False
+            
     except Exception as e:
-        logger.debug(f"Exception during exit: {e}")
+        logger.warning(f"[EXIT] Exception during exit: {e}")
+        # Try aggressive cleanup
         try:
-            shell.send("\x03"); time.sleep(0.5); shell.send("exit\n"); time.sleep(0.5)
+            shell.send("\x03")  # Ctrl-C
+            time.sleep(0.5)
+            shell.send("exit\n")
+            time.sleep(1)
+            if shell.recv_ready():
+                shell.recv(MAX_READ)
         except:
             pass
+        return False
 
 def get_hostname(shell):
     """Extract hostname from prompt"""
@@ -736,7 +784,12 @@ def process_edge_switch(shell, agg_ip, neighbor_info):
             
             # Exit back to aggregate
             try:
-                exit_device(shell)
+                logger.debug(f"[EXIT] Exiting from edge switch {edge_name}")
+                exit_success = exit_device(shell)
+                
+                if not exit_success:
+                    logger.warning(f"[EXIT] Exit from {edge_name} may have failed, verifying aggregate connection...")
+                
                 time.sleep(1)
                 logger.info("Returned to aggregate switch")
                 
@@ -1009,13 +1062,18 @@ def main():
                             logger.info(f"Added new aggregate to queue: {agg['hostname']} ({agg['mgmt_ip']})")
 
                     logger.info("Returning to seed switch...")
-                    exit_device(shell)
+                    exit_success = exit_device(shell)
+                    
+                    if not exit_success:
+                        logger.warning("[EXIT] Exit may have failed, verifying connection...")
+                    
                     time.sleep(1)
                     
                     # Verify we're back at seed
                     if not verify_aggregate_connection(shell):
                         raise NetworkConnectionError("Lost seed connection after exiting aggregate", reconnect_needed=True)
                     
+                    logger.info("[EXIT] Successfully returned to seed switch")
                     aggregate_processed = True
                     
                 except NetworkConnectionError as e:
