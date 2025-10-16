@@ -9,7 +9,7 @@ from datetime import datetime
 
 # --- USER CONFIG -------------------------------------------------------------
 USERNAME = "admin"
-PASSWORD = "cisco"
+PASSWORD = "flounder"
 SEED_SWITCH_IP = "192.168.20.19"  # Starting aggregate switch IP
 TIMEOUT = 150
 MAX_READ = 65535
@@ -23,6 +23,7 @@ AGG_RETRY_DELAY = 5
 
 visited_switches = set()
 discovered_aggregates = set()
+aggregate_hostnames = {}  # Map IP to hostname for better reporting
 camera_data = []
 
 # Setup logging
@@ -834,6 +835,9 @@ def scan_aggregate_switch(shell, agg_ip):
     discovered_aggregates.add(agg_ip)
     hostname = get_hostname(shell)
     
+    # Store hostname for reporting
+    aggregate_hostnames[agg_ip] = hostname
+    
     logger.info("")
     logger.info("#"*80)
     logger.info(f"Scanning AGGREGATE: {hostname} ({agg_ip})")
@@ -920,6 +924,10 @@ def main():
     except NetworkConnectionError as e:
         logger.error(f"Failed to connect to seed switch: {e}")
         return
+
+    # Mark seed as already visited/discovered to prevent duplicate processing
+    visited_switches.add(SEED_SWITCH_IP)
+    discovered_aggregates.add(SEED_SWITCH_IP)
 
     try:
         aggregates_to_process = []
@@ -1055,17 +1063,41 @@ def main():
     logger.info("="*80)
     logger.info(f"Aggregates discovered: {len(discovered_aggregates)}")
     for agg_ip in sorted(discovered_aggregates):
-        logger.info(f"  - {agg_ip}")
+        agg_name = aggregate_hostnames.get(agg_ip, "Unknown")
+        is_seed = " (SEED)" if agg_ip == SEED_SWITCH_IP else ""
+        logger.info(f"  - {agg_name:<40} {agg_ip}{is_seed}")
     logger.info(f"Total cameras found: {len(camera_data)}")
     logger.info("="*80)
 
-    json_file = "camera_inventory.json"
+    # Save results with aggregate info in filename
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    json_file = f"camera_inventory_{len(camera_data)}cameras_{len(discovered_aggregates)}aggs_{timestamp}.json"
+    
+    # Create enhanced output with metadata
+    output_data = {
+        "discovery_metadata": {
+            "timestamp": timestamp,
+            "seed_switch": SEED_SWITCH_IP,
+            "total_cameras": len(camera_data),
+            "total_aggregates": len(discovered_aggregates),
+            "aggregates": [
+                {
+                    "ip": agg_ip,
+                    "hostname": aggregate_hostnames.get(agg_ip, "Unknown"),
+                    "is_seed": agg_ip == SEED_SWITCH_IP
+                }
+                for agg_ip in sorted(discovered_aggregates)
+            ]
+        },
+        "cameras": camera_data
+    }
+    
     with open(json_file, "w") as f:
-        json.dump(camera_data, f, indent=2)
+        json.dump(output_data, f, indent=2)
     logger.info(f"Saved: {json_file}")
 
     if camera_data:
-        csv_file = "camera_inventory.csv"
+        csv_file = f"camera_inventory_{len(camera_data)}cameras_{len(discovered_aggregates)}aggs_{timestamp}.csv"
         with open(csv_file, "w", newline="") as f:
             fieldnames = ["switch_name", "port", "mac_address", "vlan"]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
