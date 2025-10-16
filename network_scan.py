@@ -571,7 +571,7 @@ class NetworkDiscovery:
         for hostname, links in all_neighbors_by_hostname.items():
             if len(links) > 1:
                 # Multiple links to same device
-                self.log(f"  ⚠️  Multiple links detected to {hostname}: {len(links)} links")
+                self.log(f"   Multiple links detected to {hostname}: {len(links)} links")
                 
                 # Add all links with a note
                 for idx, nbr in enumerate(links, 1):
@@ -591,7 +591,7 @@ class NetworkDiscovery:
         self.log(f"Collecting data from: {mgmt_ip}")
         
         if skip_discovery:
-            self.log("⏭️  Skipping discovery for seed aggregate switch")
+            self.log("  Skipping discovery for seed aggregate switch")
             return None
         
         # SSH to the device (unless it's the aggregate we're already on)
@@ -599,7 +599,7 @@ class NetworkDiscovery:
         if mgmt_ip != AGGREGATE_ENTRY_IP and mgmt_ip not in [AGGREGATE_ENTRY_IP]:
             if not self.ssh_to_device(self.agg_shell, mgmt_ip):
                 ssh_accessible = False
-                self.log(f"⚠️  Cannot SSH to {mgmt_ip} - marking as inaccessible", "WARN")
+                self.log(f" Cannot SSH to {mgmt_ip} - marking as inaccessible", "WARN")
                 
                 # Verify we're back at the aggregate prompt
                 self.log("Verifying connection to aggregate switch...", "DEBUG")
@@ -856,7 +856,7 @@ class NetworkDiscovery:
         with open(filename, "w") as f:
             json.dump(devices_list, f, indent=2)
         
-        self.log(f"\n✅ Topology saved to {filename}")
+        self.log(f"\n Topology saved to {filename}")
         
         # Print summary
         self.log("\n" + "="*60)
