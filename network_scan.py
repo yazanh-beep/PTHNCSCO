@@ -1,785 +1,1005 @@
 #!/usr/bin/env python3
+"""
+Smart Network Topology Discovery Tool
+Discovers Cisco network topology using CDP (with LLDP fallback) via SSH
+"""
 import paramiko
 import time
 import re
 import json
-import csv
-import logging
 from datetime import datetime
+from collections import deque
 
-# --- USER CONFIG -------------------------------------------------------------
+# ─── USER CONFIG ─────────────────────────────────────────────────────────────
 USERNAME = "admin"
 PASSWORD = "cisco"
-SEED_SWITCH_IP = "192.168.1.8"  # Starting aggregate switch IP
+AGGREGATE_ENTRY_IP = "192.168.100.11"  # Entry point from server
+AGGREGATE_MGMT_IPS = [
+    # Add your aggregate switch management IPs here (VLAN 100 IPs)
+    # Example: "10.0.100.1", "10.0.100.2"
+]
 TIMEOUT = 10
 MAX_READ = 65535
-SSH_RETRY_ATTEMPTS = 2
-SSH_RETRY_DELAY = 5
-# -----------------------------------------------------------------------------
+SSH_RETRY_ATTEMPTS = 2  # Number of times to retry SSH connection on failure
+SSH_RETRY_DELAY = 5  # Seconds to wait between retry attempts
+# ─────────────────────────────────────────────────────────────────────────────
 
-visited_switches = set()
-discovered_aggregates = set()
-camera_data = []
+class NetworkDiscovery:
+    def __init__(self):
+        self.devices = {}  # Key: mgmt_ip, Value: device_info
+        self.to_visit = deque()  # Queue of IPs to visit
+        self.visited = set()  # IPs we've already processed
+        self.hostname_to_ip = {}  # Key: hostname, Value: authoritative mgmt IP (CDP takes priority)
+        self.seed_aggregate_ip = None  # IP of the initial aggregate switch
+        self.agg_shell = None  # Persistent shell to aggregate switch
+        self.agg_client = None
+        self.log_file = None  # File handle for logging
+        self.start_time = datetime.now()
+        self.link_tracking = {}  # Track connections between devices
+        
+    def log(self, msg, level="INFO"):
+        """Clean logging output - prints to console and file"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_line = f"[{timestamp}] [{level}] {msg}"
+        print(log_line)
+        
+        # Also write to log file if it's open
+        if self.log_file:
+            self.log_file.write(log_line + "\n")
+            self.log_file.flush()  # Ensure it's written immediately
 
-# Setup logging
-log_filename = f"camera_discovery_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_filename),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-def expect_prompt(shell, patterns, timeout=TIMEOUT):
-    """Wait for specific patterns in shell output"""
-    buf, end = "", time.time() + timeout
-    while time.time() < end:
-        if shell.recv_ready():
-            data = shell.recv(MAX_READ).decode("utf-8", "ignore")
-            buf += data
-            for p in patterns:
-                if p in buf:
-                    return buf
+    def determine_device_role(self, hostname):
+        """Determine device role based on hostname"""
+        hostname_upper = hostname.upper()
+        
+        if "SRV" in hostname_upper:
+            return "server"
+        elif "AGG" in hostname_upper:
+            return "aggregate"
+        elif "ACC" in hostname_upper:
+            return "access"
+        elif "IE" in hostname_upper:
+            return "field"
         else:
-            time.sleep(0.1)
-    return buf
+            return "unknown"
 
-def send_cmd(shell, cmd, patterns=("#", ">"), timeout=TIMEOUT):
-    """Send command and wait for response"""
-    logger.debug(f"CMD: {cmd}")
-    try:
-        shell.send(cmd + "\n")
-        time.sleep(0.3)
-        out = expect_prompt(shell, patterns, timeout)
-        return out
-    except Exception as e:
-        logger.error(f"Exception in send_cmd: {e}")
-        return ""
-
-def connect_switch(ip):
-    """Connect to switch via SSH and enter privileged mode"""
-    logger.info(f"Connecting to {ip}")
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        client.connect(ip, username=USERNAME, password=PASSWORD,
-                       look_for_keys=False, allow_agent=False, timeout=15)
-        shell = client.invoke_shell()
-        expect_prompt(shell, ("#", ">"))
-        send_cmd(shell, "enable", patterns=("assword:", "#"))
-        send_cmd(shell, PASSWORD, patterns=("#",))
-        send_cmd(shell, "terminal length 0", patterns=("#",))
-        logger.info(f"Successfully connected to {ip}")
-        return client, shell
-    except Exception as e:
-        logger.error(f"Failed to connect to {ip}: {e}")
-        return None, None
-
-def hop_to_neighbor(shell, ip, attempt=1):
-    """SSH hop from current switch to neighbor with retry logic"""
-    logger.info(f"SSH hopping to {ip} (attempt {attempt}/{SSH_RETRY_ATTEMPTS})")
-    try:
-        out = send_cmd(
-            shell,
-            f"ssh -l {USERNAME} {ip}",
-            patterns=("Destination", "(yes/no)?", "assword:", "%", "#", ">", 
-                      "Connection refused", "Connection timed out", "Unable to connect"),
-            timeout=60
-        )
-        # Hard failures
-        if ("Connection refused" in out or "Unable to connect" in out or
-            "% Connection" in out or "Connection timed out" in out):
-            logger.error(f"SSH connection failed to {ip}")
-            shell.send("\x03"); time.sleep(1); shell.send("\n"); time.sleep(0.5)
+    def expect_prompt(self, shell, patterns, timeout=TIMEOUT):
+        """Wait for specific patterns in shell output"""
+        buf, end = "", time.time() + timeout
+        while time.time() < end:
             if shell.recv_ready():
-                shell.recv(MAX_READ)
-            if attempt < SSH_RETRY_ATTEMPTS:
-                logger.warning(f"Retrying SSH to {ip} in {SSH_RETRY_DELAY} seconds...")
-                time.sleep(SSH_RETRY_DELAY)
-                return hop_to_neighbor(shell, ip, attempt + 1)
-            logger.error(f"SSH to {ip} failed after {SSH_RETRY_ATTEMPTS} attempts")
-            return False
+                data = shell.recv(MAX_READ).decode("utf-8", "ignore")
+                buf += data
+                for p in patterns:
+                    if p in buf:
+                        return buf
+            else:
+                time.sleep(0.1)
+        return buf
 
-        # New host key prompt
-        if "(yes/no)?" in out or "yes/no" in out:
-            out = send_cmd(shell, "yes", patterns=("assword:", "%", "#", ">"), timeout=30)
-
-        # Password prompt
-        if "assword:" in out:
-            out = send_cmd(shell, PASSWORD, patterns=("%", "#", ">", "Permission denied", "Authentication failed"), timeout=30)
-
-        # Auth failures
-        if ("Permission denied" in out or "Authentication failed" in out or "% Authentication" in out):
-            logger.error(f"SSH authentication failed to {ip}")
-            shell.send("\x03"); time.sleep(1); shell.send("exit\n"); time.sleep(1)
-            if attempt < SSH_RETRY_ATTEMPTS:
-                logger.warning(f"Retrying SSH to {ip} in {SSH_RETRY_DELAY} seconds...")
-                time.sleep(SSH_RETRY_DELAY)
-                return hop_to_neighbor(shell, ip, attempt + 1)
-            logger.error(f"SSH authentication to {ip} failed after {SSH_RETRY_ATTEMPTS} attempts")
-            return False
-
-        # Got a prompt
-        if "#" in out or ">" in out:
-            if out.strip().endswith(">"):
-                send_cmd(shell, "enable", patterns=("assword:", "#"), timeout=15)
-                send_cmd(shell, PASSWORD, patterns=("#",), timeout=15)
-            send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
-            logger.info(f"Successfully hopped to {ip}")
-            return True
-
-        # Unknown state
-        logger.error(f"Failed to get prompt from {ip}")
-        shell.send("\x03"); time.sleep(1)
-        if attempt < SSH_RETRY_ATTEMPTS:
-            logger.warning(f"Retrying SSH to {ip} in {SSH_RETRY_DELAY} seconds...")
-            time.sleep(SSH_RETRY_DELAY)
-            return hop_to_neighbor(shell, ip, attempt + 1)
-        logger.error(f"SSH to {ip} failed after {SSH_RETRY_ATTEMPTS} attempts")
-        return False
-
-    except Exception as e:
-        logger.error(f"Exception during SSH to {ip}: {e}")
+    def send_cmd(self, shell, cmd, patterns=("#", ">"), timeout=TIMEOUT, silent=False):
+        """Send command and wait for prompt"""
+        if not silent:
+            self.log(f"CMD: {cmd}", "DEBUG")
         try:
-            shell.send("\x03"); time.sleep(1); shell.send("exit\n"); time.sleep(1)
-            if shell.recv_ready():
-                shell.recv(MAX_READ)
-        except:
-            pass
-        if attempt < SSH_RETRY_ATTEMPTS:
-            logger.warning(f"Retrying SSH to {ip} in {SSH_RETRY_DELAY} seconds...")
-            time.sleep(SSH_RETRY_DELAY)
-            return hop_to_neighbor(shell, ip, attempt + 1)
-        logger.error(f"SSH to {ip} failed with exception after {SSH_RETRY_ATTEMPTS} attempts")
-        return False
-
-def exit_device(shell):
-    """Exit from current SSH session"""
-    try:
-        send_cmd(shell, "exit", patterns=("#", ">", "closed", "Connection"), timeout=5)
-        time.sleep(1)
-        if shell.recv_ready():
-            shell.recv(MAX_READ)
-    except Exception as e:
-        logger.debug(f"Exception during exit: {e}")
-        try:
-            shell.send("\x03"); time.sleep(0.5); shell.send("exit\n"); time.sleep(0.5)
-        except:
-            pass
-
-def get_hostname(shell):
-    """Extract hostname from prompt"""
-    shell.send("\n")
-    buff = expect_prompt(shell, ("#", ">"), timeout=5)
-    for line in reversed(buff.splitlines()):
-        if m := re.match(r"^([^#>]+)[#>]", line.strip()):
-            return m.group(1)
-    return "unknown"
-
-def is_edge_switch(hostname):
-    """Check if switch is an edge switch (ACC or IE variants)"""
-    if not hostname:
-        return False
-    upper = hostname.upper()
-    if "SMS" not in upper:
-        return False
-    sms_pos = upper.find("SMS")
-    acc_pos = upper.find("ACC", sms_pos)
-    if acc_pos > sms_pos:
-        return True
-    ie_pos = upper.find("IE", sms_pos)
-    if ie_pos > sms_pos:
-        return True
-    return False
-
-def is_aggregate_switch(hostname):
-    return bool(hostname) and "AGG" in hostname.upper()
-
-def is_server_switch(hostname):
-    return bool(hostname) and "SRV" in hostname.upper()
-
-def convert_mac_format(mac_cisco):
-    mac_clean = mac_cisco.replace(".", "").upper()
-    return ":".join([mac_clean[i:i+2] for i in range(0, 12, 2)])
-
-def parse_cdp_neighbors(output):
-    neighbors = []
-    blocks = re.split(r"-{20,}", output)
-    for block in blocks:
-        if "Device ID:" not in block:
-            continue
-        neighbor = {
-            "hostname": None,
-            "mgmt_ip": None,
-            "local_intf": None,
-            "remote_intf": None,
-            "platform": None,
-            "source": "CDP"
-        }
-        if m := re.search(r"Device ID:\s*(\S+(?:\.\S+)*)", block):
-            neighbor["hostname"] = m.group(1)
-        if m := re.search(r"(?:Management address|IP address).*?:\s*(\d+\.\d+\.\d+\.\d+)", block, re.IGNORECASE):
-            neighbor["mgmt_ip"] = m.group(1)
-        if m := re.search(r"Interface:\s*(\S+)", block):
-            neighbor["local_intf"] = m.group(1).rstrip(',')
-        if m := re.search(r"Port ID.*?:\s*(\S+)", block):
-            neighbor["remote_intf"] = m.group(1)
-        if m := re.search(r"Platform:\s*([^,\n]+)", block):
-            neighbor["platform"] = m.group(1).strip()
-        if neighbor["hostname"] and neighbor["mgmt_ip"]:
-            if neighbor["platform"] and "cisco" in neighbor["platform"].lower():
-                neighbors.append(neighbor)
-    return neighbors
-
-def parse_lldp_neighbors(output):
-    neighbors = []
-    blocks = re.split(r"-{20,}", output)
-    for block in blocks:
-        if "Local Intf:" not in block and "Chassis id:" not in block:
-            continue
-        neighbor = {
-            "hostname": None,
-            "mgmt_ip": None,
-            "local_intf": None,
-            "remote_intf": None,
-            "sys_descr": "",
-            "source": "LLDP"
-        }
-        if m := re.search(r"Local Intf:\s*(\S+)", block):
-            neighbor["local_intf"] = m.group(1)
-        for pattern in (r"Port id:\s*(\S+)", r"Port ID:\s*(\S+)", r"PortID:\s*(\S+)"):
-            m = re.search(pattern, block, re.IGNORECASE)
-            if m:
-                neighbor["remote_intf"] = m.group(1)
-                break
-        if m := re.search(r"System Name:\s*([^\n]+)", block, re.IGNORECASE):
-            hostname = m.group(1).strip().strip('"').strip("'")
-            neighbor["hostname"] = hostname
-        if not neighbor["hostname"]:
-            if m := re.search(r"System Description:[^\n]*?(\S+)\s+Software", block, re.IGNORECASE):
-                neighbor["hostname"] = m.group(1)
-        if m := re.search(r"System Description:\s*([\s\S]+?)(?=\n\s*\n|\nTime|\nCapabilities|Management|$)", block, re.IGNORECASE):
-            neighbor["sys_descr"] = m.group(1).strip()
-        for pattern in (r"Management Addresses:[\s\S]*?IP:\s*(\d+\.\d+\.\d+\.\d+)",
-                        r"Management Address:\s*(\d+\.\d+\.\d+\.\d+)",
-                        r"Mgmt IP:\s*(\d+\.\d+\.\d+\.\d+)"):
-            m = re.search(pattern, block, re.IGNORECASE)
-            if m:
-                neighbor["mgmt_ip"] = m.group(1)
-                break
-        if neighbor["mgmt_ip"]:
-            if neighbor["sys_descr"] and "cisco" in neighbor["sys_descr"].lower():
-                if not neighbor["hostname"]:
-                    neighbor["hostname"] = f"LLDP-Device-{neighbor['mgmt_ip']}"
-                    logger.warning(f"No hostname found in LLDP for {neighbor['mgmt_ip']}, using placeholder")
-                neighbors.append(neighbor)
-    return neighbors
-
-def get_interface_status(shell):
-    out = send_cmd(shell, "show ip interface brief", timeout=10)
-    up_interfaces = []
-    for line in out.splitlines():
-        line = line.strip()
-        if not line or "Interface" in line or line.startswith("Vlan"):
-            continue
-        parts = re.split(r"\s+", line)
-        if len(parts) >= 5:
-            intf, status = parts[0], parts[4]
-            if status.lower() == "up":
-                if re.match(r"(Gig|Ten|FastEthernet|Ethernet)", intf, re.IGNORECASE):
-                    up_interfaces.append(intf)
-    return up_interfaces
-
-def parse_mac_table_interface(raw):
-    entries = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if (not line or "Mac Address Table" in line or line.startswith("---") or
-            line.lower().startswith("vlan") or line.startswith("Total") or
-            "Mac Address" in line or "----" in line):
-            continue
-        parts = re.split(r"\s+", line)
-        if len(parts) >= 4:
-            vlan = parts[0]
-            mac = parts[1]
-            port = None
-            mac_type_parts = []
-            for i in range(2, len(parts)):
-                if re.match(r'^(Gi|Te|Fa|Et|Po|Vl)', parts[i], re.IGNORECASE):
-                    port = parts[i]
-                    break
-                else:
-                    mac_type_parts.append(parts[i])
-            mac_type = " ".join(mac_type_parts)
-            if port and "DYNAMIC" in mac_type.upper():
-                entries.append({
-                    "vlan": vlan,
-                    "mac_address": mac,
-                    "type": mac_type,
-                    "port": port
-                })
-    return entries
-
-def map_ie_port(port_id):
-    if m := re.match(r"port-(\d+)", port_id, re.IGNORECASE):
-        port_num = int(m.group(1))
-        return f"Gi1/{port_num}"
-    return None
-
-def normalize_interface_name(intf):
-    if not intf:
-        return ""
-    replacements = {
-        'Te': 'TenGigabitEthernet',
-        'Gi': 'GigabitEthernet',
-        'Fa': 'FastEthernet',
-        'Et': 'Ethernet',
-        'Po': 'Port-channel',
-        'Vl': 'Vlan'
-    }
-    intf = intf.strip()
-    for short, full in replacements.items():
-        if intf.startswith(short) and len(intf) > len(short):
-            next_char = intf[len(short)]
-            if next_char.isdigit() or next_char == '/':
-                return intf.replace(short, full, 1)
-    return intf.lower()
-
-def is_same_interface(intf1, intf2):
-    if not intf1 or not intf2:
-        return False
-    norm1 = normalize_interface_name(intf1)
-    norm2 = normalize_interface_name(intf2)
-    if norm1 == norm2:
-        return True
-    pattern = r'(gigabitethernet|tengigabitethernet|fastethernet|ethernet)(\d+/\d+|\d+)'
-    match1 = re.search(pattern, norm1)
-    match2 = re.search(pattern, norm2)
-    if match1 and match2:
-        type1, num1 = match1.groups()
-        type2, num2 = match2.groups()
-        type_map = {
-            'gigabitethernet': 'gi',
-            'tengigabitethernet': 'te',
-            'fastethernet': 'fa',
-            'ethernet': 'eth'
-        }
-        short_type1 = type_map.get(type1, type1)
-        short_type2 = type_map.get(type2, type2)
-        return short_type1 == short_type2 and num1 == num2
-    return False
-
-def get_uplink_ports_from_neighbors(shell):
-    """Return list of uplink ports on the CURRENT device by parsing CDP/LLDP."""
-    logger.info("Discovering uplink ports using CDP and LLDP...")
-    uplink_ports = []
-    hostname_to_ip = {}
-    all_neighbors_by_hostname = {}
-
-    # CDP
-    logger.info("Checking CDP neighbors...")
-    cdp_output = send_cmd(shell, "show cdp neighbors detail", patterns=("#",), timeout=20)
-    if "CDP is not enabled" not in cdp_output and "Invalid input" not in cdp_output:
-        cdp_neighbors = parse_cdp_neighbors(cdp_output)
-        if cdp_neighbors:
-            logger.info(f"Found {len(cdp_neighbors)} CDP neighbors")
-            for nbr in cdp_neighbors:
-                if nbr["hostname"] and nbr["mgmt_ip"]:
-                    if nbr["hostname"] not in hostname_to_ip:
-                        hostname_to_ip[nbr["hostname"]] = nbr["mgmt_ip"]
-                    all_neighbors_by_hostname.setdefault(nbr["hostname"], []).append(nbr)
-    else:
-        logger.info("CDP not enabled or available")
-
-    # LLDP
-    logger.info("Checking LLDP neighbors...")
-    lldp_output = send_cmd(shell, "show lldp neighbors detail", patterns=("#",), timeout=20)
-    if "LLDP is not enabled" not in lldp_output and "Invalid input" not in lldp_output:
-        lldp_neighbors = parse_lldp_neighbors(lldp_output)
-        if lldp_neighbors:
-            logger.info(f"Found {len(lldp_neighbors)} LLDP neighbors")
-            for nbr in lldp_neighbors:
-                if nbr["hostname"] and nbr["mgmt_ip"]:
-                    if nbr["hostname"] in hostname_to_ip:
-                        authoritative_ip = hostname_to_ip[nbr["hostname"]]
-                        if authoritative_ip != nbr["mgmt_ip"]:
-                            nbr["mgmt_ip"] = authoritative_ip
-                    else:
-                        hostname_to_ip[nbr["hostname"]] = nbr["mgmt_ip"]
-
-                    # Deduplicate by local_intf if CDP already recorded it
-                    is_dup = False
-                    if nbr["hostname"] in all_neighbors_by_hostname:
-                        lldp_intf_norm = normalize_interface_name(nbr["local_intf"])
-                        for existing in all_neighbors_by_hostname[nbr["hostname"]]:
-                            if (normalize_interface_name(existing.get("local_intf")) == lldp_intf_norm and
-                                existing.get("source") == "CDP"):
-                                is_dup = True
-                                break
-                    if not is_dup:
-                        all_neighbors_by_hostname.setdefault(nbr["hostname"], []).append(nbr)
-    else:
-        logger.info("LLDP not enabled or available")
-
-    # Any neighbor that is an AGG/SRV is an uplink from the edge perspective; from AGG, other AGG/SRV links are uplinks, too.
-    for hostname, links in all_neighbors_by_hostname.items():
-        if is_aggregate_switch(hostname) or is_server_switch(hostname):
-            for nbr in links:
-                uplink_port = nbr.get("local_intf")
-                if not uplink_port and nbr.get("remote_intf"):
-                    mapped = map_ie_port(nbr.get("remote_intf"))
-                    if mapped:
-                        uplink_port = mapped
-                if uplink_port:
-                    uplink_ports.append(uplink_port)
-                    logger.info(f"UPLINK DETECTED: {uplink_port} → {hostname} (via {nbr.get('source','?')})")
-                else:
-                    logger.warning(f"Could not determine uplink port for neighbor {hostname}")
-        else:
-            logger.debug(f"Skipping neighbor {hostname} (not AGG/SRV)")
-    logger.info(f"Total uplinks identified: {len(uplink_ports)}")
-    return uplink_ports
-
-def select_camera_mac(entries, interface):
-    count = len(entries)
-    if count == 0:
-        return None
-    elif count == 1:
-        logger.debug(f"  {interface}: Single MAC found (standard)")
-        return entries[0]
-    elif count == 2:
-        logger.info(f"  {interface}: 2 MACs found - Private VLAN detected (VLANs: {entries[0]['vlan']}, {entries[1]['vlan']})")
-        return entries[0]
-    else:
-        logger.warning(f"  {interface}: {count} MACs found (unexpected!) - Taking first")
-        for idx, entry in enumerate(entries):
-            logger.warning(f"    MAC {idx+1}: {entry['mac_address']} on VLAN {entry['vlan']}")
-        return entries[0]
-
-def discover_cameras_from_edge(shell, edge_hostname):
-    logger.info("="*80)
-    logger.info(f"Scanning edge switch: {edge_hostname}")
-    logger.info("="*80)
-
-    logger.info("Clearing dynamic MAC address table...")
-    send_cmd(shell, "clear mac address-table dynamic", patterns=("#",), timeout=10)
-    logger.info("Waiting 5 seconds for MAC table to repopulate...")
-    time.sleep(5)
-    logger.info("MAC table refresh complete")
-
-    uplink_ports = get_uplink_ports_from_neighbors(shell)
-    if not uplink_ports:
-        logger.warning(f"No uplink ports detected via CDP/LLDP on {edge_hostname}")
-        logger.warning("This means ALL ports will be scanned - this may be incorrect!")
-    else:
-        logger.info(f"Uplink ports to exclude: {uplink_ports}")
-
-    up_interfaces = get_interface_status(shell)
-    logger.info(f"Found {len(up_interfaces)} UP interfaces total")
-
-    camera_count = 0
-    scanned_count = 0
-    for intf in up_interfaces:
-        if any(is_same_interface(intf, upl) for upl in uplink_ports):
-            logger.info(f"SKIP: {intf} - UPLINK PORT")
-            continue
-        scanned_count += 1
-        cmd = f"show mac address-table interface {intf}"
-        mac_out = send_cmd(shell, cmd, timeout=10)
-        entries = parse_mac_table_interface(mac_out)
-        if entries:
-            selected_entry = select_camera_mac(entries, intf)
-            if selected_entry:
-                mac_formatted = convert_mac_format(selected_entry["mac_address"])
-                camera_info = {
-                    "switch_name": edge_hostname,
-                    "port": selected_entry["port"],
-                    "mac_address": mac_formatted,
-                    "vlan": selected_entry["vlan"]
-                }
-                camera_data.append(camera_info)
-                camera_count += 1
-                logger.info(f"  [+] Camera: {mac_formatted} on port {selected_entry['port']} (VLAN {selected_entry['vlan']})")
-        else:
-            logger.debug(f"No dynamic MAC entries on {intf}")
-
-    logger.info("")
-    logger.info(f"Summary for {edge_hostname}:")
-    logger.info(f"  - Total UP interfaces: {len(up_interfaces)}")
-    logger.info(f"  - Uplink ports excluded: {len(uplink_ports)}")
-    logger.info(f"  - Ports scanned: {scanned_count}")
-    logger.info(f"  - Cameras found: {camera_count}")
-    logger.info("="*80)
-
-def process_edge_switch(shell, agg_ip, neighbor_info):
-    edge_ip = neighbor_info["mgmt_ip"]
-    edge_name = neighbor_info["remote_name"]
-    local_intf = neighbor_info["local_intf"]
-    if not edge_ip or edge_ip in visited_switches:
-        return
-    logger.info("")
-    logger.info("*"*80)
-    logger.info(f"Processing EDGE SWITCH: {edge_name} ({edge_ip})")
-    logger.info(f"Connected via aggregate port: {local_intf}")
-    logger.info("*"*80)
-    visited_switches.add(edge_ip)
-    ssh_success = hop_to_neighbor(shell, edge_ip)
-    if not ssh_success:
-        logger.error(f"Cannot SSH to {edge_name} ({edge_ip}) - SKIPPING after all retry attempts")
-        logger.info("Verifying connection to aggregate switch...")
-        try:
-            shell.send("\n"); time.sleep(1)
-            if shell.recv_ready():
-                buff = shell.recv(MAX_READ).decode("utf-8", "ignore")
-                logger.debug(f"Current prompt after failed SSH: {buff[-100:]}")
+            shell.send(cmd + "\n")
+            time.sleep(0.3)  # Small delay for command to process
+            out = self.expect_prompt(shell, patterns, timeout)
+            return out
         except Exception as e:
-            logger.error(f"Shell verification exception: {e}")
-        return
-    try:
-        discover_cameras_from_edge(shell, edge_name)
-    except Exception as e:
-        logger.error(f"Error during camera discovery on {edge_name}: {e}", exc_info=True)
-    finally:
+            self.log(f"Exception in send_cmd: {e}", "ERROR")
+            return ""
+
+    def connect_to_aggregate(self):
+        """Initial SSH connection from server to aggregate switch"""
+        self.log(f"Connecting to aggregate switch: {AGGREGATE_ENTRY_IP}")
         try:
-            exit_device(shell); time.sleep(1)
-            logger.info("Returned to aggregate switch")
-        except Exception as e:
-            logger.error(f"Error exiting from {edge_name}: {e}")
-
-def discover_aggregate_neighbors(shell, current_agg_hostname):
-    """Discover other aggregate switches using CDP and LLDP. Return list of dicts with hostname & mgmt_ip."""
-    logger.info("Discovering neighboring aggregate switches...")
-    aggregate_neighbors = []
-    hostname_to_ip = {}
-    all_neighbors_by_hostname = {}
-
-    # CDP
-    logger.info("Checking CDP neighbors...")
-    cdp_output = send_cmd(shell, "show cdp neighbors detail", patterns=("#",), timeout=20)
-    if "CDP is not enabled" not in cdp_output and "Invalid input" not in cdp_output:
-        cdp_neighbors = parse_cdp_neighbors(cdp_output)
-        if cdp_neighbors:
-            logger.info(f"Found {len(cdp_neighbors)} CDP neighbors")
-            for nbr in cdp_neighbors:
-                if nbr["hostname"] and nbr["mgmt_ip"]:
-                    hostname_to_ip.setdefault(nbr["hostname"], nbr["mgmt_ip"])
-                    all_neighbors_by_hostname.setdefault(nbr["hostname"], []).append(nbr)
-
-    # LLDP
-    logger.info("Checking LLDP neighbors...")
-    lldp_output = send_cmd(shell, "show lldp neighbors detail", patterns=("#",), timeout=20)
-    if "LLDP is not enabled" not in lldp_output and "Invalid input" not in lldp_output:
-        lldp_neighbors = parse_lldp_neighbors(lldp_output)
-        if lldp_neighbors:
-            logger.info(f"Found {len(lldp_neighbors)} LLDP neighbors")
-            for nbr in lldp_neighbors:
-                if nbr["hostname"] and nbr["mgmt_ip"]:
-                    if nbr["hostname"] in hostname_to_ip:
-                        authoritative_ip = hostname_to_ip[nbr["hostname"]]
-                        if authoritative_ip != nbr["mgmt_ip"]:
-                            nbr["mgmt_ip"] = authoritative_ip
-                    else:
-                        hostname_to_ip[nbr["hostname"]] = nbr["mgmt_ip"]
-                    # Dedup vs CDP
-                    is_dup = False
-                    if nbr["hostname"] in all_neighbors_by_hostname:
-                        lldp_intf_norm = normalize_interface_name(nbr["local_intf"])
-                        for existing in all_neighbors_by_hostname[nbr["hostname"]]:
-                            if (normalize_interface_name(existing.get("local_intf")) == lldp_intf_norm and
-                                existing.get("source") == "CDP"):
-                                is_dup = True
-                                break
-                    if not is_dup:
-                        all_neighbors_by_hostname.setdefault(nbr["hostname"], []).append(nbr)
-    else:
-        logger.info("LLDP not enabled or available")
-
-    for hostname, links in all_neighbors_by_hostname.items():
-        if is_aggregate_switch(hostname) and hostname != current_agg_hostname:
-            mgmt_ip = hostname_to_ip.get(hostname)
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(AGGREGATE_ENTRY_IP, username=USERNAME, password=PASSWORD,
+                          look_for_keys=False, allow_agent=False, timeout=15)
+            shell = client.invoke_shell()
+            self.expect_prompt(shell, ("#", ">"))
+            
+            # Enable mode
+            self.send_cmd(shell, "enable", patterns=("assword:", "#"), silent=True)
+            self.send_cmd(shell, PASSWORD, patterns=("#",), silent=True)
+            self.send_cmd(shell, "terminal length 0", patterns=("#",), silent=True)
+            
+            self.agg_client = client
+            self.agg_shell = shell
+            self.log("Successfully connected to aggregate switch")
+            
+            # Get the actual management IP (VLAN 100) of this aggregate switch
+            mgmt_ip = self.get_management_ip(shell)
             if mgmt_ip:
-                aggregate_neighbors.append({"hostname": hostname, "mgmt_ip": mgmt_ip})
-                logger.info(f"  Found aggregate neighbor: {hostname} ({mgmt_ip})")
-    return aggregate_neighbors
+                self.log(f"Aggregate switch VLAN 100 IP: {mgmt_ip}")
+                self.seed_aggregate_ip = mgmt_ip  # Store seed aggregate IP
+                return mgmt_ip
+            else:
+                self.log("WARNING: Could not determine VLAN 100 IP, using entry IP", "WARN")
+                self.seed_aggregate_ip = AGGREGATE_ENTRY_IP
+                return AGGREGATE_ENTRY_IP
+                
+        except Exception as e:
+            self.log(f"Failed to connect to aggregate: {e}", "ERROR")
+            raise
 
-def scan_aggregate_switch(shell, agg_ip):
-    """Scan aggregate switch for connected edge switches and discover other aggregates"""
-    if agg_ip in visited_switches:
-        logger.info(f"Aggregate {agg_ip} already visited, skipping")
-        return []
-    visited_switches.add(agg_ip)
-    discovered_aggregates.add(agg_ip)
-    hostname = get_hostname(shell)
-    logger.info("")
-    logger.info("#"*80)
-    logger.info(f"Scanning AGGREGATE: {hostname} ({agg_ip})")
-    logger.info("#"*80)
+    def ssh_to_device(self, shell, target_ip, attempt=1):
+        """SSH from aggregate switch to target device with retry logic"""
+        self.log(f"SSH hop to {target_ip} (attempt {attempt}/{SSH_RETRY_ATTEMPTS})")
+        try:
+            out = self.send_cmd(shell, f"ssh -l {USERNAME} {target_ip}",
+                               patterns=("Destination", "(yes/no)?", "assword:", "%", "#", ">", "Connection refused", "Connection timed out"),
+                               timeout=60, silent=True)
+            
+            # Check for immediate connection failures
+            if "Connection refused" in out or "Unable to connect" in out or "% Connection" in out or "Connection timed out" in out:
+                self.log(f"SSH connection failed to {target_ip} - connection refused/timed out", "ERROR")
+                # Send Ctrl+C to cancel the SSH attempt and clear the line
+                shell.send("\x03")  # Ctrl+C
+                time.sleep(1)
+                shell.send("\n")
+                time.sleep(0.5)
+                # Clear any remaining output
+                if shell.recv_ready():
+                    shell.recv(MAX_READ)
+                
+                # Retry if we haven't exhausted attempts
+                if attempt < SSH_RETRY_ATTEMPTS:
+                    self.log(f"Retrying SSH to {target_ip} in {SSH_RETRY_DELAY} seconds...", "WARN")
+                    time.sleep(SSH_RETRY_DELAY)
+                    return self.ssh_to_device(shell, target_ip, attempt + 1)
+                else:
+                    self.log(f"SSH to {target_ip} failed after {SSH_RETRY_ATTEMPTS} attempts", "ERROR")
+                    return False
+            
+            # Handle SSH key acceptance
+            if "(yes/no)?" in out or "yes/no" in out:
+                out = self.send_cmd(shell, "yes", 
+                                   patterns=("assword:", "%", "#", ">"), 
+                                   timeout=30, silent=True)
+            
+            # Handle password prompt
+            if "assword:" in out:
+                out = self.send_cmd(shell, PASSWORD, 
+                                   patterns=("%", "#", ">", "Permission denied", "Authentication failed"), 
+                                   timeout=30, silent=True)
+            
+            # Check for authentication failures
+            if "Permission denied" in out or "Authentication failed" in out or "% Authentication" in out:
+                self.log(f"SSH authentication failed to {target_ip}", "ERROR")
+                # Try to get back to aggregate prompt
+                shell.send("\x03")  # Ctrl+C
+                time.sleep(1)
+                shell.send("exit\n")
+                time.sleep(1)
+                
+                # Retry if we haven't exhausted attempts
+                if attempt < SSH_RETRY_ATTEMPTS:
+                    self.log(f"Retrying SSH to {target_ip} in {SSH_RETRY_DELAY} seconds...", "WARN")
+                    time.sleep(SSH_RETRY_DELAY)
+                    return self.ssh_to_device(shell, target_ip, attempt + 1)
+                else:
+                    self.log(f"SSH authentication to {target_ip} failed after {SSH_RETRY_ATTEMPTS} attempts", "ERROR")
+                    return False
+            
+            # Check if we got a prompt (success)
+            if "#" in out or ">" in out:
+                # Enter enable mode if needed
+                if out.strip().endswith(">"):
+                    self.send_cmd(shell, "enable", 
+                                 patterns=("assword:", "#"), 
+                                 timeout=15, silent=True)
+                    self.send_cmd(shell, PASSWORD, 
+                                 patterns=("#",), 
+                                 timeout=15, silent=True)
+                
+                # Disable paging
+                self.send_cmd(shell, "terminal length 0", patterns=("#",), timeout=10, silent=True)
+                self.log(f"Successfully connected to {target_ip}")
+                return True
+            else:
+                self.log(f"Failed to get prompt from {target_ip}", "ERROR")
+                # Try to recover
+                shell.send("\x03")  # Ctrl+C
+                time.sleep(1)
+                
+                # Retry if we haven't exhausted attempts
+                if attempt < SSH_RETRY_ATTEMPTS:
+                    self.log(f"Retrying SSH to {target_ip} in {SSH_RETRY_DELAY} seconds...", "WARN")
+                    time.sleep(SSH_RETRY_DELAY)
+                    return self.ssh_to_device(shell, target_ip, attempt + 1)
+                else:
+                    self.log(f"SSH to {target_ip} failed to get prompt after {SSH_RETRY_ATTEMPTS} attempts", "ERROR")
+                    return False
+            
+        except Exception as e:
+            self.log(f"Exception during SSH to {target_ip}: {e}", "ERROR")
+            # Attempt to recover the shell
+            try:
+                shell.send("\x03")  # Ctrl+C
+                time.sleep(1)
+                shell.send("exit\n")
+                time.sleep(1)
+                # Clear buffer
+                if shell.recv_ready():
+                    shell.recv(MAX_READ)
+            except:
+                pass
+            
+            # Retry if we haven't exhausted attempts
+            if attempt < SSH_RETRY_ATTEMPTS:
+                self.log(f"Retrying SSH to {target_ip} in {SSH_RETRY_DELAY} seconds...", "WARN")
+                time.sleep(SSH_RETRY_DELAY)
+                return self.ssh_to_device(shell, target_ip, attempt + 1)
+            else:
+                self.log(f"SSH to {target_ip} failed with exception after {SSH_RETRY_ATTEMPTS} attempts", "ERROR")
+                return False
 
-    new_aggregates = discover_aggregate_neighbors(shell, hostname)
-    logger.info("Discovering edge switches...")
+    def exit_device(self, shell):
+        """Exit from current SSH session"""
+        try:
+            self.send_cmd(shell, "exit", patterns=("#", ">", "closed", "Connection"), timeout=5, silent=True)
+            time.sleep(1)
+            # Clear any remaining output
+            if shell.recv_ready():
+                shell.recv(MAX_READ)
+        except Exception as e:
+            self.log(f"Exception during exit: {e}", "DEBUG")
+            # Try to force exit with Ctrl+C
+            try:
+                shell.send("\x03")  # Ctrl+C
+                time.sleep(0.5)
+                shell.send("exit\n")
+                time.sleep(0.5)
+            except:
+                pass
 
-    all_neighbors_by_hostname = {}
-    hostname_to_ip = {}
+    def get_hostname(self, shell):
+        """Extract hostname from prompt"""
+        shell.send("\n")
+        time.sleep(0.2)
+        buff = self.expect_prompt(shell, ("#", ">"), timeout=3)
+        for line in reversed(buff.splitlines()):
+            line = line.strip()
+            # Match the full hostname including dots, up to # or >
+            if m := re.match(r"^([^#>\s]+(?:\.[^#>\s]+)*)[#>]", line):
+                hostname = m.group(1)
+                # Keep the full hostname as-is, no domain stripping
+                return hostname
+        return "Unknown"
 
-    # Reuse neighbor parsing to find edges
-    cdp_output = send_cmd(shell, "show cdp neighbors detail", patterns=("#",), timeout=20)
-    if "CDP is not enabled" not in cdp_output and "Invalid input" not in cdp_output:
-        cdp_neighbors = parse_cdp_neighbors(cdp_output)
-        if cdp_neighbors:
-            for nbr in cdp_neighbors:
-                if nbr["hostname"] and nbr["mgmt_ip"]:
-                    hostname_to_ip[nbr["hostname"]] = nbr["mgmt_ip"]
-                    all_neighbors_by_hostname.setdefault(nbr["hostname"], []).append(nbr)
+    def get_management_ip(self, shell):
+        """Get VLAN 100 management IP from 'show run int vlan 100'"""
+        output = self.send_cmd(shell, "show run int vlan 100", timeout=10, silent=True)
+        # Look for: ip address 10.0.100.1 255.255.255.0
+        if m := re.search(r"ip address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)", output):
+            ip = m.group(1)
+            mask = m.group(2)
+            # Convert mask to CIDR if needed, or just return IP
+            return ip  # Return just IP for simplicity
+        return None
 
-    lldp_output = send_cmd(shell, "show lldp neighbors detail", patterns=("#",), timeout=20)
-    if "LLDP is not enabled" not in lldp_output and "Invalid input" not in lldp_output:
-        lldp_neighbors = parse_lldp_neighbors(lldp_output)
-        if lldp_neighbors:
-            for nbr in lldp_neighbors:
-                if nbr["hostname"] and nbr["mgmt_ip"]:
-                    if nbr["hostname"] in hostname_to_ip:
-                        authoritative_ip = hostname_to_ip[nbr["hostname"]]
-                        if authoritative_ip != nbr["mgmt_ip"]:
-                            nbr["mgmt_ip"] = authoritative_ip
-                    else:
-                        hostname_to_ip[nbr["hostname"]] = nbr["mgmt_ip"]
-                    is_dup = False
-                    if nbr["hostname"] in all_neighbors_by_hostname:
-                        lldp_intf_norm = normalize_interface_name(nbr["local_intf"])
-                        for existing in all_neighbors_by_hostname[nbr["hostname"]]:
-                            if (normalize_interface_name(existing.get("local_intf")) == lldp_intf_norm and
-                                existing.get("source") == "CDP"):
-                                is_dup = True
-                                break
-                    if not is_dup:
-                        all_neighbors_by_hostname.setdefault(nbr["hostname"], []).append(nbr)
+    def get_serial_number(self, shell):
+        """Extract serial number from 'show version'"""
+        output = self.send_cmd(shell, "show version", timeout=10, silent=True)
+        # Try multiple patterns for different IOS versions
+        patterns = [
+            r"System [Ss]erial [Nn]umber\s*:?\s*(\S+)",
+            r"Processor board ID\s+(\S+)",
+            r"System Serial Number\s*:?\s*(\S+)"
+        ]
+        for pattern in patterns:
+            if m := re.search(pattern, output):
+                sn = m.group(1)
+                if sn.lower() not in ["unknown", "n/a"]:
+                    return sn
+        return None
 
-    logger.info(f"Found {len(all_neighbors_by_hostname)} total neighbors")
+    def get_ios_version(self, shell):
+        """Extract IOS version from 'show version'"""
+        output = self.send_cmd(shell, "show version", timeout=10, silent=True)
+        # Try multiple patterns for different IOS formats
+        patterns = [
+            r"Cisco IOS Software.*?Version\s+([^,\s]+)",
+            r"IOS.*?Software.*?Version\s+([^,\s]+)",
+            r"Version\s+(\d+\.\d+[^\s,]*)"
+        ]
+        for pattern in patterns:
+            if m := re.search(pattern, output, re.IGNORECASE):
+                return m.group(1)
+        return None
 
-    edge_count = 0
-    for nhost, links in all_neighbors_by_hostname.items():
-        if is_edge_switch(nhost):
-            edge_count += 1
-            mgmt_ip = hostname_to_ip.get(nhost)
-            logger.info(f"Edge switch detected: {nhost} - {mgmt_ip}")
-            for link in links:
-                neighbor_info = {
-                    "remote_name": nhost,
-                    "mgmt_ip": mgmt_ip,
-                    "local_intf": link.get("local_intf")
+    def get_switch_model(self, shell):
+        """Extract switch model from 'show version'"""
+        output = self.send_cmd(shell, "show version", timeout=10, silent=True)
+        # Try multiple patterns for different output formats
+        patterns = [
+            r"Model [Nn]umber\s*:?\s*(\S+)",
+            r"cisco\s+([A-Z0-9\-]+)\s+\([^\)]+\)\s+processor",
+            r"Model:\s*(\S+)",
+            r"Hardware:\s*(\S+)",
+            r"cisco\s+(WS-[A-Z0-9\-]+)",
+            r"cisco\s+(C[0-9]{4}[A-Z0-9\-]*)",
+            r"cisco\s+(IE-[0-9]{4}[A-Z0-9\-]*)",
+            r"System image file is.*?:([A-Z0-9\-]+)"
+        ]
+        for pattern in patterns:
+            if m := re.search(pattern, output, re.IGNORECASE):
+                model = m.group(1)
+                # Clean up the model name
+                if model.lower() not in ["unknown", "n/a", "bytes"]:
+                    return model
+        return None
+
+    def parse_cdp_neighbors(self, output):
+        """Parse 'show cdp neighbors detail' output"""
+        neighbors = []
+        blocks = re.split(r"-{20,}", output)
+        
+        for block in blocks:
+            if "Device ID:" not in block:
+                continue
+                
+            neighbor = {
+                "hostname": None,
+                "mgmt_ip": None,
+                "local_intf": None,
+                "remote_intf": None,
+                "platform": None,
+                "source": "CDP"
+            }
+            
+            # Device ID / Hostname - preserve full name exactly as-is
+            if m := re.search(r"Device ID:\s*(\S+(?:\.\S+)*)", block):
+                hostname = m.group(1)
+                # Keep full hostname with no domain stripping
+                neighbor["hostname"] = hostname
+            
+            # Management IP
+            if m := re.search(r"(?:Management address|IP address).*?:\s*(\d+\.\d+\.\d+\.\d+)", block, re.IGNORECASE):
+                neighbor["mgmt_ip"] = m.group(1)
+            
+            # Local Interface
+            if m := re.search(r"Interface:\s*(\S+)", block):
+                neighbor["local_intf"] = m.group(1).rstrip(',')
+            
+            # Remote Interface (Port ID)
+            if m := re.search(r"Port ID.*?:\s*(\S+)", block):
+                neighbor["remote_intf"] = m.group(1)
+            
+            # Platform (to check if Cisco)
+            if m := re.search(r"Platform:\s*([^,\n]+)", block):
+                neighbor["platform"] = m.group(1).strip()
+            
+            # Only add if we have essential info and it's a Cisco device
+            if neighbor["hostname"] and neighbor["mgmt_ip"]:
+                if neighbor["platform"] and "cisco" in neighbor["platform"].lower():
+                    neighbors.append(neighbor)
+                    
+        return neighbors
+
+    def parse_lldp_neighbors(self, output):
+        """Parse 'show lldp neighbors detail' output"""
+        neighbors = []
+        blocks = re.split(r"-{20,}", output)
+        
+        for block in blocks:
+            if "Local Intf:" not in block and "Chassis id:" not in block:
+                continue
+                
+            neighbor = {
+                "hostname": None,
+                "mgmt_ip": None,
+                "local_intf": None,
+                "remote_intf": None,
+                "sys_descr": "",
+                "source": "LLDP"
+            }
+            
+            # Local Interface
+            if m := re.search(r"Local Intf:\s*(\S+)", block):
+                neighbor["local_intf"] = m.group(1)
+            
+            # Remote Interface (Port ID) - try multiple patterns
+            patterns = [
+                r"Port id:\s*(\S+)",
+                r"Port ID:\s*(\S+)",
+                r"PortID:\s*(\S+)"
+            ]
+            for pattern in patterns:
+                if m := re.search(pattern, block, re.IGNORECASE):
+                    neighbor["remote_intf"] = m.group(1)
+                    break
+            
+            # System Name (hostname) - extract full name from detail output exactly as-is
+            if m := re.search(r"System Name:\s*([^\n]+)", block, re.IGNORECASE):
+                hostname = m.group(1).strip()
+                # Remove quotes if present
+                hostname = hostname.strip('"').strip("'")
+                # Keep the full hostname with no domain stripping
+                neighbor["hostname"] = hostname
+            
+            # If hostname is still None or empty, try to extract from System Description
+            if not neighbor["hostname"]:
+                if m := re.search(r"System Description:[^\n]*?(\S+)\s+Software", block, re.IGNORECASE):
+                    neighbor["hostname"] = m.group(1)
+            
+            # System Description
+            if m := re.search(r"System Description:\s*([\s\S]+?)(?=\n\s*\n|\nTime|\nCapabilities|Management|$)", block, re.IGNORECASE):
+                neighbor["sys_descr"] = m.group(1).strip()
+            
+            # Management IP - try multiple patterns
+            mgmt_patterns = [
+                r"Management Addresses:[\s\S]*?IP:\s*(\d+\.\d+\.\d+\.\d+)",
+                r"Management Address:\s*(\d+\.\d+\.\d+\.\d+)",
+                r"Mgmt IP:\s*(\d+\.\d+\.\d+\.\d+)"
+            ]
+            for pattern in mgmt_patterns:
+                if m := re.search(pattern, block, re.IGNORECASE):
+                    neighbor["mgmt_ip"] = m.group(1)
+                    break
+            
+            # Only add Cisco devices with management IP
+            if neighbor["mgmt_ip"]:
+                # Check if Cisco device
+                if neighbor["sys_descr"] and "cisco" in neighbor["sys_descr"].lower():
+                    # If hostname is still missing, use a placeholder with IP
+                    if not neighbor["hostname"]:
+                        neighbor["hostname"] = f"LLDP-Device-{neighbor['mgmt_ip']}"
+                        self.log(f"  Warning: No hostname found in LLDP for {neighbor['mgmt_ip']}, using placeholder", "WARN")
+                    neighbors.append(neighbor)
+                    
+        return neighbors
+
+    def normalize_interface_name(self, interface):
+        """Normalize interface names for comparison (Te1/1/1 = TenGigabitEthernet1/1/1)"""
+        if not interface:
+            return interface
+        
+        # Mapping of short forms to full forms
+        replacements = {
+            'Te': 'TenGigabitEthernet',
+            'Gi': 'GigabitEthernet',
+            'Fa': 'FastEthernet',
+            'Et': 'Ethernet',
+            'Po': 'Port-channel',
+            'Vl': 'Vlan'
+        }
+        
+        interface = interface.strip()
+        
+        # Try to match and replace short forms
+        for short, full in replacements.items():
+            if interface.startswith(short) and len(interface) > len(short):
+                # Check if next character is a digit or slash
+                next_char = interface[len(short)]
+                if next_char.isdigit() or next_char == '/':
+                    return interface.replace(short, full, 1)
+        
+        return interface
+
+    def discover_neighbors(self, shell, current_device_ip):
+        """Discover neighbors using BOTH CDP and LLDP, merge by hostname with CDP priority"""
+        all_neighbors_by_hostname = {}  # Key: hostname, Value: list of neighbor entries
+        protocols_used = []
+        
+        # Try CDP first - CDP IPs are considered authoritative
+        self.log("Checking CDP neighbors...")
+        cdp_output = self.send_cmd(shell, "show cdp neighbors detail", timeout=20, silent=True)
+        
+        if "CDP is not enabled" not in cdp_output and "Invalid input" not in cdp_output:
+            cdp_neighbors = self.parse_cdp_neighbors(cdp_output)
+            if cdp_neighbors:
+                self.log(f"Found {len(cdp_neighbors)} CDP neighbors")
+                protocols_used.append("CDP")
+                for nbr in cdp_neighbors:
+                    if nbr["hostname"] and nbr["mgmt_ip"]:
+                        nbr["discovered_via"] = "CDP"
+                        
+                        # Register this hostname-to-IP mapping (CDP is authoritative)
+                        if nbr["hostname"] not in self.hostname_to_ip:
+                            self.hostname_to_ip[nbr["hostname"]] = nbr["mgmt_ip"]
+                            self.log(f"  Registered: {nbr['hostname']} → {nbr['mgmt_ip']} (CDP)", "DEBUG")
+                        
+                        # Use hostname as key
+                        if nbr["hostname"] not in all_neighbors_by_hostname:
+                            all_neighbors_by_hostname[nbr["hostname"]] = []
+                        all_neighbors_by_hostname[nbr["hostname"]].append(nbr)
+        else:
+            self.log("CDP not enabled or available")
+        
+        # Also try LLDP
+        self.log("Checking LLDP neighbors...")
+        lldp_output = self.send_cmd(shell, "show lldp neighbors detail", timeout=20, silent=True)
+        
+        if "LLDP is not enabled" not in lldp_output and "Invalid input" not in lldp_output:
+            lldp_neighbors = self.parse_lldp_neighbors(lldp_output)
+            if lldp_neighbors:
+                self.log(f"Found {len(lldp_neighbors)} LLDP neighbors")
+                protocols_used.append("LLDP")
+                for nbr in lldp_neighbors:
+                    if nbr["hostname"] and nbr["mgmt_ip"]:
+                        nbr["discovered_via"] = "LLDP"
+                        
+                        # Check if hostname already has an authoritative IP from CDP
+                        if nbr["hostname"] in self.hostname_to_ip:
+                            authoritative_ip = self.hostname_to_ip[nbr["hostname"]]
+                            if authoritative_ip != nbr["mgmt_ip"]:
+                                self.log(f"  Note: {nbr['hostname']} has different IPs - CDP: {authoritative_ip}, LLDP: {nbr['mgmt_ip']} - using CDP IP", "DEBUG")
+                                # Replace LLDP IP with CDP IP for consistency
+                                nbr["lldp_ip"] = nbr["mgmt_ip"]  # Store original LLDP IP
+                                nbr["mgmt_ip"] = authoritative_ip  # Use CDP IP
+                        else:
+                            # First time seeing this hostname - register LLDP IP
+                            self.hostname_to_ip[nbr["hostname"]] = nbr["mgmt_ip"]
+                            self.log(f"  Registered: {nbr['hostname']} → {nbr['mgmt_ip']} (LLDP)", "DEBUG")
+                        
+                        # Check if this hostname was already found via CDP on same interface
+                        is_duplicate_interface = False
+                        
+                        if nbr["hostname"] in all_neighbors_by_hostname:
+                            existing_entries = all_neighbors_by_hostname[nbr["hostname"]]
+                            
+                            # Normalize interface names for comparison
+                            lldp_intf_normalized = self.normalize_interface_name(nbr["local_intf"])
+                            
+                            for existing in existing_entries:
+                                existing_intf_normalized = self.normalize_interface_name(existing.get("local_intf"))
+                                
+                                if (existing_intf_normalized == lldp_intf_normalized and 
+                                    existing.get("discovered_via") == "CDP"):
+                                    is_duplicate_interface = True
+                                    self.log(f"  Skipping LLDP entry for {nbr['hostname']} on {nbr['local_intf']} - already found via CDP as {existing.get('local_intf')}", "DEBUG")
+                                    break
+                        
+                        # Only add if not a duplicate interface
+                        if not is_duplicate_interface:
+                            if nbr["hostname"] not in all_neighbors_by_hostname:
+                                all_neighbors_by_hostname[nbr["hostname"]] = []
+                            all_neighbors_by_hostname[nbr["hostname"]].append(nbr)
+        else:
+            self.log("LLDP not enabled or available")
+        
+        if not all_neighbors_by_hostname:
+            self.log("No neighbors found via CDP or LLDP", "WARN")
+            return [], None
+        
+        # Flatten the structure and detect multiple links to same device
+        all_neighbors = []
+        for hostname, links in all_neighbors_by_hostname.items():
+            if len(links) > 1:
+                # Multiple links to same device
+                self.log(f"   Multiple links detected to {hostname}: {len(links)} links")
+                
+                # Add all links with a note
+                for idx, nbr in enumerate(links, 1):
+                    nbr["link_note"] = f"Multiple links to same device ({len(links)} total) - Link {idx}"
+                    all_neighbors.append(nbr)
+            else:
+                # Single link
+                all_neighbors.append(links[0])
+        
+        # Return list of neighbors
+        protocol_str = "+".join(protocols_used) if protocols_used else None
+        return all_neighbors, protocol_str
+
+    def collect_device_info(self, mgmt_ip, skip_discovery=False):
+        """Collect information from a single device"""
+        self.log(f"\n{'='*60}")
+        self.log(f"Collecting data from: {mgmt_ip}")
+        
+        if skip_discovery:
+            self.log("  Skipping discovery for seed aggregate switch")
+            return None
+        
+        # SSH to the device (unless it's the aggregate we're already on)
+        ssh_accessible = True
+        if mgmt_ip != AGGREGATE_ENTRY_IP and mgmt_ip not in [AGGREGATE_ENTRY_IP]:
+            if not self.ssh_to_device(self.agg_shell, mgmt_ip):
+                ssh_accessible = False
+                self.log(f" Cannot SSH to {mgmt_ip} - marking as inaccessible", "WARN")
+                
+                # Verify we're back at the aggregate prompt
+                self.log("Verifying connection to aggregate switch...", "DEBUG")
+                try:
+                    self.agg_shell.send("\n")
+                    time.sleep(1)
+                    if self.agg_shell.recv_ready():
+                        buff = self.agg_shell.recv(MAX_READ).decode("utf-8", "ignore")
+                        self.log(f"Current prompt: {buff[-100:]}", "DEBUG")
+                except Exception as e:
+                    self.log(f"Shell verification exception: {e}", "ERROR")
+                
+                # Return minimal device info
+                return {
+                    "hostname": "Unknown",
+                    "management_ip": mgmt_ip,
+                    "serial_number": None,
+                    "ios_version": None,
+                    "switch_model": None,
+                    "device_role": "unknown",
+                    "discovery_protocol": None,
+                    "notes": "Inaccessible via SSH",
+                    "neighbors": []
                 }
-                process_edge_switch(shell, agg_ip, neighbor_info)
-                break
-        elif is_aggregate_switch(nhost):
-            logger.debug(f"Skipping aggregate switch: {nhost} (will be processed separately)")
-        elif is_server_switch(nhost):
-            logger.debug(f"Skipping server switch: {nhost}")
+        
+        try:
+            # Collect device information
+            hostname = self.get_hostname(self.agg_shell)
+            self.log(f"Hostname: {hostname}")
+            
+            actual_mgmt_ip = self.get_management_ip(self.agg_shell)
+            if not actual_mgmt_ip:
+                actual_mgmt_ip = mgmt_ip
+            self.log(f"Management IP (VLAN 100): {actual_mgmt_ip}")
+            
+            # Update hostname-to-IP mapping with actual discovered IP
+            if hostname not in self.hostname_to_ip:
+                self.hostname_to_ip[hostname] = actual_mgmt_ip
+                self.log(f"Registered: {hostname} → {actual_mgmt_ip}", "DEBUG")
+            
+            serial = self.get_serial_number(self.agg_shell)
+            self.log(f"Serial Number: {serial}")
+            
+            ios_version = self.get_ios_version(self.agg_shell)
+            self.log(f"IOS Version: {ios_version}")
+            
+            switch_model = self.get_switch_model(self.agg_shell)
+            self.log(f"Switch Model: {switch_model}")
+            
+            # Determine device role
+            device_role = self.determine_device_role(hostname)
+            self.log(f"Device Role: {device_role}")
+            
+            # Discover neighbors
+            neighbors, protocol = self.discover_neighbors(self.agg_shell, actual_mgmt_ip)
+            
+            # Build device info structure
+            device_info = {
+                "hostname": hostname,
+                "management_ip": actual_mgmt_ip,
+                "serial_number": serial,
+                "ios_version": ios_version,
+                "switch_model": switch_model,
+                "device_role": device_role,
+                "discovery_protocol": protocol,
+                "notes": None,
+                "neighbors": []
+            }
+            
+            # Process neighbors
+            for nbr in neighbors:
+                discovery_method = nbr.get("discovered_via", "Unknown")
+                link_note = nbr.get("link_note", "")
+                note_str = f" [{link_note}]" if link_note else ""
+                
+                self.log(f"  → Neighbor: {nbr['hostname']} ({nbr['mgmt_ip']}) "
+                        f"via {nbr['local_intf']} ↔ {nbr['remote_intf']} [{discovery_method}]{note_str}")
+                
+                neighbor_entry = {
+                    "neighbor_hostname": nbr["hostname"],
+                    "neighbor_mgmt_ip": nbr["mgmt_ip"],
+                    "local_interface": nbr["local_intf"],
+                    "remote_interface": nbr["remote_intf"],
+                    "discovered_via": discovery_method
+                }
+                
+                # Add link note if present
+                if "link_note" in nbr:
+                    neighbor_entry["link_note"] = nbr["link_note"]
+                
+                device_info["neighbors"].append(neighbor_entry)
+                
+                # Add to visit queue if not already visited and not already in queue
+                if (nbr["mgmt_ip"] not in self.visited and 
+                    nbr["mgmt_ip"] != self.seed_aggregate_ip):
+                    # Check if already in queue
+                    already_queued = any(ip == nbr["mgmt_ip"] for ip in self.to_visit)
+                    if not already_queued:
+                        self.to_visit.append(nbr["mgmt_ip"])
+                        self.log(f"    Added {nbr['mgmt_ip']} to discovery queue")
+                    else:
+                        self.log(f"    {nbr['mgmt_ip']} already in discovery queue")
+                elif nbr["mgmt_ip"] == self.seed_aggregate_ip:
+                    self.log(f"    Skipping seed aggregate {nbr['mgmt_ip']} - already discovered")
+            
+            # Exit back to aggregate (unless we're on the aggregate)
+            if mgmt_ip != AGGREGATE_ENTRY_IP:
+                self.exit_device(self.agg_shell)
+                time.sleep(1)
+            
+            return device_info
+            
+        except Exception as e:
+            self.log(f"Error collecting device info: {e}", "ERROR")
+            # Try to exit anyway
+            try:
+                if mgmt_ip != AGGREGATE_ENTRY_IP:
+                    self.exit_device(self.agg_shell)
+            except:
+                pass
+            return None
 
-    logger.info(f"Processed {edge_count} edge switches from {hostname}")
-    return new_aggregates
-
-def main():
-    logger.info("="*80)
-    logger.info("CAMERA DISCOVERY SCRIPT STARTED")
-    logger.info(f"Seed switch: {SEED_SWITCH_IP}")
-    logger.info(f"Log file: {log_filename}")
-    logger.info("="*80)
-
-    client, shell = connect_switch(SEED_SWITCH_IP)
-    if not client:
-        logger.error("Failed to connect to seed switch. Exiting.")
-        return
-
-    try:
-        aggregates_to_process = []
-        logger.info("")
-        logger.info("="*80)
-        logger.info("PHASE 1: DISCOVERING AGGREGATE SWITCHES")
-        logger.info("="*80)
-
-        new_aggregates = scan_aggregate_switch(shell, SEED_SWITCH_IP)
-        for agg in new_aggregates:
-            if agg["mgmt_ip"] not in discovered_aggregates:
-                aggregates_to_process.append(agg["mgmt_ip"])
-                logger.info(f"Added aggregate to queue: {agg['hostname']} ({agg['mgmt_ip']})")
-
-        logger.info("")
-        logger.info("="*80)
-        logger.info(f"PHASE 2: PROCESSING {len(aggregates_to_process)} ADDITIONAL AGGREGATES")
-        logger.info("="*80)
-
-        while aggregates_to_process:
-            agg_ip = aggregates_to_process.pop(0)
-            if agg_ip in discovered_aggregates:
-                logger.info(f"Aggregate {agg_ip} already processed, skipping")
+    def run_discovery(self):
+        """Main discovery loop"""
+        self.log("="*60)
+        self.log("Starting Network Topology Discovery")
+        self.log("="*60)
+        
+        # Connect to aggregate
+        agg_mgmt_ip = self.connect_to_aggregate()
+        
+        # Collect full info from seed aggregate first
+        self.log("\n" + "="*60)
+        self.log(f"Collecting seed aggregate information: {agg_mgmt_ip}")
+        self.log("="*60)
+        
+        try:
+            # Collect device information from seed aggregate
+            hostname = self.get_hostname(self.agg_shell)
+            self.log(f"Hostname: {hostname}")
+            
+            # Register hostname-to-IP mapping
+            if hostname not in self.hostname_to_ip:
+                self.hostname_to_ip[hostname] = agg_mgmt_ip
+                self.log(f"Registered: {hostname} → {agg_mgmt_ip}", "DEBUG")
+            
+            serial = self.get_serial_number(self.agg_shell)
+            self.log(f"Serial Number: {serial}")
+            
+            ios_version = self.get_ios_version(self.agg_shell)
+            self.log(f"IOS Version: {ios_version}")
+            
+            switch_model = self.get_switch_model(self.agg_shell)
+            self.log(f"Switch Model: {switch_model}")
+            
+            device_role = self.determine_device_role(hostname)
+            self.log(f"Device Role: {device_role}")
+            
+            # Discover neighbors from seed aggregate
+            neighbors, protocol = self.discover_neighbors(self.agg_shell, agg_mgmt_ip)
+            
+            # Build device info for seed aggregate
+            seed_device_info = {
+                "hostname": hostname,
+                "management_ip": agg_mgmt_ip,
+                "serial_number": serial,
+                "ios_version": ios_version,
+                "switch_model": switch_model,
+                "device_role": device_role,
+                "discovery_protocol": protocol,
+                "notes": "Seed aggregate switch",
+                "neighbors": []
+            }
+            
+            # Process neighbors and add them to discovery queue
+            for nbr in neighbors:
+                discovery_method = nbr.get("discovered_via", "Unknown")
+                link_note = nbr.get("link_note", "")
+                note_str = f" [{link_note}]" if link_note else ""
+                
+                self.log(f"  → Neighbor: {nbr['hostname']} ({nbr['mgmt_ip']}) "
+                        f"via {nbr['local_intf']} ↔ {nbr['remote_intf']} [{discovery_method}]{note_str}")
+                
+                neighbor_entry = {
+                    "neighbor_hostname": nbr["hostname"],
+                    "neighbor_mgmt_ip": nbr["mgmt_ip"],
+                    "local_interface": nbr["local_intf"],
+                    "remote_interface": nbr["remote_intf"],
+                    "discovered_via": discovery_method
+                }
+                
+                if "link_note" in nbr:
+                    neighbor_entry["link_note"] = nbr["link_note"]
+                
+                seed_device_info["neighbors"].append(neighbor_entry)
+                
+                # Add to visit queue
+                already_queued = any(ip == nbr["mgmt_ip"] for ip in self.to_visit)
+                if not already_queued:
+                    self.to_visit.append(nbr["mgmt_ip"])
+                    self.log(f"    Added {nbr['mgmt_ip']} to discovery queue")
+                else:
+                    self.log(f"    {nbr['mgmt_ip']} already in discovery queue")
+            
+            # Store seed aggregate
+            self.devices[agg_mgmt_ip] = seed_device_info
+            self.visited.add(agg_mgmt_ip)
+            
+        except Exception as e:
+            self.log(f"Error collecting seed aggregate info: {e}", "ERROR")
+            import traceback
+            traceback.print_exc()
+        
+        # Add any additional aggregate IPs from config (but not the seed)
+        for ip in AGGREGATE_MGMT_IPS:
+            if ip != agg_mgmt_ip and ip not in self.visited:
+                already_queued = any(queue_ip == ip for queue_ip in self.to_visit)
+                if not already_queued:
+                    self.to_visit.append(ip)
+        
+        # Discovery loop for remaining devices
+        while self.to_visit:
+            current_ip = self.to_visit.popleft()
+            
+            if current_ip in self.visited:
+                self.log(f"Skipping {current_ip} - already visited")
                 continue
+            
+            self.visited.add(current_ip)
+            device_info = self.collect_device_info(current_ip)
+            
+            if device_info:
+                self.devices[current_ip] = device_info
+            else:
+                self.log(f"Failed to collect info from {current_ip}", "ERROR")
+        
+        # Cleanup
+        if self.agg_client:
+            self.agg_client.close()
+        
+        end_time = datetime.now()
+        duration = (end_time - self.start_time).total_seconds()
+        
+        self.log("="*60)
+        self.log(f"Discovery complete! Found {len(self.devices)} devices")
+        self.log(f"Total discovery time: {duration:.1f} seconds")
+        self.log("="*60)
 
-            logger.info("")
-            logger.info("*"*80)
-            logger.info(f"PROCESSING AGGREGATE: {agg_ip}")
-            logger.info("*"*80)
+    def generate_json(self, filename="network_topology.json"):
+        """Generate clean JSON output as a simple array of devices"""
+        # Output just the list of devices, no wrapper
+        devices_list = list(self.devices.values())
+        
+        with open(filename, "w") as f:
+            json.dump(devices_list, f, indent=2)
+        
+        self.log(f"\n Topology saved to {filename}")
+        
+        # Print summary
+        self.log("\n" + "="*60)
+        self.log("DISCOVERY SUMMARY")
+        self.log("="*60)
+        self.log(f"Total devices discovered: {len(devices_list)}")
+        
+        # Count by role
+        role_counts = {}
+        for device in devices_list:
+            role = device.get("device_role", "unknown")
+            role_counts[role] = role_counts.get(role, 0) + 1
+        
+        self.log("\nDevices by role:")
+        for role, count in sorted(role_counts.items()):
+            self.log(f"  {role}: {count}")
+        
+        self.log("="*60)
+        
+        for device in devices_list:
+            notes_str = f" [{device['notes']}]" if device.get('notes') else ""
+            self.log(f"\n{device['hostname']} ({device['management_ip']}) - {device['device_role']}{notes_str}")
+            self.log(f"  Model: {device.get('switch_model', 'N/A')}")
+            self.log(f"  IOS Version: {device.get('ios_version', 'N/A')}")
+            self.log(f"  Serial: {device['serial_number']}")
+            self.log(f"  Neighbors: {len(device['neighbors'])}")
+            for nbr in device["neighbors"]:
+                discovered = nbr.get("discovered_via", "Unknown")
+                link_note = nbr.get("link_note", "")
+                link_str = f" - {link_note}" if link_note else ""
+                self.log(f"    • {nbr['neighbor_hostname']} via "
+                        f"{nbr['local_interface']} ↔ {nbr['remote_interface']} [{discovered}]{link_str}")
+    
+    def write_metadata(self, filename="discovery_metadata.txt"):
+        """Write discovery metadata and statistics to a separate file"""
+        duration = (datetime.now() - self.start_time).total_seconds()
+        
+        with open(filename, "w") as f:
+            f.write("="*60 + "\n")
+            f.write("NETWORK TOPOLOGY DISCOVERY METADATA\n")
+            f.write("="*60 + "\n\n")
+            
+            f.write(f"Discovery Time: {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Entry Point: {AGGREGATE_ENTRY_IP}\n")
+            f.write(f"Seed Aggregate: {self.seed_aggregate_ip}\n")
+            f.write(f"Duration: {duration:.1f} seconds\n")
+            f.write(f"Total Devices Discovered: {len(self.devices)}\n\n")
+            
+            # Device role breakdown
+            f.write("="*60 + "\n")
+            f.write("DEVICE ROLES\n")
+            f.write("="*60 + "\n")
+            role_counts = {}
+            for device in self.devices.values():
+                role = device.get("device_role", "unknown")
+                role_counts[role] = role_counts.get(role, 0) + 1
+            
+            for role, count in sorted(role_counts.items()):
+                f.write(f"  {role}: {count}\n")
+            
+            f.write("\n" + "="*60 + "\n")
+            f.write("AGGREGATE SWITCHES CONFIGURED\n")
+            f.write("="*60 + "\n")
+            if AGGREGATE_MGMT_IPS:
+                for ip in AGGREGATE_MGMT_IPS:
+                    f.write(f"  • {ip}\n")
+            else:
+                f.write("  None configured (auto-discovery only)\n")
+            
+            f.write("\n" + "="*60 + "\n")
+            f.write("DISCOVERY STATISTICS\n")
+            f.write("="*60 + "\n")
+            
+            # Count protocols used
+            cdp_count = sum(1 for d in self.devices.values() if d.get("discovery_protocol") and "CDP" in d["discovery_protocol"])
+            lldp_count = sum(1 for d in self.devices.values() if d.get("discovery_protocol") and "LLDP" in d["discovery_protocol"])
+            both_count = sum(1 for d in self.devices.values() if d.get("discovery_protocol") == "CDP+LLDP")
+            no_protocol = sum(1 for d in self.devices.values() if not d.get("discovery_protocol"))
+            
+            f.write(f"Devices with CDP only: {cdp_count - both_count}\n")
+            f.write(f"Devices with LLDP only: {lldp_count - both_count}\n")
+            f.write(f"Devices with both CDP+LLDP: {both_count}\n")
+            if no_protocol > 0:
+                f.write(f"Devices without discovery protocol: {no_protocol}\n")
+            
+            # Total neighbors
+            total_neighbors = sum(len(d["neighbors"]) for d in self.devices.values())
+            f.write(f"Total neighbor relationships: {total_neighbors}\n")
+            
+            # Count inaccessible devices
+            inaccessible = sum(1 for d in self.devices.values() if d.get("notes") == "Inaccessible via SSH")
+            if inaccessible > 0:
+                f.write(f"Inaccessible devices (via SSH): {inaccessible}\n")
+            
+            # Count multiple links
+            multiple_link_count = 0
+            for device in self.devices.values():
+                for nbr in device["neighbors"]:
+                    if "link_note" in nbr and "Multiple links" in nbr["link_note"]:
+                        multiple_link_count += 1
+            
+            if multiple_link_count > 0:
+                f.write(f"Connections with multiple links: {multiple_link_count}\n")
+            
+            # Write hostname-to-IP mapping
+            f.write("\n" + "="*60 + "\n")
+            f.write("HOSTNAME TO IP MAPPING\n")
+            f.write("="*60 + "\n")
+            for hostname, ip in sorted(self.hostname_to_ip.items()):
+                f.write(f"{hostname} → {ip}\n")
+            
+        self.log(f"📊 Metadata saved to {filename}")
 
-            logger.info("Returning to seed switch...")
-            exit_device(shell); time.sleep(1)
-
-            hop_success = hop_to_neighbor(shell, agg_ip)
-            if not hop_success:
-                logger.error(f"Failed to connect to aggregate {agg_ip} - skipping")
-                continue
-
-            new_aggregates = scan_aggregate_switch(shell, agg_ip)
-            for agg in new_aggregates:
-                if (agg["mgmt_ip"] not in discovered_aggregates and
-                    agg["mgmt_ip"] not in aggregates_to_process):
-                    aggregates_to_process.append(agg["mgmt_ip"])
-                    logger.info(f"Added new aggregate to queue: {agg['hostname']} ({agg['mgmt_ip']})")
-
-        logger.info("")
-        logger.info("Returning to seed switch...")
-        exit_device(shell); time.sleep(1)
-
-    except Exception as e:
-        logger.error(f"Fatal error during discovery: {e}", exc_info=True)
-    finally:
-        client.close()
-        logger.info("Closed connection to seed switch")
-
-    logger.info("")
-    logger.info("="*80)
-    logger.info("DISCOVERY COMPLETE")
-    logger.info("="*80)
-    logger.info(f"Aggregates discovered: {len(discovered_aggregates)}")
-    for agg_ip in sorted(discovered_aggregates):
-        logger.info(f"  - {agg_ip}")
-    logger.info(f"Total cameras found: {len(camera_data)}")
-    logger.info("="*80)
-
-    json_file = "camera_inventory.json"
-    with open(json_file, "w") as f:
-        json.dump(camera_data, f, indent=2)
-    logger.info(f"Saved: {json_file}")
-
-    if camera_data:
-        csv_file = "camera_inventory.csv"
-        with open(csv_file, "w", newline="") as f:
-            fieldnames = ["switch_name", "port", "mac_address", "vlan"]
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(camera_data)
-        logger.info(f"Saved: {csv_file}")
-
-    logger.info("")
-    logger.info("-"*80)
-    logger.info("CAMERA INVENTORY SUMMARY")
-    logger.info("-"*80)
-    for camera in camera_data:
-        logger.info(f"{camera['switch_name']:<50} {camera['port']:<15} {camera['mac_address']:<20} VLAN {camera['vlan']}")
-    logger.info("")
-    logger.info(f"Total cameras discovered: {len(camera_data)}")
-    logger.info(f"Log file saved: {log_filename}")
 
 if __name__ == "__main__":
-    main()
+    discovery = NetworkDiscovery()
+    
+    # Open log file
+    log_filename = "discovery_log.txt"
+    try:
+        discovery.log_file = open(log_filename, "w")
+        discovery.log(f"Log file created: {log_filename}")
+    except Exception as e:
+        print(f"Warning: Could not create log file: {e}")
+    
+    try:
+        discovery.run_discovery()
+        discovery.generate_json()
+        discovery.write_metadata()
+        
+        # Close log file
+        if discovery.log_file:
+            discovery.log_file.close()
+            
+    except KeyboardInterrupt:
+        print("\n\n[INTERRUPTED] Discovery stopped by user")
+        if discovery.log_file:
+            discovery.log_file.write("\n\n[INTERRUPTED] Discovery stopped by user\n")
+            discovery.log_file.close()
+    except Exception as e:
+        print(f"\n\n[FATAL ERROR] {e}")
+        if discovery.log_file:
+            discovery.log_file.write(f"\n\n[FATAL ERROR] {e}\n")
+            discovery.log_file.close()
+        import traceback
+        traceback.print_exc()
