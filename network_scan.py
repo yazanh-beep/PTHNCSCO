@@ -25,7 +25,7 @@ AGGREGATE_ENTRY_IP = "192.168.100.11"  # First hop from the server
 # "enable": "" means "reuse the login password as enable"
 CREDENTIAL_SETS = [
     {"username": "admin",  "password": "cisco",  "enable": ""},
-    {"username": "ops",    "password": "opspw",  "enable": "enableSecret"},  # example with distinct enable
+    {"username": "ops",    "password": "opspw",  "enable": "enableSecret"},
     {"username": "admin2", "password": "cisco2", "enable": ""},
 ]
 
@@ -37,8 +37,8 @@ AGGREGATE_MGMT_IPS = [
 # Timeouts/retries
 TIMEOUT = 12
 MAX_READ = 65535
-SSH_RETRY_ATTEMPTS = 10      # per your logs (attempt 1/10)
-SSH_RETRY_DELAY = 30         # seconds
+SSH_RETRY_ATTEMPTS = 10
+SSH_RETRY_DELAY = 30
 CDP_LLDP_TIMEOUT = 35
 
 # Aggregate (seed) reconnect policy
@@ -63,6 +63,7 @@ CDP_IP_PATTERNS = (
     r"IP [Aa]ddress:\s*(\d+\.\d+\.\d+\.\d+)",
     r"Management [Aa]ddress(?:es)?:.*?IP(?:v4)?:\s*(\d+\.\d+\.\d+\.\d+)",
 )
+
 LLDP_IP_PATTERNS = (
     r"Management [Aa]ddresses?:.*?IP(?:v4)?:\s*(\d+\.\d+\.\d+\.\d+)",
     r"Management [Aa]ddress:\s*(\d+\.\d+\.\d+\.\d+)",
@@ -84,20 +85,21 @@ class ConfigurationError(Exception):
 class NetworkDiscovery:
     def __init__(self):
         # State
-        self.devices = {}            # mgmt_ip -> device info
-        self.to_visit = deque()      # queue of IPs to visit
-        self.visited = set()         # visited IPs
-        self.hostname_to_ip = {}     # global mapping (informational)
-        self.scoped_hn_to_ip = {}    # per-source-device hostname->ip
+        self.devices = {}
+        self.to_visit = deque()
+        self.visited = set()
+        self.hostname_to_ip = {}
+        self.scoped_hn_to_ip = {}
         self.seed_aggregate_ip = None
         self.agg_shell = None
         self.agg_client = None
         self.start_time = datetime.now()
         self.link_tracking = {}
-        self.agg_creds = None        # creds used for the seed
-        self.device_creds = {}       # ip -> working cred dict
-        self.agg_hostname = None     # authoritative seed hostname
-        self.session_depth = 0       # 0 = on seed; >0 = inside nested ssh session
+        self.agg_creds = None
+        self.device_creds = {}
+        self.agg_hostname = None
+        self.session_depth = 0
+        self._neighbor_platform_cache = {}
 
         # Logging
         self.log_file = None
@@ -139,7 +141,7 @@ class NetworkDiscovery:
                     return buf
             else:
                 time.sleep(0.05)
-        return buf  # timed out; caller decides
+        return buf
 
     def send_cmd(self, shell, cmd, timeout=TIMEOUT, silent=False):
         if not silent:
@@ -147,7 +149,7 @@ class NetworkDiscovery:
         if not shell or shell.closed:
             raise NetworkConnectionError("SSH shell is closed", reconnect_needed=True)
         try:
-            _ = self._drain(shell)  # clear stale
+            _ = self._drain(shell)
             shell.send(cmd + "\n")
             return self.expect_prompt(shell, timeout=timeout)
         except Exception as e:
@@ -172,13 +174,11 @@ class NetworkDiscovery:
                 test = self.send_cmd(shell, pw, timeout=timeout, silent=True)
                 if test.strip().endswith("#"):
                     return True
-            # try empty once if not tried
             test = self.send_cmd(shell, "", timeout=timeout, silent=True)
             if test.strip().endswith("#"):
                 return True
             self.log("Enable failed with all provided enable passwords", "ERROR")
             return False
-        # maybe already privileged
         out2 = self.send_cmd(shell, "", timeout=3, silent=True)
         return out2.strip().endswith("#")
 
@@ -207,17 +207,14 @@ class NetworkDiscovery:
 
             self.log("[CLEANUP] Cleaning up failed SSH attempt", "DEBUG")
 
-            # Try to abort the in-flight SSH attempt
             try:
-                sh.send("\x03")  # Ctrl-C
+                sh.send("\x03")
                 time.sleep(0.2)
             except Exception:
                 pass
 
-            # Drain pending
             _ = self._drain(sh)
 
-            # Only send 'exit' if we KNOW we are nested
             if self.session_depth > 0:
                 try:
                     sh.send("exit\n")
@@ -227,7 +224,6 @@ class NetworkDiscovery:
                 except Exception:
                     pass
 
-            # Verify prompt
             try:
                 sh.send("\n")
                 time.sleep(0.2)
@@ -248,7 +244,6 @@ class NetworkDiscovery:
         last_err = None
         if reason:
             self.log(f"[RECONNECT] Reconnecting to aggregate: {reason}", "WARN")
-        # Close old client
         try:
             if self.agg_client:
                 self.agg_client.close()
@@ -279,7 +274,8 @@ class NetworkDiscovery:
 
     # ── Basic getters ─────────────────────────────────────────────────────
     def get_hostname(self, shell):
-        shell.send("\n"); time.sleep(0.2)
+        shell.send("\n")
+        time.sleep(0.2)
         buff = self.expect_prompt(shell, timeout=4)
         for line in reversed(buff.splitlines()):
             line = line.strip()
@@ -353,7 +349,14 @@ class NetworkDiscovery:
     def normalize_interface_name(self, interface):
         if not interface:
             return interface
-        repl = {'Te':'TenGigabitEthernet','Gi':'GigabitEthernet','Fa':'FastEthernet','Et':'Ethernet','Po':'Port-channel','Vl':'Vlan'}
+        repl = {
+            'Te': 'TenGigabitEthernet',
+            'Gi': 'GigabitEthernet',
+            'Fa': 'FastEthernet',
+            'Et': 'Ethernet',
+            'Po': 'Port-channel',
+            'Vl': 'Vlan'
+        }
         interface = interface.strip()
         for short, full in repl.items():
             if interface.startswith(short) and len(interface) > len(short):
@@ -368,10 +371,17 @@ class NetworkDiscovery:
         for block in blocks:
             if "Device ID:" not in block:
                 continue
-            nbr = {"hostname": None, "mgmt_ip": None, "local_intf": None,
-                   "remote_intf": None, "platform": None, "source": "CDP"}
+            nbr = {
+                "hostname": None,
+                "mgmt_ip": None,
+                "local_intf": None,
+                "remote_intf": None,
+                "platform": None,
+                "source": "CDP"
+            }
             m = re.search(r"Device ID:\s*([^\s]+)", block)
-            if m: nbr["hostname"] = m.group(1)
+            if m:
+                nbr["hostname"] = m.group(1)
 
             for pat in CDP_IP_PATTERNS:
                 m = re.search(pat, block, flags=re.I | re.S)
@@ -380,13 +390,18 @@ class NetworkDiscovery:
                     break
 
             m = re.search(r"Interface:\s*([^\s,]+)", block)
-            if m: nbr["local_intf"] = m.group(1)
+            if m:
+                nbr["local_intf"] = m.group(1)
 
             m = re.search(r"Port ID[^:]*:\s*([^\s]+)", block, flags=re.I)
-            if m: nbr["remote_intf"] = m.group(1)
+            if m:
+                nbr["remote_intf"] = m.group(1)
 
             m = re.search(r"Platform:\s*([^,\n]+)", block)
-            if m: nbr["platform"] = m.group(1).strip()
+            if m:
+                nbr["platform"] = m.group(1).strip()
+                if nbr["mgmt_ip"]:
+                    self._neighbor_platform_cache[nbr["mgmt_ip"]] = nbr["platform"]
 
             if nbr["hostname"] and nbr["mgmt_ip"]:
                 if not nbr["platform"] or "cisco" in nbr["platform"].lower():
@@ -395,47 +410,83 @@ class NetworkDiscovery:
 
     def parse_lldp_neighbors(self, output):
         neighbors = []
-        blocks = re.split(r"(?=^(?:Local Intf:|Chassis id:))", output, flags=re.M)
+        
+        blocks = re.split(r'[-]{40,}\s*\n', output)
+        
         for block in blocks:
-            if "Local Intf:" not in block and "Chassis id:" not in block:
+            if not block.strip():
                 continue
-            nbr = {"hostname": None, "mgmt_ip": None, "local_intf": None,
-                   "remote_intf": None, "sys_descr": "", "source": "LLDP"}
+                
+            if "Capability codes:" in block or "Total entries" in block or "Device ID" in block:
+                continue
+            
+            if "Local Intf:" not in block:
+                continue
+                
+            nbr = {
+                "hostname": None,
+                "mgmt_ip": None,
+                "local_intf": None,
+                "remote_intf": None,
+                "sys_descr": "",
+                "platform": None,
+                "source": "LLDP"
+            }
 
-            m = re.search(r"Local Intf:\s*(\S+)", block)
-            if m: nbr["local_intf"] = m.group(1)
+            m = re.search(r'^Local Intf:\s*(\S+)', block, re.M)
+            if m:
+                nbr["local_intf"] = m.group(1)
 
-            for pat in (r"Port id:\s*(\S+)", r"Port ID:\s*(\S+)", r"PortID:\s*(\S+)"):
-                m = re.search(pat, block, re.I)
-                if m:
-                    nbr["remote_intf"] = m.group(1)
-                    break
+            m = re.search(r'^Port id:\s*(\S+)', block, re.M | re.I)
+            if m:
+                nbr["remote_intf"] = m.group(1)
 
-            m = re.search(r"System Name:\s*([^\n]+)", block, re.I)
+            m = re.search(r'^System Name:\s*(.+?)$', block, re.M)
             if m:
                 hostname = m.group(1).strip().strip('"').strip("'")
                 nbr["hostname"] = hostname
 
-            if not nbr["hostname"]:
-                m = re.search(r"System Description:[^\n]*?(\S+)\s+Software", block, re.I)
+            m = re.search(r'^System Description:\s*\n([\s\S]+?)(?=^Time remaining:|^System Capabilities:|^Management Addresses:|$)', block, re.M)
+            if m:
+                nbr["sys_descr"] = m.group(1).strip()
+                platform_patterns = [
+                    r'IE3x00',
+                    r'IE-\d+[A-Z0-9\-]*',
+                    r'CAT9K',
+                    r'Catalyst\s+(\d+)',
+                    r'cisco\s+([A-Z0-9\-]+)',
+                ]
+                for pat in platform_patterns:
+                    platform_match = re.search(pat, nbr["sys_descr"], re.I)
+                    if platform_match:
+                        nbr["platform"] = platform_match.group(0)
+                        break
+
+            if not nbr["hostname"] and nbr["sys_descr"]:
+                m = re.search(r'(\S+)\s+Software', nbr["sys_descr"], re.I)
                 if m:
                     nbr["hostname"] = m.group(1)
 
-            m = re.search(r"System Description:\s*([\s\S]+?)(?=\n\s*\n|\nTime|\nCapabilities|Management|$)", block, re.I)
-            if m: nbr["sys_descr"] = m.group(1).strip()
-
-            for pat in LLDP_IP_PATTERNS:
-                m = re.search(pat, block, re.I | re.S)
-                if m:
-                    nbr["mgmt_ip"] = m.group(1)
-                    break
+            m = re.search(r'^Management Addresses:\s*\n\s*IP:\s*(\d+\.\d+\.\d+\.\d+)', block, re.M)
+            if m:
+                nbr["mgmt_ip"] = m.group(1)
 
             if nbr["mgmt_ip"]:
+                if not nbr["hostname"]:
+                    nbr["hostname"] = f"LLDP-Device-{nbr['mgmt_ip']}"
+                    self.log(f"  Warning: No hostname found in LLDP for {nbr['mgmt_ip']}, using placeholder", "WARN")
+                
+                if not nbr["local_intf"]:
+                    self.log(f"  Warning: No local interface found in LLDP for {nbr['hostname']} ({nbr['mgmt_ip']})", "WARN")
+                    preview = block[:300].replace('\n', ' | ')
+                    self.log(f"  [DEBUG] LLDP block: {preview}", "DEBUG")
+                
+                if nbr["platform"]:
+                    self._neighbor_platform_cache[nbr["mgmt_ip"]] = nbr["platform"]
+                
                 if nbr["sys_descr"] and "cisco" in nbr["sys_descr"].lower():
-                    if not nbr["hostname"]:
-                        nbr["hostname"] = f"LLDP-Device-{nbr['mgmt_ip']}"
-                        self.log(f"  Warning: No hostname found in LLDP for {nbr['mgmt_ip']}, using placeholder", "WARN")
                     neighbors.append(nbr)
+        
         return neighbors
 
     def discover_neighbors(self, shell, current_device_ip):
@@ -461,6 +512,15 @@ class NetworkDiscovery:
 
         self.log("Checking LLDP neighbors...")
         lldp_out = self.send_cmd(shell, "show lldp neighbors detail", timeout=CDP_LLDP_TIMEOUT, silent=True)
+        
+        try:
+            debug_filename = f"lldp_debug_{current_device_ip.replace('.', '_')}.txt"
+            with open(debug_filename, "w") as f:
+                f.write(lldp_out)
+            self.log(f"[DEBUG] LLDP output saved to {debug_filename}", "DEBUG")
+        except Exception as e:
+            self.log(f"[DEBUG] Could not save LLDP debug output: {e}", "DEBUG")
+        
         if "Invalid input" not in lldp_out and "LLDP is not enabled" not in lldp_out:
             lldp_neighbors = self.parse_lldp_neighbors(lldp_out)
             if lldp_neighbors:
@@ -477,10 +537,10 @@ class NetworkDiscovery:
                     else:
                         scope[nbr["hostname"]] = nbr["mgmt_ip"]
                         self.hostname_to_ip.setdefault(nbr["hostname"], nbr["mgmt_ip"])
-                    # de-dupe by local interface against CDP
+                    
                     is_dup_intf = False
                     if nbr["hostname"] in all_by_host:
-                        lldp_intf_norm = self.normalize_interface_name(nbr["local_intf"])
+                        lldp_intf_norm = self.normalize_interface_name(nbr["local_intf"]) if nbr["local_intf"] else None
                         for existing in all_by_host[nbr["hostname"]]:
                             exist_intf_norm = self.normalize_interface_name(existing.get("local_intf"))
                             if existing.get("discovered_via") == "CDP" and exist_intf_norm == lldp_intf_norm:
@@ -518,18 +578,16 @@ class NetworkDiscovery:
         if self.agg_creds:
             c = self.agg_creds
             cands += [c.get("enable") or c.get("password"), c.get("password")]
-        # Deduplicate preserving order
-        seen = set(); out = []
+        seen = set()
+        out = []
         for x in cands:
             if x and x not in seen:
-                out.append(x); seen.add(x)
+                out.append(x)
+                seen.add(x)
         return out or [""]
 
     def _interactive_hop(self, shell, ip, username, password, overall_timeout=90):
-        """
-        Drive IOS 'ssh' interactively until we either reach a prompt, see a failure,
-        or hit overall_timeout (seconds). Returns (success_bool, final_buffer).
-        """
+        """Drive IOS 'ssh' interactively until we reach a prompt or timeout."""
         start = time.time()
         buf = ""
 
@@ -541,7 +599,6 @@ class NetworkDiscovery:
 
         while time.time() - start < overall_timeout:
             time.sleep(0.15)
-            # read whatever we have
             if shell.recv_ready():
                 try:
                     chunk = shell.recv(MAX_READ).decode("utf-8", "ignore")
@@ -550,29 +607,24 @@ class NetworkDiscovery:
                 if chunk:
                     buf += chunk
 
-            # success: device prompt
             if PROMPT_RE.search(buf):
                 return True, buf
 
             low = buf.lower()
 
-            # handle host key prompt
             if "(yes/no)" in low or "yes/no" in low:
                 feed("yes\n")
                 continue
 
-            # username prompt variants
             if "username:" in low:
                 feed(username + "\n")
                 continue
 
-            # password prompt variants
             if "password:" in low:
                 feed(password + "\n")
                 time.sleep(0.5)
                 continue
 
-            # early hard failures
             fail_keys = (
                 "connection refused", "unable to connect", "timed out",
                 "no route to host", "host is unreachable",
@@ -583,11 +635,9 @@ class NetworkDiscovery:
             if any(k in low for k in fail_keys):
                 return False, buf
 
-            # sometimes IOS pauses on banner with no prompts; nudge stdin
             if (time.time() - start) % 5 < 0.2:
                 feed("\n")
 
-        # timeout
         return False, buf
 
     def _connect_to_aggregate_internal(self):
@@ -623,7 +673,6 @@ class NetworkDiscovery:
                 self.agg_shell = shell
                 self.agg_creds = cred
 
-                # Capture seed hostname for identity verification later
                 self.agg_hostname = self.get_hostname(self.agg_shell) or "UNKNOWN"
                 self.log(f"Seed hostname: {self.agg_hostname}", "DEBUG")
                 self.log("Successfully connected to aggregate switch")
@@ -655,23 +704,17 @@ class NetworkDiscovery:
         raise NetworkConnectionError(f"Failed to connect to seed after {AGG_MAX_RETRIES} attempts: {last_err}")
 
     def ssh_to_device(self, target_ip, attempt=1):
-        """
-        SSH hop from aggregate to target using IOS CLI.
-        Robust interactive handling of banner/Username/Password prompts.
-        Verifies hostname change and manages session_depth.
-        """
+        """SSH hop from aggregate to target using IOS CLI."""
         if not self.agg_shell or self.agg_shell.closed:
             raise NetworkConnectionError("SSH shell to aggregation switch is closed", reconnect_needed=True)
 
         self.log(f"SSH hop to {target_ip} (attempt {attempt}/{SSH_RETRY_ATTEMPTS})")
 
-        # who are we before hop?
         try:
             pre_host = self.get_hostname(self.agg_shell) or self.agg_hostname or "UNKNOWN"
         except Exception:
             pre_host = self.agg_hostname or "UNKNOWN"
 
-        # credential order: known-for-device -> seed creds -> rest
         cred_order = []
         if target_ip in self.device_creds:
             cred_order.append(self.device_creds[target_ip])
@@ -681,34 +724,29 @@ class NetworkDiscovery:
             if cs not in cred_order:
                 cred_order.append(cs)
 
-        # try each credential set with multiple ssh syntaxes
         for cred in cred_order:
             user = cred["username"]
-            pwd  = cred["password"]
+            pwd = cred["password"]
             enable = cred.get("enable") or cred["password"]
 
             syntaxes = [
                 f"ssh -l {user} {target_ip}",
                 f"ssh {user}@{target_ip}",
-                f"ssh {target_ip}",  # we'll answer Username:
+                f"ssh {target_ip}",
             ]
 
             for cmd in syntaxes:
-                # push the ssh command
-                _ = self.send_cmd(self.agg_shell, cmd, timeout=3, silent=True)  # ignore initial echo
+                _ = self.send_cmd(self.agg_shell, cmd, timeout=3, silent=True)
 
-                # drive the interaction
                 ok, out = self._interactive_hop(self.agg_shell, target_ip, user, pwd, overall_timeout=90)
 
                 if not ok:
                     self.log(f"SSH (syntax '{cmd}') failed to {target_ip} with {user}", "WARN")
-                    # depth-aware cleanup; do NOT disconnect seed unless dead
                     self.cleanup_failed_session()
                     if not self.verify_aggregate_connection():
                         raise NetworkConnectionError("Connection to aggregation switch lost", reconnect_needed=True)
                     continue
 
-                # We have *a* prompt. Ensure we're privileged.
                 if out.strip().endswith(">"):
                     if not self._ensure_enable(self.agg_shell, [enable, pwd], timeout=10):
                         self.log(f"Enable failed on {target_ip} with {user}", "WARN")
@@ -717,37 +755,30 @@ class NetworkDiscovery:
                             raise NetworkConnectionError("Connection to aggregation switch lost", reconnect_needed=True)
                         continue
 
-                # Verify identity: hostname must have changed
                 post_host = self.get_hostname(self.agg_shell) or ""
                 if post_host.strip() == pre_host.strip():
-                    # We’re still on the seed (e.g., remote closed after banner)
                     self.log(f"Hop to {target_ip} did not change hostname (still '{pre_host}'). Treating as failure.", "WARN")
                     self.cleanup_failed_session()
                     if not self.verify_aggregate_connection():
                         raise NetworkConnectionError("Connection to aggregation switch lost", reconnect_needed=True)
                     continue
 
-                # Success!
                 self.session_depth += 1
                 self.send_cmd(self.agg_shell, "terminal length 0", timeout=5, silent=True)
                 self.log(f"Successfully connected to {target_ip} as {user} (host: {post_host})")
                 self.device_creds[target_ip] = cred
                 return True
 
-        # retries across all creds/syntaxes exhausted for this attempt → backoff
         if attempt < SSH_RETRY_ATTEMPTS:
             self.log(f"[RETRY] Waiting {SSH_RETRY_DELAY}s before retry...", "INFO")
             delay_remaining = SSH_RETRY_DELAY
             while delay_remaining > 0:
                 time.sleep(min(10, delay_remaining))
                 delay_remaining -= 10
-                # keep the seed alive
                 if not self.verify_aggregate_connection():
                     raise NetworkConnectionError("Lost connection to aggregation switch during retry delay", reconnect_needed=True)
-            # try again
             return self.ssh_to_device(target_ip, attempt + 1)
 
-        # give up
         raise NetworkConnectionError(f"SSH to {target_ip} failed after {SSH_RETRY_ATTEMPTS} attempts",
                                      reconnect_needed=False, retry_allowed=False)
 
@@ -759,12 +790,13 @@ class NetworkDiscovery:
         try:
             if self.session_depth > 0:
                 self.log("[EXIT] Leaving nested session...", "DEBUG")
-                sh.send("exit\n"); time.sleep(0.6)
+                sh.send("exit\n")
+                time.sleep(0.6)
                 _ = self._drain(sh)
                 self.session_depth = max(0, self.session_depth - 1)
 
-            # Verify seed prompt
-            sh.send("\n"); time.sleep(0.2)
+            sh.send("\n")
+            time.sleep(0.2)
             data = self._drain(sh)
             return bool(PROMPT_RE.search(data))
         except Exception as e:
@@ -780,7 +812,6 @@ class NetworkDiscovery:
             self.log("  Skipping discovery for seed aggregate switch")
             return None
 
-        # Pre-verify aggregate
         if not self.verify_aggregate_connection():
             self.reconnect_to_aggregate("Seed connection lost before hop")
 
@@ -790,7 +821,6 @@ class NetworkDiscovery:
                 if not self.ssh_to_device(mgmt_ip):
                     ssh_accessible = False
             except NetworkConnectionError as e:
-                # Reconnect ONLY if truly needed
                 if getattr(e, 'reconnect_needed', False) or not self.verify_aggregate_connection():
                     self.reconnect_to_aggregate("Lost while hopping to device")
                     try:
@@ -802,7 +832,6 @@ class NetworkDiscovery:
                     ssh_accessible = False
 
             if ssh_accessible:
-                # Defensive: ensure we are NOT still on the seed after hop
                 current_host = self.get_hostname(self.agg_shell)
                 if current_host.strip() == (self.agg_hostname or "").strip():
                     self.log("Detected aggregate prompt after hop; retrying hop once...", "WARN")
@@ -814,20 +843,47 @@ class NetworkDiscovery:
 
             if not ssh_accessible:
                 self.log(f" Cannot SSH to {mgmt_ip} - marking as inaccessible", "WARN")
+                hostname = "Unknown"
+                platform = None
+                discovered_via = None
+                
+                for device_ip, device_data in self.devices.items():
+                    for nbr in device_data.get("neighbors", []):
+                        if nbr.get("neighbor_mgmt_ip") == mgmt_ip:
+                            hostname = nbr.get("neighbor_hostname", "Unknown")
+                            discovered_via = nbr.get("discovered_via")
+                            if hasattr(self, '_neighbor_platform_cache'):
+                                platform = self._neighbor_platform_cache.get(mgmt_ip)
+                            break
+                    if hostname != "Unknown":
+                        break
+                
+                if hostname == "Unknown":
+                    for hn, ip in self.hostname_to_ip.items():
+                        if ip == mgmt_ip:
+                            hostname = hn
+                            break
+                
+                device_role = self.determine_device_role(hostname) if hostname != "Unknown" else "unknown"
+                
+                note_parts = ["Inaccessible via SSH"]
+                if discovered_via:
+                    note_parts.append(f"Discovered via {discovered_via}")
+                
                 return {
-                    "hostname": "Unknown",
+                    "hostname": hostname,
                     "management_ip": mgmt_ip,
                     "serial_number": None,
                     "ios_version": None,
-                    "switch_model": None,
-                    "device_role": "unknown",
+                    "switch_model": platform,
+                    "device_role": device_role,
                     "discovery_protocol": None,
-                    "notes": "Inaccessible via SSH",
+                    "notes": " - ".join(note_parts),
                     "neighbors": []
                 }
 
         try:
-            shell = self.agg_shell  # we are nested on the device when session_depth>0
+            shell = self.agg_shell
 
             hostname = self.get_hostname(shell)
             self.log(f"Hostname: {hostname}")
@@ -882,7 +938,6 @@ class NetworkDiscovery:
 
                 device_info["neighbors"].append(neighbor_entry)
 
-                # Queue neighbor if not visited and not seed
                 if nbr["mgmt_ip"] not in self.visited and nbr["mgmt_ip"] != self.seed_aggregate_ip:
                     if nbr["mgmt_ip"] not in self.to_visit:
                         self.to_visit.append(nbr["mgmt_ip"])
@@ -892,11 +947,9 @@ class NetworkDiscovery:
                 elif nbr["mgmt_ip"] == self.seed_aggregate_ip:
                     self.log(f"    Skipping seed aggregate {nbr['mgmt_ip']} - already discovered")
 
-            # Exit back to aggregate (unless we were already on the aggregate)
             if mgmt_ip != AGGREGATE_ENTRY_IP:
                 ok = self.exit_device()
                 if not ok:
-                    # If exit flaked, verify seed and reconnect if needed
                     if not self.verify_aggregate_connection():
                         self.reconnect_to_aggregate("Lost after exiting device")
 
@@ -921,10 +974,8 @@ class NetworkDiscovery:
         self.log("Starting Network Topology Discovery")
         self.log("="*60)
 
-        # Connect to aggregate
         agg_mgmt_ip = self.connect_to_aggregate()
 
-        # Collect seed aggregate info
         self.log("\n" + "="*60)
         self.log(f"Collecting seed aggregate information: {agg_mgmt_ip}")
         self.log("="*60)
@@ -986,19 +1037,16 @@ class NetworkDiscovery:
         except Exception as e:
             self.log(f"Error collecting seed aggregate info: {e}", "ERROR")
 
-        # Add configured aggregates (not already scheduled/visited)
         for ip in AGGREGATE_MGMT_IPS:
             if ip != agg_mgmt_ip and ip not in self.visited and ip not in self.to_visit:
                 self.to_visit.append(ip)
 
-        # Discovery loop with mid-run reconnects
         while self.to_visit:
             current_ip = self.to_visit.popleft()
             if current_ip in self.visited:
                 self.log(f"Skipping {current_ip} - already visited")
                 continue
 
-            # Make sure agg is alive before each hop
             if not self.verify_aggregate_connection():
                 self.reconnect_to_aggregate("Before visiting next device")
 
@@ -1009,7 +1057,6 @@ class NetworkDiscovery:
             else:
                 self.log(f"Failed to collect info from {current_ip}", "ERROR")
 
-        # Cleanup
         try:
             if self.agg_client:
                 self.agg_client.close()
@@ -1106,7 +1153,7 @@ class NetworkDiscovery:
             total_neighbors = sum(len(d["neighbors"]) for d in self.devices.values())
             f.write(f"Total neighbor relationships: {total_neighbors}\n")
 
-            inaccessible = sum(1 for d in self.devices.values() if d.get("notes") == "Inaccessible via SSH")
+            inaccessible = sum(1 for d in self.devices.values() if d.get("notes") and "Inaccessible via SSH" in d["notes"])
             if inaccessible > 0:
                 f.write(f"Inaccessible devices (via SSH): {inaccessible}\n")
 
@@ -1129,7 +1176,6 @@ class NetworkDiscovery:
 if __name__ == "__main__":
     nd = NetworkDiscovery()
 
-    # Open log file
     try:
         nd.log_file = open(nd.log_filename, "w", encoding="utf-8")
         nd.log(f"Log file created: {nd.log_filename}")
