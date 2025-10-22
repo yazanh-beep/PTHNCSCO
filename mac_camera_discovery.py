@@ -1109,12 +1109,12 @@ def main():
         "discovery_statistics": discovery_stats,
         "cameras": camera_data
     }
-    with open(json_file, "w") as f:
+    with open(json_file, "w", encoding='utf-8' ) as f:
         json.dump(output_data, f, indent=2)
     logger.info(f"Saved: {json_file}")
     if camera_data:
         csv_file = f"camera_inventory_{len(camera_data)}cameras_{timestamp}.csv"
-        with open(csv_file, "w", newline="") as f:
+        with open(csv_file, "w", newline="", encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=["switch_name", "switch_type", "port", "mac_address", "vlan"])
             writer.writeheader()
             writer.writerows(camera_data)
