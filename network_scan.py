@@ -515,7 +515,7 @@ class NetworkDiscovery:
         
         try:
             debug_filename = f"lldp_debug_{current_device_ip.replace('.', '_')}.txt"
-            with open(debug_filename, "w") as f:
+            with open(debug_filename, "w", encoding="utf-8") as f:
                 f.write(lldp_out)
             self.log(f"[DEBUG] LLDP output saved to {debug_filename}", "DEBUG")
         except Exception as e:
@@ -1072,7 +1072,7 @@ class NetworkDiscovery:
     # ── Output writers ────────────────────────────────────────────────────
     def generate_json(self, filename="network_topology.json"):
         devices_list = list(self.devices.values())
-        with open(filename, "w") as f:
+        with open(filename, "w", encoding="utf-8") as f:
             json.dump(devices_list, f, indent=2)
         self.log(f"\n Topology saved to {filename}")
 
@@ -1107,7 +1107,7 @@ class NetworkDiscovery:
 
     def write_metadata(self, filename="discovery_metadata.txt"):
         duration = (datetime.now() - self.start_time).total_seconds()
-        with open(filename, "w") as f:
+        with open(filename, "w", , encoding="utf-8") as f:
             f.write("="*60 + "\n")
             f.write("NETWORK TOPOLOGY DISCOVERY METADATA\n")
             f.write("="*60 + "\n\n")
