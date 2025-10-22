@@ -663,8 +663,8 @@ def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
     logger.info("="*80)
     logger.info("Clearing dynamic MAC address table...")
     send_cmd(shell, "clear mac address-table dynamic", timeout=10)
-    logger.info("Waiting 5 seconds for MAC table to repopulate...")
-    time.sleep(5)
+    logger.info("Waiting 60 seconds for MAC table to repopulate...")
+    time.sleep(60)
     logger.info("MAC table refresh complete")
     uplink_ports = get_uplink_ports_from_neighbors(shell)
     if not uplink_ports:
