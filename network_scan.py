@@ -1171,7 +1171,7 @@ class NetworkDiscovery:
             for hostname, ip in sorted(self.hostname_to_ip.items()):
                 f.write(f"{hostname} → {ip}\n")
 
-        self.log(f"📊 Metadata saved to {filename}")
+        self.log(f" Metadata saved to {filename}")
 
 if __name__ == "__main__":
     nd = NetworkDiscovery()
