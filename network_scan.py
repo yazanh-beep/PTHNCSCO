@@ -24,9 +24,7 @@ AGGREGATE_ENTRY_IP = "192.168.100.11"  # First hop from the server
 # Ordered credential sets to try (add more as needed)
 # "enable": "" means "reuse the login password as enable"
 CREDENTIAL_SETS = [
-    {"username": "admin",  "password": "cisco",  "enable": ""},
-    {"username": "ops",    "password": "opspw",  "enable": "enableSecret"},
-    {"username": "admin2", "password": "cisco2", "enable": ""},
+    {"username": "admin",  "password": "cisco",  "enable": ""}
 ]
 
 # Optional: pre-known aggregate SVI mgmt IPs (besides seed)
@@ -409,83 +407,147 @@ class NetworkDiscovery:
         return neighbors
 
     def parse_lldp_neighbors(self, output):
+        """
+        Parse 'show lldp neighbors detail' output and extract neighbor information.
+        Filters out non-Cisco devices based on hostname patterns and system description.
+        
+        Returns: list of dicts with keys: hostname, mgmt_ip, local_intf, remote_intf
+        """
+        # Patterns to identify non-Cisco devices
+        NON_CISCO_PATTERNS = [
+            r'^axis-',           # Axis cameras
+            r'^SEP[A-F0-9]{12}', # Cisco IP phones
+            r'^AP[A-F0-9]+',     # Standalone access points
+            r'^printer-',
+            r'^camera-',
+            r'^phone-',
+        ]
+        
         neighbors = []
         
-        blocks = re.split(r'[-]{40,}\s*\n', output)
+        if not output or "Total entries displayed: 0" in output:
+            return neighbors
+        
+        # Split by separator to get individual neighbor blocks
+        blocks = output.split("------------------------------------------------")
         
         for block in blocks:
-            if not block.strip():
-                continue
-                
-            if "Capability codes:" in block or "Total entries" in block or "Device ID" in block:
-                continue
-            
+            # Skip empty blocks or blocks without interface info
             if "Local Intf:" not in block:
                 continue
+            
+            try:
+                neighbor = {}
                 
-            nbr = {
-                "hostname": None,
-                "mgmt_ip": None,
-                "local_intf": None,
-                "remote_intf": None,
-                "sys_descr": "",
-                "platform": None,
-                "source": "LLDP"
-            }
-
-            m = re.search(r'^Local Intf:\s*(\S+)', block, re.M)
-            if m:
-                nbr["local_intf"] = m.group(1)
-
-            m = re.search(r'^Port id:\s*(\S+)', block, re.M | re.I)
-            if m:
-                nbr["remote_intf"] = m.group(1)
-
-            m = re.search(r'^System Name:\s*(.+?)$', block, re.M)
-            if m:
-                hostname = m.group(1).strip().strip('"').strip("'")
-                nbr["hostname"] = hostname
-
-            m = re.search(r'^System Description:\s*\n([\s\S]+?)(?=^Time remaining:|^System Capabilities:|^Management Addresses:|$)', block, re.M)
-            if m:
-                nbr["sys_descr"] = m.group(1).strip()
-                platform_patterns = [
-                    r'IE3x00',
-                    r'IE-\d+[A-Z0-9\-]*',
-                    r'CAT9K',
-                    r'Catalyst\s+(\d+)',
-                    r'cisco\s+([A-Z0-9\-]+)',
-                ]
-                for pat in platform_patterns:
-                    platform_match = re.search(pat, nbr["sys_descr"], re.I)
-                    if platform_match:
-                        nbr["platform"] = platform_match.group(0)
-                        break
-
-            if not nbr["hostname"] and nbr["sys_descr"]:
-                m = re.search(r'(\S+)\s+Software', nbr["sys_descr"], re.I)
-                if m:
-                    nbr["hostname"] = m.group(1)
-
-            m = re.search(r'^Management Addresses:\s*\n\s*IP:\s*(\d+\.\d+\.\d+\.\d+)', block, re.M)
-            if m:
-                nbr["mgmt_ip"] = m.group(1)
-
-            if nbr["mgmt_ip"]:
-                if not nbr["hostname"]:
-                    nbr["hostname"] = f"LLDP-Device-{nbr['mgmt_ip']}"
-                    self.log(f"  Warning: No hostname found in LLDP for {nbr['mgmt_ip']}, using placeholder", "WARN")
+                # Extract local interface
+                local_match = re.search(r"Local Intf:\s*(\S+)", block)
+                if not local_match:
+                    self.log("  Warning: LLDP block missing Local Intf", "DEBUG")
+                    continue
+                neighbor["local_intf"] = local_match.group(1)
                 
-                if not nbr["local_intf"]:
-                    self.log(f"  Warning: No local interface found in LLDP for {nbr['hostname']} ({nbr['mgmt_ip']})", "WARN")
-                    preview = block[:300].replace('\n', ' | ')
-                    self.log(f"  [DEBUG] LLDP block: {preview}", "DEBUG")
+                # Extract system name (hostname)
+                name_match = re.search(r"System Name:\s*(\S+)", block)
+                if not name_match:
+                    self.log(f"  Warning: LLDP block on {neighbor['local_intf']} missing System Name", "DEBUG")
+                    continue
+                hostname = name_match.group(1)
+                neighbor["hostname"] = hostname
                 
-                if nbr["platform"]:
-                    self._neighbor_platform_cache[nbr["mgmt_ip"]] = nbr["platform"]
+                # FILTER 1: Check hostname pattern for non-Cisco devices
+                is_non_cisco = any(re.match(pattern, hostname, re.IGNORECASE) 
+                                  for pattern in NON_CISCO_PATTERNS)
+                if is_non_cisco:
+                    self.log(f"  ⊗ Skipping non-Cisco device (pattern match): {hostname}", "DEBUG")
+                    continue
                 
-                if nbr["sys_descr"] and "cisco" in nbr["sys_descr"].lower():
-                    neighbors.append(nbr)
+                # FILTER 2: Check System Description for Cisco IOS/NX-OS
+                has_cisco_desc = ("Cisco IOS" in block or 
+                                "Cisco NX-OS" in block or
+                                "IOS-XE" in block or
+                                "IOS XE" in block)
+                
+                if not has_cisco_desc:
+                    # Extract a snippet of the description for logging
+                    desc_match = re.search(r"System Description:\s*\n(.{0,50})", block)
+                    desc_snippet = desc_match.group(1).strip() if desc_match else "Unknown"
+                    self.log(f"  ⊗ Skipping non-Cisco device (no Cisco OS): {hostname} - {desc_snippet}", "DEBUG")
+                    continue
+                
+                # Extract remote port ID
+                port_match = re.search(r"Port id:\s*(\S+)", block)
+                if port_match:
+                    neighbor["remote_intf"] = port_match.group(1)
+                else:
+                    self.log(f"  Warning: No Port ID found for {hostname}", "DEBUG")
+                    neighbor["remote_intf"] = "Unknown"
+                
+                # Extract management IP address
+                # Try multiple patterns as different IOS versions format it differently
+                mgmt_ip = None
+                
+                # Pattern 1: Multi-line format with "Management Addresses:" header
+                ip_match1 = re.search(r"Management Addresses:\s*\n\s*IP:\s*(\d+\.\d+\.\d+\.\d+)", block)
+                if ip_match1:
+                    mgmt_ip = ip_match1.group(1)
+                
+                # Pattern 2: Single line format
+                if not mgmt_ip:
+                    ip_match2 = re.search(r"Management Address:\s*(\d+\.\d+\.\d+\.\d+)", block)
+                    if ip_match2:
+                        mgmt_ip = ip_match2.group(1)
+                
+                # Pattern 3: IPv4 prefix
+                if not mgmt_ip:
+                    ip_match3 = re.search(r"Management.*?IPv4:\s*(\d+\.\d+\.\d+\.\d+)", block)
+                    if ip_match3:
+                        mgmt_ip = ip_match3.group(1)
+                
+                # Pattern 4: Direct IP pattern anywhere in Management section
+                if not mgmt_ip:
+                    mgmt_section = re.search(r"Management.*?(?=\n[A-Z]|\n\n|$)", block, re.DOTALL)
+                    if mgmt_section:
+                        ip_match4 = re.search(r"(\d+\.\d+\.\d+\.\d+)", mgmt_section.group(0))
+                        if ip_match4:
+                            mgmt_ip = ip_match4.group(1)
+                
+                if mgmt_ip:
+                    neighbor["mgmt_ip"] = mgmt_ip
+                else:
+                    self.log(f"  Warning: No management IP found for {hostname} on {neighbor['local_intf']}", "WARN")
+                    # Still add the neighbor but mark it as inaccessible
+                    neighbor["mgmt_ip"] = None
+                    neighbor["note"] = "No management IP in LLDP"
+                
+                # Optional: Extract chassis ID for additional info
+                chassis_match = re.search(r"Chassis id:\s*([a-fA-F0-9.:]+)", block)
+                if chassis_match:
+                    neighbor["chassis_id"] = chassis_match.group(1)
+                
+                # Optional: Extract system capabilities
+                cap_match = re.search(r"System Capabilities:\s*([A-Z,\s]+)", block)
+                if cap_match:
+                    neighbor["capabilities"] = cap_match.group(1).strip()
+                
+                # Optional: Extract port description
+                port_desc_match = re.search(r"Port Description:\s*(.+?)(?=\n|$)", block)
+                if port_desc_match:
+                    neighbor["port_description"] = port_desc_match.group(1).strip()
+                
+                # Add discovery method marker
+                neighbor["discovered_via"] = "LLDP"
+                
+                # Only add if we have the minimum required fields
+                if neighbor.get("hostname") and neighbor.get("local_intf"):
+                    neighbors.append(neighbor)
+                    self.log(f"  ✓ Parsed LLDP neighbor: {neighbor['hostname']} "
+                            f"({neighbor.get('mgmt_ip', 'No-IP')}) via "
+                            f"{neighbor['local_intf']} ↔ {neighbor['remote_intf']}", "DEBUG")
+                
+            except Exception as e:
+                self.log(f"  Error parsing LLDP block: {e}", "ERROR")
+                self.log(f"  Block content: {block[:200]}...", "DEBUG")
+                continue
         
         return neighbors
 
@@ -515,7 +577,7 @@ class NetworkDiscovery:
         
         try:
             debug_filename = f"lldp_debug_{current_device_ip.replace('.', '_')}.txt"
-            with open(debug_filename, "w", encoding="utf-8") as f:
+            with open(debug_filename,  "w" ,encoding='utf-8') as f:
                 f.write(lldp_out)
             self.log(f"[DEBUG] LLDP output saved to {debug_filename}", "DEBUG")
         except Exception as e:
@@ -1072,7 +1134,7 @@ class NetworkDiscovery:
     # ── Output writers ────────────────────────────────────────────────────
     def generate_json(self, filename="network_topology.json"):
         devices_list = list(self.devices.values())
-        with open(filename, "w", encoding="utf-8") as f:
+        with open(filename,  "w" , encoding='utf-8') as f:
             json.dump(devices_list, f, indent=2)
         self.log(f"\n Topology saved to {filename}")
 
@@ -1107,7 +1169,7 @@ class NetworkDiscovery:
 
     def write_metadata(self, filename="discovery_metadata.txt"):
         duration = (datetime.now() - self.start_time).total_seconds()
-        with open(filename, "w", , encoding="utf-8") as f:
+        with open(filename,  "w" ,  encoding='utf-8' ) as f:
             f.write("="*60 + "\n")
             f.write("NETWORK TOPOLOGY DISCOVERY METADATA\n")
             f.write("="*60 + "\n\n")
