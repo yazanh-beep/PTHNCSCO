@@ -476,37 +476,98 @@ def parse_cdp_neighbors(output):
     return neighbors
 
 def parse_lldp_neighbors(output):
+    """
+    Parse LLDP neighbors - returns ONLY Cisco network devices (filters out cameras, phones, etc.)
+    """
     neighbors = []
-    blocks = re.split(r'[-]{40,}\s*\n', output)
+    
+    # Split on dashes separator (40 or more dashes)
+    blocks = re.split(r'[-]{40,}', output)
+    
     for block in blocks:
         if not block.strip():
             continue
+        
+        # Skip header/footer blocks
         if "Capability codes:" in block or "Total entries" in block or "Device ID" in block:
             continue
+        
+        # Must have Local Intf to be a valid neighbor entry
         if "Local Intf:" not in block:
             continue
-        neighbor = {"hostname": None, "mgmt_ip": None, "local_intf": None, "remote_intf": None, "sys_descr": "", "source": "LLDP"}
+        
+        neighbor = {
+            "hostname": None, 
+            "mgmt_ip": None, 
+            "local_intf": None, 
+            "remote_intf": None, 
+            "sys_descr": "", 
+            "source": "LLDP"
+        }
+        
+        # Extract local interface
         if m := re.search(r'^Local Intf:\s*(\S+)', block, re.M):
             neighbor["local_intf"] = m.group(1)
+        
+        # Extract remote port ID
         if m := re.search(r'^Port id:\s*(\S+)', block, re.M | re.I):
             neighbor["remote_intf"] = m.group(1)
+        
+        # Extract system name (hostname)
         if m := re.search(r'^System Name:\s*(.+?)$', block, re.M):
             hostname = m.group(1).strip().strip('"').strip("'")
             neighbor["hostname"] = hostname
+        
+        # Extract system description - CRITICAL for filtering
         if m := re.search(r'^System Description:\s*\n([\s\S]+?)(?=^Time remaining:|^System Capabilities:|^Management Addresses:|$)', block, re.M):
             neighbor["sys_descr"] = m.group(1).strip()
+        
+        # FILTER: Skip non-Cisco devices (Axis cameras, IP phones, etc.)
+        if neighbor["sys_descr"]:
+            sys_desc_lower = neighbor["sys_descr"].lower()
+            # Only accept Cisco devices
+            if "cisco ios" not in sys_desc_lower and "cisco nx-os" not in sys_desc_lower:
+                logger.debug(f"  ⊗ Skipping non-Cisco LLDP device: {neighbor.get('hostname', 'Unknown')} "
+                           f"(Desc: {neighbor['sys_descr'][:50]}...)")
+                continue
+        else:
+            # No system description - cannot verify it's Cisco, skip it
+            logger.debug(f"  ⊗ Skipping LLDP device without System Description: {neighbor.get('hostname', 'Unknown')}")
+            continue
+        
+        # If no hostname found in System Name, try extracting from System Description
         if not neighbor["hostname"] and neighbor["sys_descr"]:
             m = re.search(r'(\S+)\s+Software', neighbor["sys_descr"], re.I)
             if m:
                 neighbor["hostname"] = m.group(1)
+        
+        # Extract management IP address - try multiple patterns
+        # Pattern 1: Standard format
         if m := re.search(r'^Management Addresses:\s*\n\s*IP:\s*(\d+\.\d+\.\d+\.\d+)', block, re.M):
             neighbor["mgmt_ip"] = m.group(1)
+        
+        # Pattern 2: Single-line format
+        if not neighbor["mgmt_ip"]:
+            if m := re.search(r'Management Address.*?:\s*(\d+\.\d+\.\d+\.\d+)', block, re.I):
+                neighbor["mgmt_ip"] = m.group(1)
+        
+        # Pattern 3: IPv4 explicit
+        if not neighbor["mgmt_ip"]:
+            if m := re.search(r'IPv4:\s*(\d+\.\d+\.\d+\.\d+)', block, re.I):
+                neighbor["mgmt_ip"] = m.group(1)
+        
+        # Only add if we have minimum required fields
         if neighbor["mgmt_ip"]:
             if not neighbor["hostname"]:
                 neighbor["hostname"] = f"LLDP-Device-{neighbor['mgmt_ip']}"
                 logger.warning(f"No hostname in LLDP for {neighbor['mgmt_ip']}")
-            if neighbor["sys_descr"] and "cisco" in neighbor["sys_descr"].lower():
-                neighbors.append(neighbor)
+            
+            neighbors.append(neighbor)
+            logger.debug(f"  ✓ Cisco LLDP neighbor: {neighbor['hostname']} ({neighbor['mgmt_ip']}) "
+                        f"via {neighbor['local_intf']} ↔ {neighbor['remote_intf']}")
+        else:
+            logger.debug(f"  ⊗ Skipping LLDP neighbor without mgmt IP: {neighbor.get('hostname', 'Unknown')}")
+    
     return neighbors
 
 def get_interface_status(shell):
