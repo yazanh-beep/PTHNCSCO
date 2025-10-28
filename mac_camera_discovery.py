@@ -20,6 +20,12 @@ CREDENTIAL_SETS = [
 AGG_MAX_RETRIES = 3
 AGG_RETRY_DELAY = 5
 CDP_LLDP_TIMEOUT = 35
+
+# --- RETRY CONFIGURATION (NEW) ---
+SSH_HOP_RETRY_ATTEMPTS = 5  # Number of retry attempts for SSH hops
+SSH_HOP_RETRY_BASE_DELAY = 2  # Base delay between retries (seconds)
+SSH_HOP_USE_EXPONENTIAL_BACKOFF = True  # Use exponential backoff (2s, 4s, 8s, 16s...)
+SSH_HOP_VERIFY_ROUTE = True  # Test ping before SSH attempt
 # -----------------------------------------------------------------------------
 
 PROMPT_RE = re.compile(r"(?m)^[^\r\n#>\s][^\r\n#>]*[>#]\s?$")
@@ -28,6 +34,7 @@ visited_switches = set()
 discovered_aggregates = set()
 aggregate_hostnames = {}
 camera_data = []
+failed_switches = []  # Track switches that failed for retry from seed
 
 discovery_stats = {
     "switches_attempted": 0,
@@ -38,6 +45,8 @@ discovery_stats = {
     "switches_failed_other": 0,
     "aggregates_reconnections": 0,
     "total_cameras_found": 0,
+    "switches_retried_from_seed": 0,
+    "switches_recovered_on_retry": 0,
     "switches_by_type": {
         "EDGE": {"attempted": 0, "successful": 0, "failed": 0},
         "SERVER": {"attempted": 0, "successful": 0, "failed": 0},
@@ -335,91 +344,317 @@ def reconnect_to_aggregate(reason=""):
             time.sleep(AGG_RETRY_DELAY)
     raise NetworkConnectionError(f"Failed to reconnect: {last_err}", reconnect_needed=True)
 
-def ssh_to_device(target_ip, attempt=1):
-    global agg_shell, session_depth, device_creds
-    if not agg_shell or agg_shell.closed:
-        raise NetworkConnectionError("SSH shell closed", reconnect_needed=True)
+# ============================================================================
+# NEW RETRY LOGIC FUNCTIONS
+# ============================================================================
+
+def verify_ip_reachable_quick(target_ip, shell, timeout=3):
+    """
+    Quick ping test to verify IP is reachable.
+    Returns True if reachable, False otherwise.
+    """
+    try:
+        logger.debug(f"[PING] Testing {target_ip}...")
+        ping_out = send_cmd(shell, f"ping {target_ip} timeout 1 repeat 2", timeout=timeout, silent=True)
+        
+        # Check for any successful replies
+        if re.search(r"Success rate is [1-9]|!+|\d+ packets received", ping_out):
+            logger.debug(f"[PING] {target_ip} is reachable")
+            return True
+        
+        logger.debug(f"[PING] {target_ip} not reachable")
+        return False
+        
+    except Exception as e:
+        logger.debug(f"[PING] Error testing reachability: {e}")
+        return True  # Assume reachable if test fails
+
+
+def cleanup_and_return_to_parent(expected_parent_hostname, max_attempts=3):
+    """
+    Ensure we're back at the parent switch.
+    Handles cases where session depth is confused.
+    
+    Returns:
+        True if successfully at parent, False otherwise
+    """
+    global agg_shell, session_depth
+    
+    for attempt in range(1, max_attempts + 1):
+        try:
+            current_hostname = get_hostname(agg_shell)
+            
+            if current_hostname == expected_parent_hostname:
+                logger.debug(f"[CLEANUP] Already at parent: {expected_parent_hostname}")
+                return True
+            
+            logger.warning(f"[CLEANUP] At {current_hostname}, need to return to {expected_parent_hostname}")
+            logger.info(f"[CLEANUP] Sending exit command (attempt {attempt}/{max_attempts})")
+            
+            # Try to exit
+            agg_shell.send("exit\n")
+            time.sleep(1)
+            output = _drain(agg_shell)
+            
+            # Check if connection closed (we exited too far)
+            if agg_shell.closed or "closed by" in output.lower():
+                logger.error(f"[CLEANUP] Connection closed - exited too far!")
+                return False
+            
+            # Verify hostname
+            time.sleep(0.5)
+            new_hostname = get_hostname(agg_shell)
+            
+            if new_hostname == expected_parent_hostname:
+                logger.info(f"[CLEANUP] Successfully returned to {expected_parent_hostname}")
+                session_depth = max(0, session_depth - 1)
+                return True
+            
+        except Exception as e:
+            logger.error(f"[CLEANUP] Exception: {e}")
+    
+    logger.error(f"[CLEANUP] Failed to return to parent after {max_attempts} attempts")
+    return False
+
+
+def attempt_ssh_hop(target_ip, parent_hostname, expected_hostname=None, attempt_number=1):
+    """
+    Single SSH hop attempt with detailed result reporting.
+    
+    Returns:
+        dict with keys:
+            - success (bool): True if hop succeeded
+            - reason (str): Failure reason if unsuccessful
+            - hostname (str): Hostname reached (if any)
+            - fatal (bool): True if error is unrecoverable
+    """
+    global agg_shell, session_depth, device_creds, hostname_to_ip
+    
+    # Try each credential set
+    for cred_idx, cred_set in enumerate(CREDENTIAL_SETS, 1):
+        username = cred_set["username"]
+        password = cred_set["password"]
+        enable_pw = cred_set.get("enable", "")
+        
+        logger.debug(f"[HOP] Trying credentials {cred_idx}/{len(CREDENTIAL_SETS)}")
+        
+        try:
+            # Send SSH command
+            agg_shell.send(f"ssh -l {username} {target_ip}\n")
+            time.sleep(2)
+            
+            output = ""
+            timeout_time = time.time() + 45  # Increased timeout
+            password_sent = False
+            
+            while time.time() < timeout_time:
+                if not agg_shell or agg_shell.closed:
+                    return {
+                        "success": False,
+                        "reason": "shell_closed",
+                        "fatal": True
+                    }
+                
+                if agg_shell.recv_ready():
+                    chunk = agg_shell.recv(MAX_READ).decode("utf-8", "ignore")
+                    output += chunk
+                    
+                    # Handle password prompt
+                    if re.search(r"[Pp]assword:", output) and not password_sent:
+                        logger.debug(f"[HOP] Sending password")
+                        agg_shell.send(password + "\n")
+                        password_sent = True
+                        time.sleep(1)
+                        output = ""
+                        continue
+                    
+                    # Handle SSH key confirmation
+                    if re.search(r"\(yes/no\)", output):
+                        logger.debug(f"[HOP] Accepting SSH key")
+                        agg_shell.send("yes\n")
+                        time.sleep(0.5)
+                        continue
+                    
+                    # Handle connection errors
+                    if re.search(r"Connection refused|Connection timed out|No route to host", output, re.IGNORECASE):
+                        logger.debug(f"[HOP] Connection error in output")
+                        cleanup_failed_session()
+                        return {
+                            "success": False,
+                            "reason": "connection_refused"
+                        }
+                    
+                    # Check for authentication failure
+                    if re.search(r"Authentication failed|Permission denied|Access denied|Login invalid", output, re.IGNORECASE):
+                        logger.debug(f"[HOP] Authentication failed")
+                        cleanup_failed_session()
+                        break  # Try next credential set
+                    
+                    # Check for prompt (potential success)
+                    if PROMPT_RE.search(output):
+                        logger.debug(f"[HOP] Prompt detected")
+                        time.sleep(0.5)  # Let buffer settle
+                        
+                        # CRITICAL: Verify hostname changed
+                        reached_hostname = get_hostname(agg_shell)
+                        logger.debug(f"[HOP] Parent: {parent_hostname}, Reached: {reached_hostname}")
+                        
+                        if reached_hostname == parent_hostname:
+                            # FAILURE: We're still on the same switch!
+                            logger.error(f"[HOP] HOSTNAME UNCHANGED - still on {parent_hostname}")
+                            cleanup_failed_session()
+                            return {
+                                "success": False,
+                                "reason": "hostname_unchanged",
+                                "hostname": reached_hostname
+                            }
+                        
+                        # Verify expected hostname if provided
+                        if expected_hostname and reached_hostname != expected_hostname:
+                            logger.warning(f"[HOP] Hostname mismatch: expected '{expected_hostname}', got '{reached_hostname}'")
+                        
+                        # SUCCESS!
+                        logger.info(f"[HOP] Successfully reached {reached_hostname} at {target_ip}")
+                        
+                        # Enter enable mode
+                        enable_candidates = [enable_pw, password, ""]
+                        if not _ensure_enable(agg_shell, enable_candidates, timeout=10):
+                            logger.warning(f"[HOP] Could not enter enable mode")
+                        
+                        # Set terminal length
+                        send_cmd(agg_shell, "terminal length 0", timeout=5, silent=True)
+                        
+                        # Update tracking
+                        session_depth += 1
+                        device_creds[target_ip] = cred_set
+                        hostname_to_ip[reached_hostname] = target_ip
+                        
+                        return {
+                            "success": True,
+                            "hostname": reached_hostname
+                        }
+                
+                time.sleep(0.1)
+            
+            # Timeout reached for this credential
+            logger.debug(f"[HOP] Timeout with credential {cred_idx}")
+            cleanup_failed_session()
+            
+        except Exception as e:
+            logger.error(f"[HOP] Exception during SSH: {e}")
+            cleanup_failed_session()
+            return {
+                "success": False,
+                "reason": f"exception: {str(e)}",
+                "fatal": False
+            }
+    
+    # All credentials failed
+    return {
+        "success": False,
+        "reason": "auth_failed_all_credentials"
+    }
+
+
+def ssh_to_device(target_ip, expected_hostname=None, parent_hostname=None):
+    """
+    SSH from current switch to target IP with retry logic and hostname verification.
+    
+    Args:
+        target_ip: IP address to connect to
+        expected_hostname: Expected hostname of target device (optional)
+        parent_hostname: Hostname of current device (for verification)
+    
+    Returns:
+        True on success, False on failure after all retries
+    """
+    global agg_shell, session_depth, device_creds, hostname_to_ip
+    
+    # Get current hostname if not provided
+    if parent_hostname is None:
+        try:
+            parent_hostname = get_hostname(agg_shell) or agg_hostname or "UNKNOWN"
+        except Exception:
+            parent_hostname = agg_hostname or "UNKNOWN"
+    
+    logger.debug(f"[RETRY] Attempting SSH to {target_ip} from {parent_hostname}")
     
     # Check if we're already on the target switch
     try:
-        current_host = get_hostname(agg_shell) or agg_hostname or "UNKNOWN"
+        ip_brief_out = send_cmd(agg_shell, "show ip interface brief", timeout=10, silent=True)
+        for line in ip_brief_out.splitlines():
+            if target_ip in line and ("up" in line.lower() or "administratively" in line.lower()):
+                logger.info(f"Target IP {target_ip} belongs to current switch {parent_hostname} - already connected")
+                logger.info(f"This is not a separate device to SSH to - it's an interface on current switch")
+                return None  # Return None to indicate "already here, skip this"
+    except Exception as e:
+        logger.debug(f"Could not check local IPs: {e}")
+    
+    for attempt in range(1, SSH_HOP_RETRY_ATTEMPTS + 1):
+        # Calculate delay for this attempt (exponential backoff)
+        if attempt > 1:
+            if SSH_HOP_USE_EXPONENTIAL_BACKOFF:
+                delay = SSH_HOP_RETRY_BASE_DELAY * (2 ** (attempt - 2))
+            else:
+                delay = SSH_HOP_RETRY_BASE_DELAY
+            
+            logger.info(f"[RETRY] Waiting {delay}s before attempt {attempt}/{SSH_HOP_RETRY_ATTEMPTS}...")
+            time.sleep(delay)
         
-        # Check if target IP belongs to current switch by checking interface IPs
-        try:
-            ip_brief_out = send_cmd(agg_shell, "show ip interface brief", timeout=10, silent=True)
-            for line in ip_brief_out.splitlines():
-                if target_ip in line and ("up" in line.lower() or "administratively" in line.lower()):
-                    logger.info(f"Target IP {target_ip} belongs to current switch {current_host} - already connected")
-                    return True
-        except Exception as e:
-            logger.debug(f"Could not check local IPs: {e}")
-    except Exception:
-        current_host = agg_hostname or "UNKNOWN"
-    
-    logger.info(f"SSH hop to {target_ip} (attempt {attempt}/{SSH_RETRY_ATTEMPTS})")
-    
-    try:
-        pre_host = get_hostname(agg_shell) or agg_hostname or "UNKNOWN"
-    except Exception:
-        pre_host = agg_hostname or "UNKNOWN"
-    
-    cred_order = []
-    if target_ip in device_creds:
-        cred_order.append(device_creds[target_ip])
-    if agg_creds and agg_creds not in cred_order:
-        cred_order.append(agg_creds)
-    for cs in CREDENTIAL_SETS:
-        if cs not in cred_order:
-            cred_order.append(cs)
-    
-    for cred in cred_order:
-        user = cred["username"]
-        pwd = cred["password"]
-        enable = cred.get("enable") or cred["password"]
-        syntaxes = [
-            f"ssh -l {user} {target_ip}",
-            f"ssh {user}@{target_ip}",
-            f"ssh {target_ip}",
-        ]
-        for cmd in syntaxes:
-            _ = send_cmd(agg_shell, cmd, timeout=3, silent=True)
-            ok, out = _interactive_hop(agg_shell, target_ip, user, pwd, overall_timeout=90)
-            if not ok:
-                logger.warning(f"SSH failed to {target_ip} with {user}")
-                cleanup_failed_session()
-                if not verify_aggregate_connection():
-                    raise NetworkConnectionError("Connection lost", reconnect_needed=True)
-                continue
-            if out.strip().endswith(">"):
-                if not _ensure_enable(agg_shell, [enable, pwd], timeout=10):
-                    logger.warning(f"Enable failed on {target_ip}")
-                    cleanup_failed_session()
-                    if not verify_aggregate_connection():
-                        raise NetworkConnectionError("Connection lost", reconnect_needed=True)
-                    continue
-            post_host = get_hostname(agg_shell) or ""
-            if post_host.strip() == pre_host.strip():
-                logger.warning(f"Hop to {target_ip} did not change hostname")
-                cleanup_failed_session()
-                if not verify_aggregate_connection():
-                    raise NetworkConnectionError("Connection lost", reconnect_needed=True)
-                continue
-            session_depth += 1
-            send_cmd(agg_shell, "terminal length 0", timeout=5, silent=True)
-            logger.info(f"Successfully connected to {target_ip} as {user} (host: {post_host})")
-            device_creds[target_ip] = cred
-            return True
-    if attempt < SSH_RETRY_ATTEMPTS:
-        logger.info(f"[RETRY] Waiting {SSH_RETRY_DELAY}s...")
-        delay_remaining = SSH_RETRY_DELAY
-        while delay_remaining > 0:
-            time.sleep(min(10, delay_remaining))
-            delay_remaining -= 10
+        logger.info(f"[RETRY] SSH hop attempt {attempt}/{SSH_HOP_RETRY_ATTEMPTS} to {target_ip}")
+        
+        # Optional: Verify routing/reachability before attempting SSH
+        if SSH_HOP_VERIFY_ROUTE and attempt == 1:
+            if not verify_ip_reachable_quick(target_ip, agg_shell):
+                logger.warning(f"[RETRY] {target_ip} not reachable via ping")
+        
+        # Ensure we're in a clean state before retry
+        if attempt > 1:
             if not verify_aggregate_connection():
-                raise NetworkConnectionError("Lost connection during retry", reconnect_needed=True)
-        return ssh_to_device(target_ip, attempt + 1)
-    discovery_stats["switches_failed_other"] += 1
-    raise NetworkConnectionError(f"SSH to {target_ip} failed after {SSH_RETRY_ATTEMPTS} attempts", reconnect_needed=False, retry_allowed=False)
+                logger.error(f"[RETRY] Lost connection to parent switch before attempt {attempt}")
+                raise NetworkConnectionError("Lost parent connection", reconnect_needed=True)
+            
+            # Make sure we're back at parent hostname
+            current_host = get_hostname(agg_shell)
+            if current_host != parent_hostname:
+                logger.warning(f"[RETRY] Not at parent hostname ({current_host} != {parent_hostname})")
+                logger.warning(f"[RETRY] Attempting to return to parent...")
+                if not cleanup_and_return_to_parent(parent_hostname):
+                    logger.error(f"[RETRY] Could not return to parent switch")
+                    raise NetworkConnectionError("Cannot return to parent", reconnect_needed=True)
+        
+        # Attempt the SSH hop
+        result = attempt_ssh_hop(
+            target_ip=target_ip,
+            parent_hostname=parent_hostname,
+            expected_hostname=expected_hostname,
+            attempt_number=attempt
+        )
+        
+        if result["success"]:
+            logger.info(f"[RETRY] SUCCESS on attempt {attempt}/{SSH_HOP_RETRY_ATTEMPTS}")
+            return True
+        
+        # Log why this attempt failed
+        failure_reason = result.get("reason", "Unknown")
+        logger.warning(f"[RETRY] Attempt {attempt} failed: {failure_reason}")
+        
+        # Determine if we should retry based on failure type
+        if result.get("fatal", False):
+            logger.error(f"[RETRY] Fatal error - no retry possible")
+            return False
+        
+        # Special handling for specific failure types
+        if "hostname_unchanged" in failure_reason:
+            logger.warning(f"[RETRY] Hostname didn't change - target may be unreachable or misconfigured")
+    
+    # All retries exhausted
+    logger.error(f"[RETRY] Failed to connect to {target_ip} after {SSH_HOP_RETRY_ATTEMPTS} attempts")
+    return False
+
+# ============================================================================
+# END NEW RETRY LOGIC FUNCTIONS
+# ============================================================================
 
 def exit_device():
     global agg_shell, session_depth
@@ -774,82 +1009,200 @@ def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
     logger.info(f"  - Cameras found: {camera_count}")
     logger.info("="*80)
 
-def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN"):
+def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=False):
+    """
+    Process a switch with enhanced retry logic, hostname verification, and failure tracking.
+    
+    Args:
+        parent_ip: IP of the parent aggregate
+        neighbor_info: Dict with switch details
+        switch_type: Type of switch (EDGE, SERVER, etc.)
+        is_retry: True if this is a retry attempt from seed
+        
+    Returns:
+        True on success, False on failure
+    """
+    global failed_switches
+    
     switch_ip = neighbor_info["mgmt_ip"]
     switch_name = neighbor_info["remote_name"]
     local_intf = neighbor_info["local_intf"]
-    if not switch_ip or switch_ip in visited_switches:
-        return
+    
+    # CRITICAL: Skip aggregate switches - they never have cameras directly connected
+    if switch_type == "AGGREGATE":
+        logger.debug(f"Skipping {switch_name} - aggregate switches don't have cameras")
+        return True
+    
+    if not switch_ip or (switch_ip in visited_switches and not is_retry):
+        return True  # Skip already processed
+    
     logger.info("")
     logger.info("*"*80)
-    logger.info(f"Processing {switch_type} SWITCH: {switch_name} ({switch_ip})")
+    if is_retry:
+        logger.info(f"RETRYING {switch_type} SWITCH: {switch_name} ({switch_ip}) FROM SEED")
+    else:
+        logger.info(f"Processing {switch_type} SWITCH: {switch_name} ({switch_ip})")
     logger.info("*"*80)
-    visited_switches.add(switch_ip)
-    discovery_stats["switches_attempted"] += 1
-    discovery_stats["switches_by_type"][switch_type]["attempted"] += 1
-    max_retries = SSH_RETRY_ATTEMPTS
-    for attempt in range(max_retries):
-        try:
-            if not verify_aggregate_connection():
-                raise NetworkConnectionError("Parent connection lost", reconnect_needed=True)
-            ssh_success = ssh_to_device(switch_ip, attempt=1)
-            if not ssh_success:
-                logger.error(f"Cannot SSH to {switch_name} - SKIPPING")
-                discovery_stats["switches_by_type"][switch_type]["failed"] += 1
-                discovery_stats["failure_details"].append({
-                    "switch_name": switch_name,
-                    "switch_ip": switch_ip,
-                    "switch_type": switch_type,
-                    "reason": "SSH connection failed"
-                })
-                return
-            try:
-                discover_cameras_from_switch(agg_shell, switch_name, switch_type)
-                discovery_stats["switches_successfully_scanned"] += 1
-                discovery_stats["switches_by_type"][switch_type]["successful"] += 1
-            except NetworkConnectionError as e:
-                if getattr(e, 'reconnect_needed', False):
-                    logger.error(f"Lost parent connection: {e}")
-                    raise
-                else:
-                    logger.error(f"Error during camera discovery: {e}")
-            except Exception as e:
-                logger.error(f"Error during camera discovery: {e}", exc_info=True)
+    
+    if not is_retry:
+        visited_switches.add(switch_ip)
+        discovery_stats["switches_attempted"] += 1
+        discovery_stats["switches_by_type"][switch_type]["attempted"] += 1
+    else:
+        # Don't increment attempted for retries - already counted in Phase 2
+        discovery_stats["switches_retried_from_seed"] += 1
+    
+    # Get parent hostname for verification
+    try:
+        parent_hostname = get_hostname(agg_shell)
+    except Exception:
+        parent_hostname = agg_hostname or "UNKNOWN"
+    
+    try:
+        if not verify_aggregate_connection():
+            raise NetworkConnectionError("Parent connection lost", reconnect_needed=True)
+        
+        # Use new ssh_to_device with retry logic and hostname verification
+        ssh_success = ssh_to_device(
+            target_ip=switch_ip,
+            expected_hostname=switch_name,
+            parent_hostname=parent_hostname
+        )
+        
+        # Handle case where target IP belongs to current switch
+        if ssh_success is None:
+            logger.info(f"Skipping {switch_name} ({switch_ip}) - IP belongs to current switch, not a separate device")
+            # Don't count as failure, just skip it
+            return True
+        
+        if not ssh_success:
+            logger.error(f"Cannot SSH to {switch_name} after {SSH_HOP_RETRY_ATTEMPTS} attempts - SKIPPING")
             
-            try:
-                logger.debug(f"[EXIT] Exiting from {switch_type} switch")
-                exit_success = exit_device()
-                if not exit_success:
-                    logger.warning(f"[EXIT] Exit may have failed")
-                time.sleep(1)
-                logger.info("Returned to parent switch")
-                if not verify_aggregate_connection():
-                    raise NetworkConnectionError("Lost parent connection", reconnect_needed=True)
-            except Exception as e:
-                logger.error(f"Error exiting: {e}")
-                if not verify_aggregate_connection():
-                    raise NetworkConnectionError("Lost parent connection", reconnect_needed=True)
-            return
-        except NetworkConnectionError as e:
-            reconnect_needed = getattr(e, 'reconnect_needed', False)
-            if reconnect_needed:
-                logger.error(f"Parent connection lost")
-                raise
-            retry_allowed = getattr(e, 'retry_allowed', False)
-            is_last_attempt = (attempt >= max_retries - 1)
-            if retry_allowed and not is_last_attempt:
-                logger.info(f"[RETRY] Will retry (attempt {attempt + 2}/{max_retries})")
-                continue
-            else:
-                logger.error(f"Cannot connect after {attempt + 1} attempts - SKIPPING")
-                discovery_stats["switches_by_type"][switch_type]["failed"] += 1
-                discovery_stats["failure_details"].append({
+            failure_info = {
+                "switch_name": switch_name,
+                "switch_ip": switch_ip,
+                "switch_type": switch_type,
+                "parent_ip": parent_ip,
+                "parent_hostname": parent_hostname,
+                "reason": f"SSH connection failed after {SSH_HOP_RETRY_ATTEMPTS} retry attempts",
+                "local_intf": local_intf,
+                "is_retry": is_retry
+            }
+            
+            if not is_retry:
+                # Only add to failed list if this wasn't already a retry
+                failed_switches.append(failure_info)
+                logger.warning(f"Added {switch_name} to retry queue for Phase 3")
+            
+            discovery_stats["switches_by_type"][switch_type]["failed"] += 1
+            discovery_stats["switches_failed_unreachable"] += 1
+            discovery_stats["failure_details"].append(failure_info)
+            return False  # Indicate failure
+        
+        # Verify we actually changed switches
+        actual_hostname = get_hostname(agg_shell)
+        if actual_hostname == parent_hostname:
+            logger.error(f"FATAL: Still on parent {parent_hostname} after supposedly successful hop!")
+            discovery_stats["switches_by_type"][switch_type]["failed"] += 1
+            discovery_stats["switches_failed_other"] += 1
+            
+            if not is_retry:
+                failed_switches.append({
                     "switch_name": switch_name,
                     "switch_ip": switch_ip,
                     "switch_type": switch_type,
-                    "reason": str(e)
+                    "parent_ip": parent_ip,
+                    "parent_hostname": parent_hostname,
+                    "reason": "Hostname verification failed - still on parent switch",
+                    "local_intf": local_intf,
+                    "is_retry": is_retry
                 })
-                return
+            return False
+        
+        try:
+            discover_cameras_from_switch(agg_shell, actual_hostname, switch_type)
+            discovery_stats["switches_successfully_scanned"] += 1
+            discovery_stats["switches_by_type"][switch_type]["successful"] += 1
+            
+            if is_retry:
+                discovery_stats["switches_recovered_on_retry"] += 1
+                logger.info(f"[RECOVERED] RETRY SUCCESS: {switch_name} recovered on retry from seed")
+            
+        except NetworkConnectionError as e:
+            if getattr(e, 'reconnect_needed', False):
+                logger.error(f"Lost parent connection: {e}")
+                raise
+            else:
+                logger.error(f"Error during camera discovery: {e}")
+        except Exception as e:
+            logger.error(f"Error during camera discovery: {e}", exc_info=True)
+        
+        try:
+            logger.debug(f"[EXIT] Exiting from {switch_type} switch")
+            exit_success = exit_device()
+            if not exit_success:
+                logger.warning(f"[EXIT] Exit may have failed")
+            time.sleep(1)
+            
+            # Verify we returned to parent
+            final_hostname = get_hostname(agg_shell)
+            if final_hostname != parent_hostname:
+                logger.error(f"After exit: at {final_hostname}, expected {parent_hostname}")
+                raise NetworkConnectionError("Lost parent connection", reconnect_needed=True)
+            
+            logger.info("Returned to parent switch")
+            
+            if not verify_aggregate_connection():
+                raise NetworkConnectionError("Lost parent connection", reconnect_needed=True)
+                
+            return True  # Success!
+            
+        except Exception as e:
+            logger.error(f"Error exiting: {e}")
+            if not verify_aggregate_connection():
+                raise NetworkConnectionError("Lost parent connection", reconnect_needed=True)
+    
+    except NetworkConnectionError as e:
+        reconnect_needed = getattr(e, 'reconnect_needed', False)
+        if reconnect_needed:
+            logger.error(f"Parent connection lost while processing {switch_name}")
+            # IMPORTANT: Still add to failed list even if parent connection lost
+            # This switch should be retried in Phase 3 from seed
+            if not is_retry:
+                failed_switches.append({
+                    "switch_name": switch_name,
+                    "switch_ip": switch_ip,
+                    "switch_type": switch_type,
+                    "parent_ip": parent_ip,
+                    "parent_hostname": parent_hostname,
+                    "reason": "Parent connection lost during SSH attempts",
+                    "local_intf": local_intf,
+                    "is_retry": is_retry
+                })
+                logger.warning(f"Added {switch_name} to retry queue for Phase 3 (connection lost)")
+            raise  # Propagate to trigger reconnection
+        logger.error(f"Cannot connect - SKIPPING: {e}")
+        discovery_stats["switches_by_type"][switch_type]["failed"] += 1
+        
+        if not is_retry:
+            failed_switches.append({
+                "switch_name": switch_name,
+                "switch_ip": switch_ip,
+                "switch_type": switch_type,
+                "parent_ip": parent_ip,
+                "parent_hostname": parent_hostname,
+                "reason": str(e),
+                "local_intf": local_intf,
+                "is_retry": is_retry
+            })
+        
+        discovery_stats["failure_details"].append({
+            "switch_name": switch_name,
+            "switch_ip": switch_ip,
+            "switch_type": switch_type,
+            "reason": str(e)
+        })
+        return False
 
 def discover_aggregate_neighbors(shell, current_agg_hostname):
     logger.info("Discovering neighboring aggregate switches...")
@@ -988,7 +1341,7 @@ def scan_aggregate_switch(shell, agg_ip, resume_mode=False):
                 "local_intf": link.get("local_intf")
             }
             try:
-                process_switch(agg_ip, neighbor_info, switch_type)
+                process_switch(agg_ip, neighbor_info, switch_type, is_retry=False)
             except NetworkConnectionError as e:
                 if getattr(e, 'reconnect_needed', False):
                     logger.error(f"Lost aggregate connection")
@@ -1000,6 +1353,131 @@ def scan_aggregate_switch(shell, agg_ip, resume_mode=False):
     logger.info(f"Summary for {hostname}:")
     logger.info(f"  - Edge: {switch_counts['EDGE']}, Server: {switch_counts['SERVER']}, Other: {switch_counts['OTHER']}")
     return new_aggregates
+
+def retry_failed_switches_from_seed():
+    """
+    PHASE 3: Retry all failed switches from the seed switch.
+    
+    Since this is Layer 2, all edge switches should be reachable from the seed
+    via CDP/LLDP regardless of which aggregate they're connected to.
+    """
+    global failed_switches, agg_shell
+    
+    if not failed_switches:
+        logger.info("="*80)
+        logger.info("PHASE 3: No failed switches to retry")
+        logger.info("="*80)
+        return
+    
+    logger.info("="*80)
+    logger.info(f"PHASE 3: RETRYING {len(failed_switches)} FAILED SWITCHES FROM SEED")
+    logger.info("="*80)
+    logger.info("Since this is Layer 2, all edge switches should be reachable from seed")
+    
+    # Ensure we're connected to seed
+    try:
+        if not verify_aggregate_connection():
+            logger.info("Reconnecting to seed for retry phase...")
+            reconnect_to_aggregate("Phase 3 Retry")
+    except Exception as e:
+        logger.error(f"Cannot reconnect to seed for retries: {e}")
+        return
+    
+    # Verify we're on seed
+    current_hostname = get_hostname(agg_shell)
+    seed_hostname = agg_hostname or "UNKNOWN"
+    
+    if current_hostname != seed_hostname:
+        logger.warning(f"Not on seed switch (on {current_hostname}, expected {seed_hostname})")
+        logger.warning(f"Attempting to return to seed...")
+        try:
+            # Try to exit back to seed
+            for _ in range(5):  # Max 5 exits
+                exit_device()
+                time.sleep(0.5)
+                current_hostname = get_hostname(agg_shell)
+                if current_hostname == seed_hostname:
+                    logger.info(f"Successfully returned to seed: {seed_hostname}")
+                    break
+            else:
+                logger.error("Could not return to seed - reconnecting...")
+                reconnect_to_aggregate("Return to seed for retry")
+                current_hostname = get_hostname(agg_shell)
+                if current_hostname != seed_hostname:
+                    logger.error(f"Still not on seed after reconnect: {current_hostname}")
+                    return
+        except Exception as e:
+            logger.error(f"Error returning to seed: {e}")
+            return
+    
+    logger.info(f"Ready to retry from seed switch: {seed_hostname}")
+    
+    # Create a copy of failed switches to retry
+    switches_to_retry = failed_switches.copy()
+    retry_successes = 0
+    retry_failures = 0
+    
+    for idx, switch_info in enumerate(switches_to_retry, 1):
+        switch_name = switch_info["switch_name"]
+        switch_ip = switch_info["switch_ip"]
+        switch_type = switch_info["switch_type"]
+        original_parent = switch_info.get("parent_hostname", "Unknown")
+        
+        logger.info("")
+        logger.info(f"[RETRY {idx}/{len(switches_to_retry)}] {switch_name} ({switch_ip})")
+        logger.info(f"  Originally failed from: {original_parent}")
+        logger.info(f"  Retrying from: {seed_hostname} (seed)")
+        
+        # Create neighbor_info for retry
+        neighbor_info = {
+            "remote_name": switch_name,
+            "mgmt_ip": switch_ip,
+            "local_intf": switch_info.get("local_intf", "Unknown")
+        }
+        
+        try:
+            # Retry the switch from seed
+            success = process_switch(
+                parent_ip=SEED_SWITCH_IP,
+                neighbor_info=neighbor_info,
+                switch_type=switch_type,
+                is_retry=True
+            )
+            
+            if success:
+                retry_successes += 1
+                logger.info(f"[SUCCESS] Retry {idx}/{len(switches_to_retry)}: RECOVERED")
+            else:
+                retry_failures += 1
+                logger.warning(f"[FAILED] Retry {idx}/{len(switches_to_retry)}: STILL FAILED")
+            
+        except NetworkConnectionError as e:
+            logger.error(f"Network error during retry: {e}")
+            retry_failures += 1
+            
+            # Try to reconnect to seed if connection lost
+            if getattr(e, 'reconnect_needed', False):
+                logger.warning("Lost seed connection during retry - reconnecting...")
+                try:
+                    reconnect_to_aggregate("Phase 3 recovery")
+                    logger.info("Reconnected to seed")
+                except Exception as reconnect_err:
+                    logger.error(f"Could not reconnect: {reconnect_err}")
+                    logger.error("Aborting retry phase")
+                    break
+        
+        except Exception as e:
+            logger.error(f"Error retrying {switch_name}: {e}", exc_info=True)
+            retry_failures += 1
+    
+    logger.info("")
+    logger.info("="*80)
+    logger.info("PHASE 3 COMPLETE - RETRY FROM SEED")
+    logger.info("="*80)
+    logger.info(f"Switches retried: {len(switches_to_retry)}")
+    logger.info(f"Recovered: {retry_successes}")
+    logger.info(f"Still failed: {retry_failures}")
+    logger.info("="*80)
 
 def main():
     logger.info("="*80)
@@ -1093,10 +1571,20 @@ def main():
                     if not verify_aggregate_connection():
                         raise NetworkConnectionError("Seed lost", reconnect_needed=True)
                     logger.info("Hopping to aggregate...")
-                    hop_success = ssh_to_device(agg_ip)
+                    
+                    # Get parent hostname before hop
+                    parent_hostname = get_hostname(agg_shell)
+                    
+                    hop_success = ssh_to_device(
+                        target_ip=agg_ip,
+                        expected_hostname=None,
+                        parent_hostname=parent_hostname
+                    )
+                    
                     if not hop_success:
-                        logger.error(f"Failed to connect to {agg_ip}")
+                        logger.error(f"Failed to connect to {agg_ip} after {SSH_HOP_RETRY_ATTEMPTS} attempts")
                         break
+                    
                     new_aggregates = scan_aggregate_switch(agg_shell, agg_ip)
                     for agg in new_aggregates:
                         # Skip if this IP belongs to the seed switch
@@ -1136,6 +1624,14 @@ def main():
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
     finally:
+        # ====================================================================
+        # PHASE 3: RETRY FAILED SWITCHES FROM SEED
+        # ====================================================================
+        try:
+            retry_failed_switches_from_seed()
+        except Exception as e:
+            logger.error(f"Error in Phase 3 (retry from seed): {e}", exc_info=True)
+        
         try:
             if agg_client:
                 agg_client.close()
@@ -1155,8 +1651,15 @@ def main():
     logger.info("="*80)
     logger.info(f"Switches attempted: {discovery_stats['switches_attempted']}")
     logger.info(f"Successfully scanned: {discovery_stats['switches_successfully_scanned']}")
-    logger.info(f"Failed: {discovery_stats['switches_attempted'] - discovery_stats['switches_successfully_scanned']}")
+    
+    initial_failures = discovery_stats['switches_attempted'] - (discovery_stats['switches_successfully_scanned'] - discovery_stats['switches_recovered_on_retry'])
+    final_failures = discovery_stats['switches_attempted'] - discovery_stats['switches_successfully_scanned']
+    
+    logger.info(f"Initial failures (Phase 1-2): {initial_failures}")
+    logger.info(f"Recovered in Phase 3: {discovery_stats['switches_recovered_on_retry']}")
+    logger.info(f"Final failures: {final_failures}")
     logger.info(f"Aggregate reconnections: {discovery_stats['aggregates_reconnections']}")
+    logger.info(f"Switches retried from seed: {discovery_stats['switches_retried_from_seed']}")
     logger.info(f"Total cameras: {discovery_stats['total_cameras_found']}")
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     json_file = f"camera_inventory_{len(camera_data)}cameras_{timestamp}.json"
