@@ -418,13 +418,6 @@ def cleanup_and_return_to_parent(expected_parent_hostname, max_attempts=3):
 def attempt_ssh_hop(target_ip, parent_hostname, expected_hostname=None, attempt_number=1):
     """
     Single SSH hop attempt with detailed result reporting.
-    
-    Returns:
-        dict with keys:
-            - success (bool): True if hop succeeded
-            - reason (str): Failure reason if unsuccessful
-            - hostname (str): Hostname reached (if any)
-            - fatal (bool): True if error is unrecoverable
     """
     global agg_shell, session_depth, device_creds, hostname_to_ip
     
@@ -442,7 +435,7 @@ def attempt_ssh_hop(target_ip, parent_hostname, expected_hostname=None, attempt_
             time.sleep(2)
             
             output = ""
-            timeout_time = time.time() + 45  # Increased timeout
+            timeout_time = time.time() + 45
             password_sent = False
             
             while time.time() < timeout_time:
@@ -484,14 +477,14 @@ def attempt_ssh_hop(target_ip, parent_hostname, expected_hostname=None, attempt_
                     
                     # Check for authentication failure
                     if re.search(r"Authentication failed|Permission denied|Access denied|Login invalid", output, re.IGNORECASE):
-                        logger.debug(f"[HOP] Authentication failed")
+                        logger.debug(f"[HOP] Authentication failed with credential {cred_idx}")
                         cleanup_failed_session()
-                        break  # Try next credential set
+                        continue  # ✅ CHANGED: Try next credential set
                     
                     # Check for prompt (potential success)
                     if PROMPT_RE.search(output):
                         logger.debug(f"[HOP] Prompt detected")
-                        time.sleep(0.5)  # Let buffer settle
+                        time.sleep(0.5)
                         
                         # CRITICAL: Verify hostname changed
                         reached_hostname = get_hostname(agg_shell)
@@ -499,20 +492,16 @@ def attempt_ssh_hop(target_ip, parent_hostname, expected_hostname=None, attempt_
                         
                         if reached_hostname == parent_hostname:
                             # FAILURE: We're still on the same switch!
-                            logger.error(f"[HOP] HOSTNAME UNCHANGED - still on {parent_hostname}")
+                            logger.warning(f"[HOP] HOSTNAME UNCHANGED with credential {cred_idx} - still on {parent_hostname}")
                             cleanup_failed_session()
-                            return {
-                                "success": False,
-                                "reason": "hostname_unchanged",
-                                "hostname": reached_hostname
-                            }
+                            continue  # ✅ CHANGED: Try next credential set
                         
                         # Verify expected hostname if provided
                         if expected_hostname and reached_hostname != expected_hostname:
                             logger.warning(f"[HOP] Hostname mismatch: expected '{expected_hostname}', got '{reached_hostname}'")
                         
                         # SUCCESS!
-                        logger.info(f"[HOP] Successfully reached {reached_hostname} at {target_ip}")
+                        logger.info(f"[HOP] Successfully reached {reached_hostname} at {target_ip} using credential {cred_idx}")
                         
                         # Enter enable mode
                         enable_candidates = [enable_pw, password, ""]
@@ -537,17 +526,15 @@ def attempt_ssh_hop(target_ip, parent_hostname, expected_hostname=None, attempt_
             # Timeout reached for this credential
             logger.debug(f"[HOP] Timeout with credential {cred_idx}")
             cleanup_failed_session()
+            # Continue to next credential (implicit)
             
         except Exception as e:
-            logger.error(f"[HOP] Exception during SSH: {e}")
+            logger.error(f"[HOP] Exception during SSH with credential {cred_idx}: {e}")
             cleanup_failed_session()
-            return {
-                "success": False,
-                "reason": f"exception: {str(e)}",
-                "fatal": False
-            }
+            continue  # ✅ Try next credential
     
     # All credentials failed
+    logger.warning(f"[HOP] All {len(CREDENTIAL_SETS)} credential sets failed for {target_ip}")
     return {
         "success": False,
         "reason": "auth_failed_all_credentials"
