@@ -12,8 +12,6 @@ from collections import deque
 SEED_SWITCH_IP = "192.168.1.18"
 TIMEOUT = 150
 MAX_READ = 65535
-SSH_RETRY_ATTEMPTS = 10
-SSH_RETRY_DELAY = 30
 CREDENTIAL_SETS = [
     {"username": "admin", "password": "/2/_HKX6YvCGMwzAdJp", "enable": ""},
 ]
