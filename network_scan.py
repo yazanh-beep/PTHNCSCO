@@ -87,7 +87,6 @@ class NetworkDiscovery:
         self.to_visit = deque()
         self.visited = set()
         self.hostname_to_ip = {}
-        self.scoped_hn_to_ip = {}
         self.seed_aggregate_ip = None
         self.agg_shell = None
         self.agg_client = None
@@ -261,6 +260,19 @@ class NetworkDiscovery:
             reconnect_needed=True
         )
 
+    # ── Hostname normalization ────────────────────────────────────────────
+    def normalize_hostname(self, hostname):
+        """
+        Normalize hostname by stripping domain suffixes.
+        Examples:
+            "AGG-SW1.CAM.INT" -> "AGG-SW1"
+            "AGG-SW1" -> "AGG-SW1"
+        """
+        if not hostname:
+            return hostname
+        # Strip everything after the first dot
+        return hostname.split('.')[0]
+    
     # ── Device role helper ────────────────────────────────────────────────
     def determine_device_role(self, hostname):
         up = (hostname or "").upper()
@@ -279,7 +291,7 @@ class NetworkDiscovery:
             line = line.strip()
             m = re.match(r"^([^#>\s]+(?:\.[^#>\s]+)*)[#>]", line)
             if m:
-                return m.group(1)
+                return self.normalize_hostname(m.group(1))
         return "Unknown"
 
     def get_management_ip(self, shell):
@@ -379,7 +391,7 @@ class NetworkDiscovery:
             }
             m = re.search(r"Device ID:\s*([^\s]+)", block)
             if m:
-                nbr["hostname"] = m.group(1)
+                nbr["hostname"] = self.normalize_hostname(m.group(1))
 
             for pat in CDP_IP_PATTERNS:
                 m = re.search(pat, block, flags=re.I | re.S)
@@ -451,7 +463,7 @@ class NetworkDiscovery:
                 if not name_match:
                     self.log(f"  Warning: LLDP block on {neighbor['local_intf']} missing System Name", "DEBUG")
                     continue
-                hostname = name_match.group(1)
+                hostname = self.normalize_hostname(name_match.group(1))
                 neighbor["hostname"] = hostname
                 
                 # FILTER 1: Check hostname pattern for non-Cisco devices
@@ -552,10 +564,9 @@ class NetworkDiscovery:
         return neighbors
 
     def discover_neighbors(self, shell, current_device_ip):
-        """Discover neighbors using CDP then LLDP; prefer CDP IP per-local-device scope."""
+        """Discover neighbors using CDP then LLDP; prefer CDP IP globally."""
         all_by_host = {}
         protocols_used = []
-        scope = self.scoped_hn_to_ip.setdefault(current_device_ip, {})
 
         self.log("Checking CDP neighbors...")
         cdp_out = self.send_cmd(shell, "show cdp neighbors detail", timeout=CDP_LLDP_TIMEOUT, silent=True)
@@ -566,9 +577,11 @@ class NetworkDiscovery:
                 protocols_used.append("CDP")
                 for nbr in cdp_neighbors:
                     nbr["discovered_via"] = "CDP"
-                    scope.setdefault(nbr["hostname"], nbr["mgmt_ip"])
-                    self.hostname_to_ip.setdefault(nbr["hostname"], nbr["mgmt_ip"])
-                    all_by_host.setdefault(nbr["hostname"], []).append(nbr)
+                    normalized_hn = nbr["hostname"]  # Already normalized by parser
+                    self.log(f"  [CDP] Storing {normalized_hn} -> {nbr['mgmt_ip']} globally", "DEBUG")
+                    # Store in global hostname_to_ip (CDP always wins)
+                    self.hostname_to_ip[normalized_hn] = nbr["mgmt_ip"]
+                    all_by_host.setdefault(normalized_hn, []).append(nbr)
         else:
             self.log("CDP not enabled or available")
 
@@ -590,27 +603,40 @@ class NetworkDiscovery:
                 protocols_used.append("LLDP")
                 for nbr in lldp_neighbors:
                     nbr["discovered_via"] = "LLDP"
-                    if nbr["hostname"] in scope:
-                        auth_ip = scope[nbr["hostname"]]
-                        if nbr["mgmt_ip"] != auth_ip:
-                            self.log(f"  Note: {nbr['hostname']} IP differs (CDP:{auth_ip} vs LLDP:{nbr['mgmt_ip']}), using CDP IP", "DEBUG")
-                            nbr["lldp_ip"] = nbr["mgmt_ip"]
-                            nbr["mgmt_ip"] = auth_ip
-                    else:
-                        scope[nbr["hostname"]] = nbr["mgmt_ip"]
-                        self.hostname_to_ip.setdefault(nbr["hostname"], nbr["mgmt_ip"])
+                    normalized_hn = nbr["hostname"]  # Already normalized by parser
                     
+                    self.log(f"  [LLDP] Processing {normalized_hn} with IP {nbr.get('mgmt_ip')}", "DEBUG")
+                    
+                    # Check for duplicates BEFORE modifying IP or adding to all_by_host
                     is_dup_intf = False
-                    if nbr["hostname"] in all_by_host:
+                    if normalized_hn in all_by_host:
                         lldp_intf_norm = self.normalize_interface_name(nbr["local_intf"]) if nbr["local_intf"] else None
-                        for existing in all_by_host[nbr["hostname"]]:
+                        for existing in all_by_host[normalized_hn]:
                             exist_intf_norm = self.normalize_interface_name(existing.get("local_intf"))
                             if existing.get("discovered_via") == "CDP" and exist_intf_norm == lldp_intf_norm:
-                                self.log(f"  Skipping LLDP entry for {nbr['hostname']} on {nbr['local_intf']} (CDP already)", "DEBUG")
+                                self.log(f"  [LLDP] Skipping LLDP entry for {nbr['hostname']} on {nbr['local_intf']} (CDP already on same interface)", "DEBUG")
                                 is_dup_intf = True
                                 break
-                    if not is_dup_intf:
-                        all_by_host.setdefault(nbr["hostname"], []).append(nbr)
+                    
+                    # Skip this neighbor if it's a duplicate
+                    if is_dup_intf:
+                        continue
+                    
+                    # Process IP address (prefer globally-known CDP IP if available)
+                    if normalized_hn in self.hostname_to_ip:
+                        auth_ip = self.hostname_to_ip[normalized_hn]
+                        if nbr["mgmt_ip"] != auth_ip:
+                            self.log(f"  [LLDP] IP differs: Global={auth_ip} vs LLDP={nbr['mgmt_ip']}, using Global IP", "INFO")
+                            nbr["lldp_ip"] = nbr["mgmt_ip"]
+                            nbr["mgmt_ip"] = auth_ip
+                        else:
+                            self.log(f"  [LLDP] IPs match, both are {auth_ip}", "DEBUG")
+                    else:
+                        self.log(f"  [LLDP] {normalized_hn} NOT in global map, using LLDP IP {nbr['mgmt_ip']}", "DEBUG")
+                        self.hostname_to_ip[normalized_hn] = nbr["mgmt_ip"]
+                    
+                    # Add to all_by_host only if not a duplicate
+                    all_by_host.setdefault(normalized_hn, []).append(nbr)
         else:
             self.log("LLDP not enabled or available")
 
