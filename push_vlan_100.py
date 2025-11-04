@@ -3,29 +3,34 @@ import paramiko
 import time
 import sys
 import logging
-from typing import Tuple, List, Optional
 import ipaddress
+import re
+from typing import Tuple, List, Optional
 
-# USER CONFIG
-AGG_IP = "192.168.1.1"
+# ========================= USER CONFIG =========================
+AGG_IP = "192.168.100.11"
 USERNAME = "admin"
 PASSWORD = "cisco"
 TIMEOUT = 10
 MAX_READ = 65535
 
-# Retry configuration for aggregation switch connection
+# VLAN settings (script arguments will supply the per-device IP/mask)
+VLAN_ID = 100
+
+# Retry configuration
 AGG_MAX_RETRIES = 3
 AGG_RETRY_DELAY = 5
 
-# Retry configuration for target device connections
-TARGET_MAX_RETRIES = 1
-TARGET_RETRY_DELAY = 5
+# Per-device retry attempts (your request)
+TARGET_MAX_RETRIES = 3           # <— now used to retry each device multiple times
+TARGET_RETRY_DELAY = 8
 TARGET_SSH_TIMEOUT = 60
 TARGET_TCP_TIMEOUT = 30
+# ===============================================================
 
-# Setup logging with live output
+
+# ========================= LOGGING SETUP =======================
 class LiveFormatter(logging.Formatter):
-    """Custom formatter for colored, live output"""
     COLORS = {
         'DEBUG': '\033[36m',
         'INFO': '\033[32m',
@@ -36,12 +41,14 @@ class LiveFormatter(logging.Formatter):
     RESET = '\033[0m'
 
     def format(self, record):
-        if sys.stdout.isatty():
-            log_color = self.COLORS.get(record.levelname, self.RESET)
-            record.levelname = f"{log_color}{record.levelname}{self.RESET}"
+        try:
+            if sys.stdout.isatty():
+                color = self.COLORS.get(record.levelname, self.RESET)
+                record.levelname = f"{color}{record.levelname}{self.RESET}"
+        except Exception:
+            pass
         return super().format(record)
 
-# Create formatters
 file_formatter = logging.Formatter(
     '%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
@@ -51,335 +58,487 @@ console_formatter = LiveFormatter(
     datefmt='%H:%M:%S'
 )
 
-# File handler
 file_handler = logging.FileHandler('vlan_100_config.log', mode='a')
 file_handler.setLevel(logging.DEBUG)
 file_handler.setFormatter(file_formatter)
-file_handler.stream.reconfigure(line_buffering=True)
+try:
+    file_handler.stream.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
-# Console handler
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(console_formatter)
 
-# Setup logger
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
-sys.stdout.reconfigure(line_buffering=True)
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+# ===============================================================
 
+
+# ========================= EXCEPTIONS ==========================
 class NetworkConnectionError(Exception):
-    """Custom exception for network connection issues"""
     def __init__(self, message, retry_allowed=False, reconnect_needed=False):
         super().__init__(message)
         self.retry_allowed = retry_allowed
         self.reconnect_needed = reconnect_needed
 
 class ConfigurationError(Exception):
-    """Custom exception for configuration issues"""
     pass
+# ===============================================================
 
+
+# ========================= SSH HELPERS =========================
 def expect_prompt(shell, patterns=("#", ">"), timeout=TIMEOUT, show_progress=False):
-    """Wait for expected prompt patterns with timeout"""
     buf, end = "", time.time() + timeout
-    last_log_time = time.time()
-    start_time = time.time()
-    last_progress_time = time.time()
+    last_log = time.time()
+    started = time.time()
+    last_prog = time.time()
 
     while time.time() < end:
-        if shell.recv_ready():
+        if getattr(shell, "recv_ready", lambda: False)():
             data = shell.recv(MAX_READ).decode("utf-8", "ignore")
             buf += data
-
-            if time.time() - last_log_time > 2 or any(p in buf for p in patterns):
+            if (time.time() - last_log > 2) or any(p in buf for p in patterns):
                 if data.strip():
-                    logger.debug(f"[RECV] {data.strip()[-100:]}")
-                last_log_time = time.time()
-
+                    logger.debug(f"[RECV] {data.strip()[-120:]}")
+                last_log = time.time()
             for p in patterns:
                 if p in buf:
                     return buf
         else:
-            if show_progress and time.time() - last_progress_time >= 5:
-                elapsed = int(time.time() - start_time)
-                remaining = int(end - time.time())
-                logger.info(f"[WAIT] Elapsed: {elapsed}s, Remaining: {remaining}s...")
+            if show_progress and time.time() - last_prog >= 5:
+                elapsed = int(time.time() - started)
+                remaining = max(0, int(end - time.time()))
+                logger.info(f"[WAIT] Elapsed: {elapsed}s, Remaining: {remaining}s ...")
                 sys.stdout.flush()
-                last_progress_time = time.time()
-
+                last_prog = time.time()
             time.sleep(0.1)
 
-    logger.warning(f"Timeout waiting for prompt. Buffer: {buf[-200:]}")
+    logger.warning(f"Timeout waiting for prompt. Buffer tail: {buf[-200:]}")
     return buf
 
 def send_cmd(shell, cmd, patterns=("#", ">"), timeout=TIMEOUT, log_cmd=True, show_progress=False):
-    """Send command and wait for prompt"""
     if log_cmd:
-        logger.debug(f"Sending command: {cmd}")
+        logger.debug(f"Sending: {cmd}")
     shell.send(cmd + "\n")
     return expect_prompt(shell, patterns, timeout, show_progress=show_progress)
+# ===============================================================
 
-def connect_to_agg(retry_count=0):
-    """Connect to aggregation switch with retry logic"""
+
+# ========================= CORE CONNECT ========================
+def connect_to_agg(retry=0):
     try:
-        logger.info(f"[CONNECT] Attempt {retry_count + 1}/{AGG_MAX_RETRIES} - SSH to aggregation switch: {AGG_IP}")
-        sys.stdout.flush()
-
+        logger.info(f"[CONNECT] Attempt {retry+1}/{AGG_MAX_RETRIES} to {AGG_IP}")
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
-            AGG_IP, 
-            username=USERNAME, 
-            password=PASSWORD,
-            look_for_keys=False, 
-            allow_agent=False, 
-            timeout=10
-        )
+        client.connect(AGG_IP, username=USERNAME, password=PASSWORD,
+                       look_for_keys=False, allow_agent=False, timeout=10)
         shell = client.invoke_shell()
-
-        logger.info("[CONNECT] Waiting for initial prompt...")
-        out = expect_prompt(shell, ("#", ">"))
+        logger.info("[CONNECT] Waiting for prompt...")
+        out = expect_prompt(shell, ("#", ">"), timeout=15)
         if not out:
-            raise NetworkConnectionError("No initial prompt received")
-
-        logger.info("[CONNECT] Entering enable mode...")
-        out = send_cmd(shell, "enable", patterns=("assword:", "#"))
+            raise NetworkConnectionError("No prompt from aggregation switch")
+        # enable
+        out = send_cmd(shell, "enable", patterns=("assword:", "#"), timeout=8, log_cmd=False)
         if "assword:" in out:
-            send_cmd(shell, PASSWORD, patterns=("#",))
-
-        logger.info("[CONNECT] Configuring terminal...")
-        send_cmd(shell, "terminal length 0", patterns=("#",))
-
-        # Configure a reasonable SSH timeout on the aggregation switch (10 minutes)
-        # This prevents the aggregation switch from disconnecting us during long operations
-        logger.info("[CONNECT] Configuring SSH timeout on aggregation switch...")
-        send_cmd(shell, "configure terminal", patterns=("(config)#",))
-        send_cmd(shell, "ip ssh time-out 10", patterns=("(config)#",))  # 10 minutes
-        send_cmd(shell, "end", patterns=("#",))
-        logger.info("[CONNECT] SSH timeout set to 10 minutes")
-        
-        logger.info("[CONNECT] Successfully connected to aggregation switch")
-        return client, shell
-
-@@ -227,7 +235,7 @@
-        sys.stdout.flush()
-
-        if shell.closed:
-            raise NetworkConnectionError("SSH shell to aggregation switch is closed")
-            raise NetworkConnectionError("SSH shell to aggregation switch is closed", reconnect_needed=True)
-
-        logger.info(f"[HOP] Initiating SSH connection (timeout: {TARGET_SSH_TIMEOUT}s)...")
-        out = send_cmd(
-@@ -244,7 +252,7 @@
-            raise NetworkConnectionError(f"SSH connection refused by {target_ip} - skipping device")
-
-        if "Connection timed out" in out or "Destination" in out:
-            raise NetworkConnectionError(f"SSH connection timed out to {target_ip} - device unreachable, skipping")
-            raise NetworkConnectionError(f"SSH connection timed out to {target_ip}", retry_allowed=True)
-
-        if "No route to host" in out or "Host is unreachable" in out:
-            raise NetworkConnectionError(f"Network unreachable to {target_ip} - skipping device")
-@@ -401,7 +409,7 @@
+            out = send_cmd(shell, PASSWORD, patterns=("#",), timeout=8, log_cmd=False)
+        # disable paging
+        send_cmd(shell, "terminal length 0", patterns=("#",), timeout=6, log_cmd=False)
+        # learn hostname
+        agg_name = safe_get_hostname(shell) or "AGGREGATION"
+        logger.info(f"[CONNECT] Connected to aggregation switch '{agg_name}'")
+        return client, shell, agg_name
     except Exception as e:
-        logger.warning(f"[EXIT] Error during exit: {e}")
+        logger.error(f"[CONNECT] Failed: {e}")
+        if retry < AGG_MAX_RETRIES - 1:
+            logger.info(f"[RETRY] Waiting {AGG_RETRY_DELAY}s before retry...")
+            time.sleep(AGG_RETRY_DELAY)
+            return connect_to_agg(retry+1)
+        raise
+# ===============================================================
 
-def configure_device_vlan(shell, target_ip, vlan_ip, netmask):
-def configure_device_vlan(shell, client, target_ip, vlan_ip, netmask):
-    """Configure VLAN 100 on a target device"""
+
+# ========================= UTILS ===============================
+HOSTNAME_RE = re.compile(r'^\s*hostname\s+(.+)$', re.MULTILINE)
+PROMPT_HOST_RE = re.compile(r'\r?\n([A-Za-z0-9._\-\/]+)[#>]')
+
+IFACE_RE = re.compile(r'^(Po\d+|Gi\d+(?:/\d+){1,2}|Te\d+(?:/\d+){1,2}|Fo\d+(?:/\d+){1,2})\b')
+
+def safe_get_hostname(shell) -> Optional[str]:
     try:
-        if shell.closed:
-@@ -421,8 +429,66 @@
-        except OSError:
-            raise NetworkConnectionError("Connection to aggregation switch lost", reconnect_needed=True)
+        out = send_cmd(shell, "show run | i ^hostname", patterns=("#", ">", "--More--"), timeout=6, log_cmd=False)
+        m = HOSTNAME_RE.search(out)
+        if m:
+            return m.group(1).strip()
+        # Try prompt scrape
+        out2 = send_cmd(shell, "", patterns=("#", ">"), timeout=3, log_cmd=False)
+        m2 = PROMPT_HOST_RE.search(out2)
+        if m2:
+            return m2.group(1).strip()
+    except Exception:
+        pass
+    return None
 
-        # Establish session to target device
+def backup_config(shell, label: str) -> str:
+    logger.info("[BACKUP] Capturing running config...")
+    out = send_cmd(shell, "show running-config", patterns=("#",), timeout=30, show_progress=True)
+    fname = f"backup_{label}_{int(time.time())}.cfg"
+    with open(fname, "w", encoding="utf-8", errors="ignore") as f:
+        f.write(out)
+    logger.info(f"[BACKUP] Saved to {fname}")
+    return fname
+
+def apply_vlan_config(shell, ip_addr: str, netmask: str):
+    logger.info("[CONFIG] Applying VLAN 100 SVI")
+    send_cmd(shell, "configure terminal", patterns=("(config)#",), timeout=10)
+    send_cmd(shell, f"vlan {VLAN_ID}", patterns=("(config-vlan)#", "(config)#"), timeout=8)
+    send_cmd(shell, "exit", patterns=("(config)#",), timeout=6)
+    send_cmd(shell, f"interface vlan {VLAN_ID}", patterns=("(config-if)#",), timeout=10)
+    send_cmd(shell, f"ip address {ip_addr} {netmask}", patterns=("(config-if)#",), timeout=8)
+    send_cmd(shell, "no shutdown", patterns=("(config-if)#",), timeout=6)
+    send_cmd(shell, "exit", patterns=("(config)#",), timeout=6)
+    send_cmd(shell, "end", patterns=("#",), timeout=6)
+
+def find_trunk_interfaces(shell) -> List[str]:
+    logger.info("[TRUNK] Identifying trunk interfaces...")
+    out = send_cmd(shell, "show interfaces trunk", patterns=("#", ">"), timeout=12)
+
+    trunks = set()
+    for line in out.splitlines():
+        s = line.strip()
+        # ignore prompts/garbage
+        if not s or s.endswith("#") or s.endswith(">") or "hostname" in s:
+            continue
+        m = IFACE_RE.match(s)
+        if m:
+            trunks.add(m.group(1))
+
+    # Fallback to running-config scan
+    if not trunks:
+        out2 = send_cmd(shell, "show run | i ^interface (Po|Gi|Te|Fo)", patterns=("#",), timeout=10)
+        for line in out2.splitlines():
+            s = line.strip()
+            if s.startswith("interface "):
+                cand = s.split()[1]
+                if IFACE_RE.match(cand):
+                    trunks.add(cand)
+
+    trunks = sorted(trunks)
+    logger.info(f"[TRUNK] Found {len(trunks)} trunk interface(s): {', '.join(trunks) if trunks else 'None'}")
+    return trunks
+
+def add_vlan_to_trunks(shell, trunks: List[str], vlan: int):
+    if not trunks:
+        logger.info("[TRUNK] No trunks found — skipping trunk updates.")
+        return
+    logger.info("[TRUNK] Adding VLAN 100 to trunk allowed lists")
+    send_cmd(shell, "configure terminal", patterns=("(config)#",), timeout=8)
+    done = 0
+    for iface in trunks:
+        logger.info(f"[TRUNK] Updating {iface}")
+        send_cmd(shell, f"interface {iface}", patterns=("(config-if)#",), timeout=8)
+        send_cmd(shell, f"switchport trunk allowed vlan add {vlan}", patterns=("(config-if)#",), timeout=8)
+        send_cmd(shell, "exit", patterns=("(config)#",), timeout=6)
+        done += 1
+    send_cmd(shell, "end", patterns=("#",), timeout=6)
+    logger.info(f"[TRUNK] Successfully updated {done}/{len(trunks)} trunk interface(s)")
+# ===============================================================
+
+
+# ========================= HOP & EXIT ==========================
+def establish_device_session(shell, target_ip: str):
+    logger.info(f"[HOP] SSH to {target_ip}")
+    if shell.closed:
+        raise NetworkConnectionError("SSH shell to aggregation switch is closed", reconnect_needed=True)
+
+    out = send_cmd(
+        shell,
+        f"ssh -l {USERNAME} {target_ip}",
+        patterns=("Destination", "(yes/no)?", "yes/no", "assword:", "%", "#", ">", "Connection refused", "Connection timed out"),
+        timeout=TARGET_SSH_TIMEOUT,
+        show_progress=True
+    )
+
+    if "Connection refused" in out:
+        raise NetworkConnectionError(f"SSH refused by {target_ip}")
+    if "Connection timed out" in out or "Destination" in out:
+        raise NetworkConnectionError(f"SSH timed out to {target_ip}")
+    if "No route to host" in out or "Host is unreachable" in out:
+        raise NetworkConnectionError(f"Network unreachable to {target_ip}")
+
+    if "(yes/no)?" in out or "yes/no" in out:
+        out = send_cmd(shell, "yes", patterns=("assword:", "#", ">", "%"), timeout=15)
+
+    if "assword:" in out:
+        out = send_cmd(shell, PASSWORD, patterns=("#", ">", "%", "assword:"), timeout=15)
+        if "assword:" in out:
+            raise NetworkConnectionError(f"Authentication failed for {target_ip}", retry_allowed=True)
+
+    if not ("#" in out or ">" in out):
+        raise NetworkConnectionError(f"No prompt from {target_ip}", retry_allowed=True)
+
+    # If user-mode, enter enable
+    last = out.strip().splitlines()[-1] if out.strip().splitlines() else ""
+    if last.endswith(">") or (out.count(">") > out.count("#")):
+        out = send_cmd(shell, "enable", patterns=("assword:", "#", "%"), timeout=8)
+        if "assword:" in out:
+            out = send_cmd(shell, PASSWORD, patterns=("#", "%"), timeout=8)
+        if "#" not in out:
+            raise NetworkConnectionError(f"Failed to enter enable on {target_ip}", retry_allowed=True)
+
+    # Disable paging on target
+    send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5, log_cmd=False)
+
+    # settle
+    send_cmd(shell, "", patterns=("#",), timeout=3, log_cmd=False)
+    return True
+
+def exit_to_agg(shell):
+    """Return one level (target -> agg) safely. Never raise."""
+    try:
+        if getattr(shell, "closed", False):
+            logger.warning("[EXIT] Channel already closed; skipping exit")
+            return
+        # try a gentle exit sequence
+        try:
+            shell.send("\n")
+            expect_prompt(shell, ("#", ">"), timeout=3)
+        except Exception:
+            pass
+        try:
+            shell.send("exit\n")
+            expect_prompt(shell, ("#", ">"), timeout=5)
+        except Exception:
+            pass
+        # clear any buffer
+        try:
+            shell.send("\n")
+            time.sleep(0.2)
+            if shell.recv_ready():
+                _ = shell.recv(MAX_READ)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning(f"[EXIT] Error: {e}")
+# ===============================================================
+
+
+# ========================= DEVICE CONFIG WRAPPER ===============
+def configure_over_hop(shell, target_ip: str, vlan_ip: str, netmask: str) -> Tuple[bool, bool]:
+    """
+    Try to hop to target and configure VLAN SVI + trunk allow-list.
+    Returns (success, reconnect_needed).
+    If SSH hop fails -> skip attempt, no 'exit' is sent.
+    """
+    # Try to establish session
+    try:
         establish_device_session(shell, target_ip)
-        # Establish session to target device with retry support
-        max_retries = TARGET_MAX_RETRIES
-        for attempt in range(max_retries):
-            try:
-                establish_device_session(shell, target_ip, retry_count=attempt)
-                break  # Success!
-            except NetworkConnectionError as e:
-                # Check if we need to reconnect to aggregation switch
-                if getattr(e, 'reconnect_needed', False) or shell.closed:
-                    logger.warning("[RETRY] Aggregation switch connection lost, need to reconnect")
-                    raise NetworkConnectionError("Connection to aggregation switch lost", reconnect_needed=True)
-                
-                retry_allowed = getattr(e, 'retry_allowed', False)
-                is_last_attempt = (attempt >= max_retries - 1)
-                
-                if retry_allowed and not is_last_attempt:
-                    logger.info(f"[RETRY] Waiting {TARGET_RETRY_DELAY} seconds before retry...")
-                    sys.stdout.flush()
-                    
-                    # Keep aggregation switch alive during retry delay by sending keepalives
-                    delay_remaining = TARGET_RETRY_DELAY
-                    keepalive_interval = 10  # Send keepalive every 10 seconds
-                    
-                    while delay_remaining > 0:
-                        sleep_time = min(keepalive_interval, delay_remaining)
-                        time.sleep(sleep_time)
-                        delay_remaining -= sleep_time
-                        
-                        # Send keepalive to aggregation switch
-                        if delay_remaining > 0 and not shell.closed:
-                            try:
-                                shell.send("\n")  # Send empty line as keepalive
-                                time.sleep(0.2)
-                                if shell.recv_ready():
-                                    shell.recv(MAX_READ)  # Clear any response
-                            except:
-                                logger.warning("[RETRY] Failed to send keepalive to aggregation switch")
-                                break
-                    
-                    # Verify aggregation switch is still connected after retry delay
-                    if shell.closed:
-                        logger.warning("[RETRY] Aggregation switch disconnected during retry delay")
-                        raise NetworkConnectionError("Connection to aggregation switch lost", reconnect_needed=True)
-                    
-                    # Verify we're still at aggregate prompt
-                    try:
-                        out = send_cmd(shell, "", patterns=("#",), timeout=3)
-                        if "#" not in out:
-                            logger.warning("[RETRY] Lost aggregation switch prompt during retry")
-                            raise NetworkConnectionError("Connection to aggregation switch lost", reconnect_needed=True)
-                    except (OSError, Exception):
-                        logger.warning("[RETRY] Cannot verify aggregation switch connection")
-                        raise NetworkConnectionError("Connection to aggregation switch lost", reconnect_needed=True)
-                    
-                    continue  # Try again
-                else:
-                    # Either retry not allowed or last attempt failed
-                    if not retry_allowed:
-                        logger.info(f"[SKIP] Device {target_ip} is unreachable - moving to next device")
-                    raise NetworkConnectionError(f"Failed to connect to {target_ip} after {attempt + 1} attempt(s)")
+    except NetworkConnectionError as e:
+        logger.warning(f"[SKIP] {target_ip} SSH hop failed — {e}. No changes on this attempt.")
+        # If channel died, ask caller to reconnect
+        if getattr(shell, "closed", False) or getattr(e, "reconnect_needed", False):
+            return (False, True)
+        # Probe liveness
+        try:
+            shell.send("\n")
+            time.sleep(0.2)
+            if shell.recv_ready():
+                _ = shell.recv(MAX_READ)
+        except Exception:
+            return (False, True)
+        return (False, False)
 
-        # Apply VLAN configuration
+    # Now on target (enable mode)
+    target_name = safe_get_hostname(shell) or "DEVICE"
+    logger.info(f"[CONNECTED] On device '{target_name}'")
+
+    label = (target_name or target_ip).replace(" ", "_").replace(".", "_")
+    try:
+        backup_config(shell, label)
         apply_vlan_config(shell, vlan_ip, netmask)
-@@ -563,69 +629,111 @@
-                break
+        trunks = find_trunk_interfaces(shell)
+        add_vlan_to_trunks(shell, trunks, VLAN_ID)
+    except Exception as e:
+        logger.error(f"[CONFIG] Failed on {target_ip}: {e}")
+        try:
+            exit_to_agg(shell)
+        except Exception:
+            pass
+        return (False, False)
 
-        device_start = time.time()
-        success, reconnect_needed = configure_device_vlan(shell, target, vlan_ip, netmask)
-        device_elapsed = time.time() - device_start
+    # exit back to agg
+    exit_to_agg(shell)
+    return (True, False)
+# ===============================================================
 
-        if success:
-            logger.info(f"[SUCCESS] VLAN 100 configured on {target} with IP {vlan_ip} in {device_elapsed:.1f}s")
-            successful.append((target, vlan_ip))
-        else:
-            logger.error(f"[FAILED] Could not configure {target} after {device_elapsed:.1f}s")
-            failed.append(target)
-        # Retry loop for device configuration with aggregation switch reconnection support
-        device_success = False
-        device_reconnect_needed = False
-        
-        for device_attempt in range(TARGET_MAX_RETRIES):
-            # Check if aggregation connection is still alive
-            if shell.closed:
-                logger.error("Connection to aggregation switch lost!")
-                logger.info("Attempting to reconnect...")
+
+# ========================= MAIN ================================
+def main():
+    if len(sys.argv) != 4:
+        print("Usage: python vlan_100.py <devices_file> <vlan100_start_ip> <netmask>")
+        sys.exit(1)
+
+    devices_file = sys.argv[1]
+    start_ip_str = sys.argv[2]
+    netmask = sys.argv[3]
+
+    logger.info("=" * 68)
+    logger.info("VLAN 100 CONFIGURATION SCRIPT")
+    logger.info("=" * 68)
+    logger.info(f"Aggregation Switch: {AGG_IP}")
+    logger.info(f"Devices file: {devices_file}")
+    logger.info(f"Starting VLAN 100 IP: {start_ip_str}")
+    logger.info(f"Netmask: {netmask}")
+    logger.info("")
+
+    # Load devices
+    try:
+        with open(devices_file, "r") as f:
+            targets = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    except FileNotFoundError as e:
+        logger.error(f"Devices file not found: {e}")
+        sys.exit(1)
+
+    # Compute per-device IPs
+    try:
+        base_ip = ipaddress.IPv4Address(start_ip_str)
+    except Exception as e:
+        logger.error(f"Invalid start IP: {e}")
+        sys.exit(1)
+
+    plan = []
+    for i, ip in enumerate(targets):
+        vlan_ip = str(base_ip + i)
+        plan.append((ip, vlan_ip))
+
+    logger.info(f"Target devices: {len(plan)}")
+    for ip, vip in plan:
+        logger.info(f"   - {ip} -> VLAN 100 IP: {vip}")
+    logger.info("")
+
+    # Connect to aggregation and get name
+    try:
+        client, shell, agg_name = connect_to_agg()
+    except Exception as e:
+        logger.error(f"Failed to connect to aggregation switch: {e}")
+        sys.exit(1)
+
+    # 1) Configure aggregation switch itself first
+    logger.info("=" * 68)
+    logger.info("CONFIGURING AGGREGATION SWITCH (FIRST)")
+    logger.info("=" * 68)
+    try:
+        agg_label = agg_name.replace(" ", "_").replace(".", "_")
+        backup_config(shell, agg_label)
+        # Apply VLAN 100 on aggregation with the start_ip (adjust if you prefer a fixed agg IP)
+        apply_vlan_config(shell, start_ip_str, netmask)
+        trunks = find_trunk_interfaces(shell)
+        add_vlan_to_trunks(shell, trunks, VLAN_ID)
+    except Exception as e:
+        logger.error(f"[AGG] Failed to configure aggregation switch: {e}")
+        # Continue to devices anyway
+
+    successful = []
+    failed = []
+
+    # 2) Iterate devices with up-to TARGET_MAX_RETRIES attempts each
+    for idx, (target, vlan_ip) in enumerate(plan, 1):
+        logger.info("")
+        logger.info("=" * 68)
+        logger.info(f"DEVICE {idx}/{len(plan)}: {target}")
+        logger.info("=" * 68)
+
+        # Skip agg if present in list
+        if target == AGG_IP:
+            logger.warning(f"[SKIP] {target} is the aggregation switch IP — already configured first. Skipping.")
+            continue
+
+        device_ok = False
+
+        for attempt in range(1, TARGET_MAX_RETRIES + 1):
+            # Ensure agg channel is alive
+            if getattr(shell, "closed", False):
+                logger.error("Aggregation channel closed; attempting reconnect...")
                 try:
                     try:
                         client.close()
-                    except:
+                    except Exception:
                         pass
-                    client, shell = connect_to_agg()
-                    logger.info("Successfully reconnected to aggregation switch")
-                except NetworkConnectionError as e:
-                    logger.error(f"Failed to reconnect to aggregation switch: {e}")
-                    logger.error("Cannot continue - stopping")
-                    failed.extend(target_ips[idx:])
-                    device_success = False
-                    device_reconnect_needed = False
+                    client, shell, agg_name = connect_to_agg()
+                    logger.info("Reconnected to aggregation switch")
+                except Exception as e:
+                    logger.error(f"Could not reconnect to aggregation switch: {e}")
+                    # No point to continue; mark this device failed and break retry loop
                     break
-            
-            success, reconnect_needed = configure_device_vlan(shell, client, target, vlan_ip, netmask)
-            
-            if success:
-                device_success = True
-                device_reconnect_needed = False
-                break  # Device configured successfully
+
+            logger.info(f"[ATTEMPT] {attempt}/{TARGET_MAX_RETRIES} for {target}")
+            start_t = time.time()
+            ok, reconnect_needed = configure_over_hop(shell, target, vlan_ip, netmask)
 
             if reconnect_needed:
-                logger.info("Attempting to reconnect to aggregation switch...")
-                # Aggregation switch connection lost - reconnect and retry this device
-                logger.info("Connection to aggregation switch lost during device configuration")
-                logger.info(f"Attempting to reconnect... (Device attempt {device_attempt + 1}/{TARGET_MAX_RETRIES})")
+                logger.info("[RECOVER] Aggregation channel down — reconnecting...")
                 try:
                     try:
                         client.close()
-                    except:
+                    except Exception:
                         pass
-                    client, shell = connect_to_agg()
-                    logger.info("Successfully reconnected - continuing with remaining devices")
-                    logger.info(f"Successfully reconnected - will retry device {target}")
-                    # Loop will continue to next attempt for this device
-                except NetworkConnectionError as e:
-                    logger.error(f"Failed to reconnect to aggregation switch: {e}")
-                    logger.error("Stopping configuration for remaining devices")
-                    failed.extend(target_ips[idx + 1:])
-                    logger.error("Cannot continue - stopping")
-                    failed.extend(target_ips[idx:])
-                    device_success = False
-                    device_reconnect_needed = False
-                    break
+                    client, shell, agg_name = connect_to_agg()
+                    logger.info("[RECOVER] Reconnected to aggregation switch")
+                except Exception as e:
+                    logger.error(f"[RECOVER] Reconnect failed: {e}")
+                    # will retry if attempts remain
+            elif ok:
+                elapsed = time.time() - start_t
+                logger.info(f"[SUCCESS] VLAN 100 configured on {target} with IP {vlan_ip}")
+                device_ok = True
+                break  # done with this device
             else:
-                # Device configuration failed but aggregation switch is OK
-                # The configure_device_vlan function already handles retries internally
-                device_success = False
-                device_reconnect_needed = False
-                break  # Don't retry at this level
-        
-        device_elapsed = time.time() - device_start
-        
-        if device_success:
-            logger.info(f"[SUCCESS] VLAN 100 configured on {target} with IP {vlan_ip} in {device_elapsed:.1f}s")
+                logger.warning(f"[RETRY] Will retry {target} after {TARGET_RETRY_DELAY}s...")
+                time.sleep(TARGET_RETRY_DELAY)
+
+        if device_ok:
             successful.append((target, vlan_ip))
         else:
-            logger.error(f"[FAILED] Could not configure {target} after {device_elapsed:.1f}s")
+            logger.error(f"[FAILED] Could not configure {target} after {TARGET_MAX_RETRIES} attempt(s)")
             failed.append(target)
 
-        time.sleep(2)
+        time.sleep(1.5)
 
-    # Close connection
+    # Close agg session
     try:
         client.close()
         logger.info("")
-        logger.info("[DISCONNECT] Closed connection to aggregation switch")
-    except:
+        logger.info("[DISCONNECT] Closed aggregation switch session")
+    except Exception:
         pass
 
     # Summary
-    total_elapsed = time.time() - start_time
     logger.info("")
-    logger.info("=" * 70)
+    logger.info("=" * 68)
     logger.info("VLAN 100 CONFIGURATION SUMMARY")
-    logger.info("=" * 70)
-    logger.info(f"Total time: {total_elapsed:.1f}s")
-    logger.info(f"Total devices: {len(target_ips)}")
+    logger.info("=" * 68)
+    logger.info(f"Total devices: {len(plan)}")
     logger.info(f"Successful: {len(successful)}")
     logger.info(f"Failed: {len(failed)}")
-    logger.info(f"Success rate: {(len(successful)/len(target_ips)*100):.1f}%")
-
     if successful:
-        logger.info(f"\nSuccessful configurations:")
-        for device, ip in successful:
-            logger.info(f"   - {device}: VLAN 100 IP {ip} {netmask}")
-
+        logger.info("\nSuccessful configurations:")
+        for d, vip in successful:
+            logger.info(f"   - {d}: VLAN 100 IP {vip} {netmask}")
     if failed:
-        logger.error(f"\nFailed devices:")
-        for device in failed:
-            logger.error(f"   - {device}")
-
-    logger.info("")
-    logger.info("=" * 70)
-    logger.info("All VLAN 100 configuration tasks completed")
-    logger.info("=" * 70)
+        logger.error("\nFailed devices:")
+        for d in failed:
+            logger.error(f"   - {d}")
 
     sys.exit(0 if not failed else 1)
+
+# ===============================================================
 
 if __name__ == "__main__":
     main()
