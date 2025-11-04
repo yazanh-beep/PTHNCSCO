@@ -91,6 +91,7 @@ def expect_prompt(shell, patterns=("#", ">"), timeout=TIMEOUT, show_progress=Fal
     last_log = time.time()
     start = time.time()
     last_progress = time.time()
+    last_nudge = time.time()
 
     while time.time() < end:
         if shell.recv_ready():
@@ -104,6 +105,14 @@ def expect_prompt(shell, patterns=("#", ">"), timeout=TIMEOUT, show_progress=Fal
                 if p in buf:
                     return buf
         else:
+            # gentle nudge every 10s to wake prompts that stop printing
+            if time.time() - last_nudge >= 10:
+                try:
+                    shell.send("\n")
+                except Exception:
+                    pass
+                last_nudge = time.time()
+
             if show_progress and time.time() - last_progress >= 5:
                 logger.info(f"[WAIT] Elapsed: {int(time.time()-start)}s ...")
                 last_progress = time.time()
@@ -121,12 +130,25 @@ def connect_to_agg(retry=0):
         logger.info(f"[CONNECT] Attempt {retry+1}/{AGG_MAX_RETRIES} to {AGG_IP}")
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(AGG_IP, username=USERNAME, password=PASSWORD, look_for_keys=False, allow_agent=False)
-        shell = client.invoke_shell()
+        client.connect(
+            AGG_IP,
+            username=USERNAME,
+            password=PASSWORD,
+            look_for_keys=False,
+            allow_agent=False,
+            timeout=15,
+        )
+        # Keepalive so long trunk reads don’t kill the channel
+        try:
+            client.get_transport().set_keepalive(30)
+        except Exception:
+            pass
 
+        shell = client.invoke_shell()
         expect_prompt(shell, ("#", ">"))
-        send_cmd(shell, "enable", ("assword:", "#"))
-        send_cmd(shell, PASSWORD, ("#",))
+        out = send_cmd(shell, "enable", ("assword:", "#"))
+        if "assword:" in out:
+            send_cmd(shell, PASSWORD, ("#",))
         send_cmd(shell, "terminal length 0", ("#",))
         return client, shell
 
@@ -146,7 +168,7 @@ def cleanup_failed_session(shell):
             time.sleep(0.6)
             if shell.recv_ready():
                 data = shell.recv(MAX_READ).decode("utf-8", "ignore")
-                if "#" in data:
+                if "#" in data or ">" in data:
                     return True
         except:
             pass
@@ -166,8 +188,9 @@ def establish_device_session(shell, target_ip, retry=0):
     if "assword:" in out:
         out = send_cmd(shell, PASSWORD, ("#", ">",))
     # enable + no paging on the target
-    send_cmd(shell, "enable", ("assword:", "#"))
-    send_cmd(shell, PASSWORD, ("#",))
+    out = send_cmd(shell, "enable", ("assword:", "#"))
+    if "assword:" in out:
+        send_cmd(shell, PASSWORD, ("#",))
     send_cmd(shell, "terminal length 0", ("#",))
     return True
 
@@ -201,18 +224,19 @@ def apply_vlan10_config(shell, vlan_ip, netmask):
     send_cmd(shell, "end", ("#",))
     return True
 
-# --------- NEW: discover trunk interfaces on the TARGET device ----------
+# --------- Trunk helpers ----------
 def get_trunk_interfaces(shell) -> List[str]:
     """Parse 'show interfaces trunk' and return a list of trunk interface names."""
     logger.info("[TRUNK] Identifying trunk interfaces...")
-    out = send_cmd(shell, "show interfaces trunk", ("#",), timeout=15)
+    out = send_cmd(shell, "show interfaces trunk", ("#",), timeout=120, show_progress=True)
     trunk_intfs: List[str] = []
     for line in out.splitlines():
         line = line.strip()
         if not line or line.lower().startswith(("port", "portchannel", "vlans", "----", "name")):
             continue
-        # Simple first-token extraction; matches common Cisco names (Gi, Fa, Te, Et, Po)
-        first = line.split()[0] if line.split() else ""
+        # first token is often the interface
+        toks = line.split()
+        first = toks[0] if toks else ""
         if any(first.startswith(pfx) for pfx in ("Gi", "Fa", "Te", "Et", "Po")):
             if first not in trunk_intfs:
                 trunk_intfs.append(first)
@@ -234,16 +258,16 @@ def configure_trunk_vlan(shell, interfaces: List[str]) -> bool:
     success = 0
     for intf in interfaces:
         logger.info(f"[TRUNK] Updating {intf}")
-        out = send_cmd(shell, f"interface {intf}", ("(config-if)#",), timeout=5)
+        out = send_cmd(shell, f"interface {intf}", ("(config-if)#",), timeout=8)
         if "(config-if)#" not in out:
             logger.warning(f"[TRUNK] Could not enter interface {intf}, skipping")
             continue
-        send_cmd(shell, "switchport trunk allowed vlan add 10", ("(config-if)#",), timeout=5)
+        send_cmd(shell, "switchport trunk allowed vlan add 10", ("(config-if)#",), timeout=8)
         success += 1
     send_cmd(shell, "end", ("#",), timeout=5)
     logger.info(f"[TRUNK] Successfully updated {success}/{len(interfaces)} trunk interface(s)")
     return True
-# ------------------------------------------------------------------------
+# ----------------------------------
 
 def exit_device_session(shell):
     logger.info("[EXIT] Returning to aggregation switch")
@@ -281,6 +305,7 @@ def main():
         logger.info(f"  - {t} -> Vlan10 {ip} {netmask}")
     logger.info("")
 
+    # initial agg connection
     try:
         client, shell = connect_to_agg()
     except Exception as e:
@@ -289,11 +314,17 @@ def main():
 
     success, failed = [], []
 
-    for idx, (target, vip) in enumerate(zip(targets, vlan_ips), 1):
+    idx = 0
+    while idx < len(targets):
+        target = targets[idx]
+        vip = vlan_ips[idx]
+
         logger.info("")
         logger.info("=" * 70)
-        logger.info(f"DEVICE {idx}/{len(targets)}: {target}")
+        logger.info(f"DEVICE {idx+1}/{len(targets)}: {target}")
         logger.info("=" * 70)
+
+        retry_after_reconnect = False
         try:
             if shell.closed:
                 raise NetworkConnectionError("Aggregation shell closed", reconnect_needed=True)
@@ -303,7 +334,7 @@ def main():
 
             establish_device_session(shell, target)
 
-            # Optional: backup
+            # Backup (best-effort)
             try:
                 backup_config(shell, target)
             except Exception as be:
@@ -312,7 +343,7 @@ def main():
             # Configure SVI
             apply_vlan10_config(shell, vip, netmask)
 
-            # NEW: Add VLAN 10 to all trunk allowed lists on the target
+            # Add VLAN 10 to trunks
             trunks = get_trunk_interfaces(shell)
             configure_trunk_vlan(shell, trunks)
 
@@ -320,16 +351,65 @@ def main():
             exit_device_session(shell)
             logger.info(f"[SUCCESS] {target} configured")
             success.append(target)
+            idx += 1  # proceed to next device
 
-        except Exception as e:
-            logger.error(f"[FAILED] {target}: {e}")
-            # Try to clean up session so we’re back at agg
+        except (NetworkConnectionError, OSError) as e:
+            msg = str(e)
+            dropped = ("Aggregation shell closed" in msg) or ("Socket is closed" in msg) or ("aggregation" in msg.lower())
+            logger.error(f"[FAILED] {target}: {msg if msg else type(e).__name__}")
+
+            # Try to clean up current nested session if any
             try:
                 if not shell.closed:
                     cleanup_failed_session(shell)
             except:
                 pass
-            failed.append(target)
+
+            if dropped:
+                # reconnect to agg and retry same device once
+                logger.info("[RECOVER] Reconnecting to aggregation switch...")
+                try:
+                    try:
+                        client.close()
+                    except:
+                        pass
+                    client, shell = connect_to_agg()
+                    logger.info("[RECOVER] Reconnected. Retrying current device once.")
+                    retry_after_reconnect = True
+                except Exception as re:
+                    logger.error(f"[RECOVER] Reconnect failed: {re}")
+                    failed.append(target)
+                    idx += 1  # skip to next device
+            else:
+                failed.append(target)
+                idx += 1  # skip to next device
+
+            # perform the single retry if we reconnected OK
+            if retry_after_reconnect:
+                try:
+                    if not verify_connectivity(shell, target):
+                        raise NetworkConnectionError("Unreachable after reconnect")
+                    establish_device_session(shell, target)
+                    try:
+                        backup_config(shell, target)
+                    except Exception as be:
+                        logger.warning(f"[BACKUP] Skipped (error: {be})")
+                    apply_vlan10_config(shell, vip, netmask)
+                    trunks = get_trunk_interfaces(shell)
+                    configure_trunk_vlan(shell, trunks)
+                    exit_device_session(shell)
+                    logger.info(f"[SUCCESS] {target} configured (after reconnect)")
+                    success.append(target)
+                except Exception as e2:
+                    logger.error(f"[FAILED] {target} after reconnect: {e2}")
+                    try:
+                        if not shell.closed:
+                            cleanup_failed_session(shell)
+                    except:
+                        pass
+                    failed.append(target)
+                finally:
+                    idx += 1  # move on after retry
 
         time.sleep(1)
 
