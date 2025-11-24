@@ -11,9 +11,9 @@ client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 try:
     print("[1/6] Connecting...")
     client.connect(
-        '192.168.1.8',
-        username='admin',
-        password='cisco',
+        '',
+        username='',
+        password='',
         look_for_keys=False,
         allow_agent=False,
         timeout=10
