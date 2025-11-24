@@ -24,9 +24,9 @@ from datetime import datetime
 from collections import defaultdict
 
 # ========================= USER CONFIG =========================
-AGG_IP = "192.168.100.11"
-USERNAME = "admin"
-PASSWORD = "cisco"
+AGG_IP = ""
+USERNAME = ""
+PASSWORD = ""
 TIMEOUT = 10
 MAX_READ = 65535
 
