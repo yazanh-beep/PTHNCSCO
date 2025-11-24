@@ -261,32 +261,32 @@ class NetworkDiscovery:
         )
 
     # ── Hostname normalization ────────────────────────────────────────────
-def normalize_hostname(self, hostname):
-    """
-    Normalize hostname by stripping domain suffixes only.
-    Preserves unique device identifiers in the hostname.
-    
-    Examples:
-        "CL-SCL-CNO1A-SMSACC1.4-1-12.CAM.INT" -> "CL-SCL-CNO1A-SMSACC1.4-1-12"
-        "CL-SCL-CNO1A-SMSACC1.1K-1-17.CAM.INT" -> "CL-SCL-CNO1A-SMSACC1.1K-1-17"
-        "AGG-SW1.example.com" -> "AGG-SW1.example.com" (if not in known domains)
-    """
-    if not hostname:
+    def normalize_hostname(self, hostname):
+        """
+        Normalize hostname by stripping domain suffixes only.
+        Preserves unique device identifiers in the hostname.
+        
+        Examples:
+            "CL-SCL-CNO1A-SMSACC1.4-1-12.CAM.INT" -> "CL-SCL-CNO1A-SMSACC1.4-1-12"
+            "CL-SCL-CNO1A-SMSACC1.1K-1-17.CAM.INT" -> "CL-SCL-CNO1A-SMSACC1.1K-1-17"
+            "AGG-SW1.example.com" -> "AGG-SW1.example.com" (if not in known domains)
+        """
+        if not hostname:
+            return hostname
+        
+        # List of known domain suffixes to remove
+        domain_suffixes = [
+            r'\.CAM\.INT$',
+            r'\.cam\.int$',
+            # Add more domain patterns here if needed
+            # r'\.example\.com$',
+        ]
+        
+        # Try to remove each known domain suffix
+        for suffix_pattern in domain_suffixes:
+            hostname = re.sub(suffix_pattern, '', hostname, flags=re.IGNORECASE)
+        
         return hostname
-    
-    # List of known domain suffixes to remove
-    domain_suffixes = [
-        r'\.CAM\.INT$',
-        r'\.cam\.int$',
-        # Add more domain patterns here if needed
-        # r'\.example\.com$',
-    ]
-    
-    # Try to remove each known domain suffix
-    for suffix_pattern in domain_suffixes:
-        hostname = re.sub(suffix_pattern, '', hostname, flags=re.IGNORECASE)
-    
-    return hostname
     # ── Device role helper ────────────────────────────────────────────────
     def determine_device_role(self, hostname):
         up = (hostname or "").upper()
