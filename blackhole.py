@@ -7,9 +7,9 @@ import re
 from datetime import datetime
 
 # USER CONFIG
-AGG_IP = "192.168.1.11"
-USERNAME = "admin"
-PASSWORD = "cisco"
+AGG_IP = ""
+USERNAME = ""
+PASSWORD = ""
 TIMEOUT = 20
 MAX_READ = 65535
 MAX_RETRIES = 3
