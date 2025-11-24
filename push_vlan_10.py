@@ -7,9 +7,9 @@ import ipaddress
 from typing import List
 
 # ========================= USER CONFIG =========================
-AGG_IP = "192.168.100.11"      # Seed aggregation switch
-USERNAME = "admin"
-PASSWORD = "cisco"
+AGG_IP = ""      # Seed aggregation switch
+USERNAME = ""
+PASSWORD = ""
 
 TIMEOUT = 10
 MAX_READ = 65535
