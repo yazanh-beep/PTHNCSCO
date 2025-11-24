@@ -178,7 +178,15 @@ def send_cmd(shell, cmd, timeout=TIMEOUT, silent=False):
     try:
         _ = _drain(shell)
         shell.send(cmd + "\n")
-        return expect_prompt(shell, timeout=timeout)
+        output = expect_prompt(shell, timeout=timeout)
+        
+        # Clean backspace characters from output
+        # Replace \b followed by any character with nothing (simulates backspace)
+        output = re.sub(r'.\b', '', output)
+        # Remove any remaining standalone backspaces
+        output = output.replace('\b', '')
+        
+        return output
     except Exception as e:
         logger.error(f"Exception in send_cmd('{cmd}'): {e}")
         raise NetworkConnectionError(f"Send command failed: {e}", reconnect_needed=True)
@@ -687,29 +695,93 @@ def get_interface_status(shell):
     return up_interfaces
 
 def parse_mac_table_interface(raw):
+    """
+    Parse MAC address table output.
+    Enhanced to handle command echoes, backspaces, and validate MAC addresses.
+    """
     entries = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if (not line or "Mac Address Table" in line or line.startswith("---") or
-            line.lower().startswith("vlan") or line.startswith("Total") or
-            "Mac Address" in line or "----" in line):
+    
+    # Split into lines and start processing after we see the table header
+    lines = raw.splitlines()
+    in_table = False
+    
+    for line in lines:
+        line_clean = line.strip()
+        
+        # Skip empty lines
+        if not line_clean:
             continue
-        parts = re.split(r"\s+", line)
-        if len(parts) >= 4:
-            vlan = parts[0]
-            mac = parts[1]
-            port = None
-            mac_type_parts = []
-            for i in range(2, len(parts)):
-                if re.match(r'^(Gi|Te|Fa|Et|Po|Vl)', parts[i], re.IGNORECASE):
-                    port = parts[i]
-                    break
-                else:
-                    mac_type_parts.append(parts[i])
-            mac_type = " ".join(mac_type_parts)
-            # Accept any MAC entry with a port (DYNAMIC, STATIC, etc.)
-            if port:
-                entries.append({"vlan": vlan, "mac_address": mac, "type": mac_type, "port": port})
+        
+        # Skip command echo (may contain backspaces \b)
+        if '\b' in line_clean or 'show mac' in line_clean.lower():
+            continue
+        
+        # Detect table header - start processing after this
+        if "Mac Address Table" in line_clean:
+            in_table = False  # Wait for the actual column headers
+            continue
+        
+        # Detect column headers
+        if "Vlan" in line_clean and "Mac Address" in line_clean and "Type" in line_clean:
+            in_table = True
+            continue
+        
+        # Skip separator lines
+        if line_clean.startswith("---") or line_clean.startswith("====") or "----" in line_clean:
+            continue
+        
+        # Skip total/summary lines
+        if "Total" in line_clean or "All" in line_clean:
+            continue
+        
+        # Only process if we're in the table section
+        if not in_table:
+            continue
+        
+        # Parse the MAC table entry
+        parts = re.split(r"\s+", line_clean)
+        
+        # Need at least 4 parts: VLAN, MAC, Type, Port
+        if len(parts) < 4:
+            continue
+        
+        vlan = parts[0]
+        mac = parts[1]
+        
+        # Validate VLAN (should be numeric or a valid VLAN identifier)
+        if not vlan.isdigit() and not vlan.startswith("Vlan"):
+            continue
+        
+        # Validate MAC address format (should be xxxx.xxxx.xxxx)
+        if not re.match(r'^[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}$', mac):
+            logger.debug(f"Skipping invalid MAC format: {mac}")
+            continue
+        
+        # Find the port (starts with Gi, Te, Fa, etc.)
+        port = None
+        mac_type_parts = []
+        
+        for i in range(2, len(parts)):
+            if re.match(r'^(Gi|Te|Fa|Et|Po|Vl|Tw|Fo)', parts[i], re.IGNORECASE):
+                port = parts[i]
+                break
+            else:
+                mac_type_parts.append(parts[i])
+        
+        mac_type = " ".join(mac_type_parts)
+        
+        # Accept any entry with a valid port (DYNAMIC, STATIC, etc.)
+        if port:
+            logger.debug(f"Found MAC: VLAN={vlan}, MAC={mac}, Type={mac_type}, Port={port}")
+            entries.append({
+                "vlan": vlan,
+                "mac_address": mac,
+                "type": mac_type,
+                "port": port
+            })
+        else:
+            logger.debug(f"Skipping entry with no port: {line_clean}")
+    
     return entries
 
 def normalize_interface_name(intf):
