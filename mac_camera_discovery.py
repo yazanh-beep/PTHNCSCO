@@ -5,15 +5,20 @@ import re
 import json
 import csv
 import logging
+import sys
+import io
 from datetime import datetime
 from collections import deque
 
-# --- USER CONFIG -------------------------------------------------------------
-SEED_SWITCH_IP = ""
+# ============================================================================
+# USER CONFIG
+# ============================================================================
+
+SEED_SWITCH_IP = "192.168.1.18"
 TIMEOUT = 150
 MAX_READ = 65535
 CREDENTIAL_SETS = [
-    {"username": "", "password": "", "enable": ""},
+    {"username": "admin", "password": "/2/_HKX6YvCGMwzAdJp", "enable": ""},
 ]
 AGG_MAX_RETRIES = 3
 AGG_RETRY_DELAY = 5
@@ -32,7 +37,66 @@ MAC_POLL_INITIAL_WAIT = 15       # Initial wait after clearing table
 MAC_POLL_BATCH_SIZE = 100        # Ports per batch
 MAC_POLL_BATCH_PAUSE = 2         # Pause between batches
 MAC_POLL_HARD_TIMEOUT = 600      # 10 minutes absolute maximum per port (safety net)
-# -----------------------------------------------------------------------------
+
+# ============================================================================
+# IDLE-SAFE LOGGING CONFIGURATION
+# ============================================================================
+
+class IDLESafeHandler(logging.StreamHandler):
+    """Custom handler that's safe for IDLE and handles Unicode properly"""
+    def __init__(self):
+        super().__init__(sys.stdout)
+        self.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # Replace problematic Unicode characters with ASCII equivalents
+            msg = msg.replace('✓', 'OK')
+            msg = msg.replace('⏳', 'WAIT')
+            msg = msg.replace('○', 'SKIP')
+            msg = msg.replace('✗', 'ERROR')
+            msg = msg.replace('⊗', 'X')
+            # Print with flush to ensure immediate output
+            print(msg, flush=True)
+        except Exception:
+            self.handleError(record)
+
+# Detect if running in IDLE
+running_in_idle = 'idlelib.run' in sys.modules
+
+log_filename = f"camera_discovery_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+if running_in_idle:
+    # IDLE: Use custom safe handler + file
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_filename, encoding='utf-8'),
+            IDLESafeHandler()  # Custom IDLE-safe handler
+        ]
+    )
+    print("="*80)
+    print("RUNNING IN IDLE MODE - LIVE LOGGING ENABLED")
+    print(f"Logs saved to: {log_filename}")
+    print("="*80)
+else:
+    # Normal: Standard logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_filename, encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# GLOBAL VARIABLES
+# ============================================================================
 
 PROMPT_RE = re.compile(r"(?m)^[^\r\n#>\s][^\r\n#>]*[>#]\s?$")
 
@@ -63,17 +127,6 @@ discovery_stats = {
     "failure_details": []
 }
 
-log_filename = f"camera_discovery_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_filename),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
 agg_client = None
 agg_shell = None
 agg_creds = None
@@ -81,6 +134,10 @@ agg_hostname = None
 session_depth = 0
 device_creds = {}
 hostname_to_ip = {}
+
+# ============================================================================
+# HELPER CLASSES AND FUNCTIONS
+# ============================================================================
 
 class NetworkConnectionError(Exception):
     def __init__(self, message, retry_allowed=False, reconnect_needed=False):
@@ -230,49 +287,6 @@ def is_aggregate_switch(hostname):
 
 def is_server_switch(hostname):
     return determine_switch_type(hostname) == "SERVER"
-
-def _interactive_hop(shell, ip, username, password, overall_timeout=90):
-    start = time.time()
-    buf = ""
-    def feed(s):
-        try:
-            shell.send(s)
-        except Exception:
-            pass
-    while time.time() - start < overall_timeout:
-        time.sleep(0.15)
-        if shell.recv_ready():
-            try:
-                chunk = shell.recv(MAX_READ).decode("utf-8", "ignore")
-            except Exception:
-                chunk = ""
-            if chunk:
-                buf += chunk
-        if PROMPT_RE.search(buf):
-            return True, buf
-        low = buf.lower()
-        if "(yes/no)" in low or "yes/no" in low:
-            feed("yes\n")
-            continue
-        if "username:" in low:
-            feed(username + "\n")
-            continue
-        if "password:" in low:
-            feed(password + "\n")
-            time.sleep(0.5)
-            continue
-        fail_keys = (
-            "connection refused", "unable to connect", "timed out",
-            "no route to host", "host is unreachable",
-            "closed by foreign host", "connection closed by",
-            "authentication failed", "permission denied",
-            "% bad passwords", "% login invalid"
-        )
-        if any(k in low for k in fail_keys):
-            return False, buf
-        if (time.time() - start) % 5 < 0.2:
-            feed("\n")
-    return False, buf
 
 def _connect_to_aggregate_internal():
     global agg_client, agg_shell, agg_creds, agg_hostname
@@ -596,11 +610,11 @@ def parse_lldp_neighbors(output):
         if neighbor["sys_descr"]:
             sys_desc_lower = neighbor["sys_descr"].lower()
             if "cisco ios" not in sys_desc_lower and "cisco nx-os" not in sys_desc_lower:
-                logger.debug(f"  ⊗ Skipping non-Cisco LLDP device: {neighbor.get('hostname', 'Unknown')} "
+                logger.debug(f"  X Skipping non-Cisco LLDP device: {neighbor.get('hostname', 'Unknown')} "
                            f"(Desc: {neighbor['sys_descr'][:50]}...)")
                 continue
         else:
-            logger.debug(f"  ⊗ Skipping LLDP device without System Description: {neighbor.get('hostname', 'Unknown')}")
+            logger.debug(f"  X Skipping LLDP device without System Description: {neighbor.get('hostname', 'Unknown')}")
             continue
         if not neighbor["hostname"] and neighbor["sys_descr"]:
             m = re.search(r'(\S+)\s+Software', neighbor["sys_descr"], re.I)
@@ -619,10 +633,10 @@ def parse_lldp_neighbors(output):
                 neighbor["hostname"] = f"LLDP-Device-{neighbor['mgmt_ip']}"
                 logger.warning(f"No hostname in LLDP for {neighbor['mgmt_ip']}")
             neighbors.append(neighbor)
-            logger.debug(f"  ✓ Cisco LLDP neighbor: {neighbor['hostname']} ({neighbor['mgmt_ip']}) "
-                        f"via {neighbor['local_intf']} ↔ {neighbor['remote_intf']}")
+            logger.debug(f"  OK Cisco LLDP neighbor: {neighbor['hostname']} ({neighbor['mgmt_ip']}) "
+                        f"via {neighbor['local_intf']} <-> {neighbor['remote_intf']}")
         else:
-            logger.debug(f"  ⊗ Skipping LLDP neighbor without mgmt IP: {neighbor.get('hostname', 'Unknown')}")
+            logger.debug(f"  X Skipping LLDP neighbor without mgmt IP: {neighbor.get('hostname', 'Unknown')}")
     return neighbors
 
 def get_interface_status(shell):
@@ -787,7 +801,7 @@ def get_uplink_ports_from_neighbors(shell):
                     if uplink_norm not in uplink_ports_normalized:
                         uplink_ports.append(uplink_port)
                         uplink_ports_normalized.add(uplink_norm)
-                        logger.info(f"UPLINK DETECTED: {uplink_port} → {hostname} (via {nbr.get('source','?')})")
+                        logger.info(f"UPLINK DETECTED: {uplink_port} -> {hostname} (via {nbr.get('source','?')})")
                     else:
                         logger.debug(f"UPLINK DUPLICATE: {uplink_port}")
                 else:
@@ -845,25 +859,25 @@ def poll_port_for_mac(shell, interface, max_attempts=MAC_POLL_MAX_ATTEMPTS, inte
             
             if entries:
                 # SUCCESS - Found MAC address
-                logger.info(f"  [✓] {interface}: MAC found (attempt {attempt}, {elapsed:.1f}s)")
+                logger.info(f"  [OK] {interface}: MAC found (attempt {attempt}, {elapsed:.1f}s)")
                 return select_camera_mac(entries, interface)
             
             # Log progress periodically
             time_since_last_log = elapsed - (last_log_time - start_time)
             if attempt <= 3:
                 # Always log first 3 attempts
-                logger.info(f"  [⏳] {interface}: No MAC yet (attempt {attempt})")
+                logger.info(f"  [WAIT] {interface}: No MAC yet (attempt {attempt})")
                 last_log_time = time.time()
             elif time_since_last_log >= 30:
                 # Log every 30 seconds after that
-                logger.info(f"  [⏳] {interface}: Still waiting... (attempt {attempt}, {elapsed:.1f}s elapsed)")
+                logger.info(f"  [WAIT] {interface}: Still waiting... (attempt {attempt}, {elapsed:.1f}s elapsed)")
                 last_log_time = time.time()
             
             # Keep polling - sleep and continue
             time.sleep(interval)
                 
         except Exception as e:
-            logger.error(f"  [✗] {interface}: Exception during polling: {e}")
+            logger.error(f"  [ERROR] {interface}: Exception during polling: {e}")
             # Even on exception, keep trying after a brief pause
             time.sleep(interval)
             continue
@@ -1192,11 +1206,11 @@ def discover_aggregate_neighbors(shell, current_agg_hostname):
                 mgmt_ip = hostname_to_ip.get(hostname)
                 if mgmt_ip:
                     aggregate_neighbors.append({"hostname": hostname, "mgmt_ip": mgmt_ip})
-                    logger.info(f"  ✓ Added: {hostname} ({mgmt_ip})")
+                    logger.info(f"  OK Added: {hostname} ({mgmt_ip})")
                 else:
-                    logger.warning(f"  ✗ No management IP for {hostname}")
+                    logger.warning(f"  X No management IP for {hostname}")
             else:
-                logger.info(f"  ✗ Skipping (same as current)")
+                logger.info(f"  X Skipping (same as current)")
     logger.info(f"Total aggregate neighbors found: {len(aggregate_neighbors)}")
     return aggregate_neighbors
 
