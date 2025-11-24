@@ -10,7 +10,7 @@ from typing import Tuple, List, Optional
 # ========================= USER CONFIG =========================
 AGG_IP = ""
 USERNAME = ""
-PASSWORD = "cisco"
+PASSWORD = ""
 TIMEOUT = 10
 MAX_READ = 65535
 
