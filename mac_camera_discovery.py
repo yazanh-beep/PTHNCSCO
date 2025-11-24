@@ -707,7 +707,8 @@ def parse_mac_table_interface(raw):
                 else:
                     mac_type_parts.append(parts[i])
             mac_type = " ".join(mac_type_parts)
-            if port and "DYNAMIC" in mac_type.upper():
+            # Accept any MAC entry with a port (DYNAMIC, STATIC, etc.)
+            if port:
                 entries.append({"vlan": vlan, "mac_address": mac, "type": mac_type, "port": port})
     return entries
 
