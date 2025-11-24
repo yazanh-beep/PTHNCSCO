@@ -19,11 +19,19 @@ AGG_MAX_RETRIES = 3
 AGG_RETRY_DELAY = 5
 CDP_LLDP_TIMEOUT = 35
 
-# --- RETRY CONFIGURATION (NEW) ---
-SSH_HOP_RETRY_ATTEMPTS = 5  # Number of retry attempts for SSH hops
-SSH_HOP_RETRY_BASE_DELAY = 2  # Base delay between retries (seconds)
-SSH_HOP_USE_EXPONENTIAL_BACKOFF = True  # Use exponential backoff (2s, 4s, 8s, 16s...)
-SSH_HOP_VERIFY_ROUTE = True  # Test ping before SSH attempt
+# --- RETRY CONFIGURATION ---
+SSH_HOP_RETRY_ATTEMPTS = 5
+SSH_HOP_RETRY_BASE_DELAY = 2
+SSH_HOP_USE_EXPONENTIAL_BACKOFF = True
+SSH_HOP_VERIFY_ROUTE = True
+
+# --- MAC TABLE POLLING CONFIGURATION ---
+MAC_POLL_INTERVAL = 5           # Seconds between checks
+MAC_POLL_MAX_ATTEMPTS = 10      # Max attempts per port (reduced from 20)
+MAC_POLL_INITIAL_WAIT = 10      # Initial wait after clearing table
+MAC_POLL_BATCH_SIZE = 10        # Ports per batch
+MAC_POLL_BATCH_PAUSE = 2        # Pause between batches
+MAC_POLL_HARD_TIMEOUT = 30      # Hard limit per port (seconds)
 # -----------------------------------------------------------------------------
 
 PROMPT_RE = re.compile(r"(?m)^[^\r\n#>\s][^\r\n#>]*[>#]\s?$")
@@ -32,7 +40,7 @@ visited_switches = set()
 discovered_aggregates = set()
 aggregate_hostnames = {}
 camera_data = []
-failed_switches = []  # Track switches that failed for retry from seed
+failed_switches = []
 
 discovery_stats = {
     "switches_attempted": 0,
@@ -45,6 +53,7 @@ discovery_stats = {
     "total_cameras_found": 0,
     "switches_retried_from_seed": 0,
     "switches_recovered_on_retry": 0,
+    "total_ports_no_mac": 0,
     "switches_by_type": {
         "EDGE": {"attempted": 0, "successful": 0, "failed": 0},
         "SERVER": {"attempted": 0, "successful": 0, "failed": 0},
@@ -342,115 +351,65 @@ def reconnect_to_aggregate(reason=""):
             time.sleep(AGG_RETRY_DELAY)
     raise NetworkConnectionError(f"Failed to reconnect: {last_err}", reconnect_needed=True)
 
-# ============================================================================
-# NEW RETRY LOGIC FUNCTIONS
-# ============================================================================
-
 def verify_ip_reachable_quick(target_ip, shell, timeout=3):
-    """
-    Quick ping test to verify IP is reachable.
-    Returns True if reachable, False otherwise.
-    """
     try:
         logger.debug(f"[PING] Testing {target_ip}...")
         ping_out = send_cmd(shell, f"ping {target_ip} timeout 1 repeat 2", timeout=timeout, silent=True)
-        
-        # Check for any successful replies
         if re.search(r"Success rate is [1-9]|!+|\d+ packets received", ping_out):
             logger.debug(f"[PING] {target_ip} is reachable")
             return True
-        
         logger.debug(f"[PING] {target_ip} not reachable")
         return False
-        
     except Exception as e:
         logger.debug(f"[PING] Error testing reachability: {e}")
-        return True  # Assume reachable if test fails
-
+        return True
 
 def cleanup_and_return_to_parent(expected_parent_hostname, max_attempts=3):
-    """
-    Ensure we're back at the parent switch.
-    Handles cases where session depth is confused.
-    
-    Returns:
-        True if successfully at parent, False otherwise
-    """
     global agg_shell, session_depth
-    
     for attempt in range(1, max_attempts + 1):
         try:
             current_hostname = get_hostname(agg_shell)
-            
             if current_hostname == expected_parent_hostname:
                 logger.debug(f"[CLEANUP] Already at parent: {expected_parent_hostname}")
                 return True
-            
             logger.warning(f"[CLEANUP] At {current_hostname}, need to return to {expected_parent_hostname}")
             logger.info(f"[CLEANUP] Sending exit command (attempt {attempt}/{max_attempts})")
-            
-            # Try to exit
             agg_shell.send("exit\n")
             time.sleep(1)
             output = _drain(agg_shell)
-            
-            # Check if connection closed (we exited too far)
             if agg_shell.closed or "closed by" in output.lower():
                 logger.error(f"[CLEANUP] Connection closed - exited too far!")
                 return False
-            
-            # Verify hostname
             time.sleep(0.5)
             new_hostname = get_hostname(agg_shell)
-            
             if new_hostname == expected_parent_hostname:
                 logger.info(f"[CLEANUP] Successfully returned to {expected_parent_hostname}")
                 session_depth = max(0, session_depth - 1)
                 return True
-            
         except Exception as e:
             logger.error(f"[CLEANUP] Exception: {e}")
-    
     logger.error(f"[CLEANUP] Failed to return to parent after {max_attempts} attempts")
     return False
 
-
 def attempt_ssh_hop(target_ip, parent_hostname, expected_hostname=None, attempt_number=1):
-    """
-    Single SSH hop attempt with detailed result reporting.
-    """
     global agg_shell, session_depth, device_creds, hostname_to_ip
-    
-    # Try each credential set
     for cred_idx, cred_set in enumerate(CREDENTIAL_SETS, 1):
         username = cred_set["username"]
         password = cred_set["password"]
         enable_pw = cred_set.get("enable", "")
-        
         logger.debug(f"[HOP] Trying credentials {cred_idx}/{len(CREDENTIAL_SETS)}")
-        
         try:
-            # Send SSH command
             agg_shell.send(f"ssh -l {username} {target_ip}\n")
             time.sleep(2)
-            
             output = ""
             timeout_time = time.time() + 45
             password_sent = False
-            
             while time.time() < timeout_time:
                 if not agg_shell or agg_shell.closed:
-                    return {
-                        "success": False,
-                        "reason": "shell_closed",
-                        "fatal": True
-                    }
-                
+                    return {"success": False, "reason": "shell_closed", "fatal": True}
                 if agg_shell.recv_ready():
                     chunk = agg_shell.recv(MAX_READ).decode("utf-8", "ignore")
                     output += chunk
-                    
-                    # Handle password prompt
                     if re.search(r"[Pp]assword:", output) and not password_sent:
                         logger.debug(f"[HOP] Sending password")
                         agg_shell.send(password + "\n")
@@ -458,148 +417,82 @@ def attempt_ssh_hop(target_ip, parent_hostname, expected_hostname=None, attempt_
                         time.sleep(1)
                         output = ""
                         continue
-                    
-                    # Handle SSH key confirmation
                     if re.search(r"\(yes/no\)", output):
                         logger.debug(f"[HOP] Accepting SSH key")
                         agg_shell.send("yes\n")
                         time.sleep(0.5)
                         continue
-                    
-                    # Handle connection errors
                     if re.search(r"Connection refused|Connection timed out|No route to host", output, re.IGNORECASE):
                         logger.debug(f"[HOP] Connection error in output")
                         cleanup_failed_session()
-                        return {
-                            "success": False,
-                            "reason": "connection_refused"
-                        }
-                    
-                    # Check for authentication failure
+                        return {"success": False, "reason": "connection_refused"}
                     if re.search(r"Authentication failed|Permission denied|Access denied|Login invalid", output, re.IGNORECASE):
                         logger.debug(f"[HOP] Authentication failed with credential {cred_idx}")
                         cleanup_failed_session()
-                        continue  # ✅ CHANGED: Try next credential set
-                    
-                    # Check for prompt (potential success)
+                        continue
                     if PROMPT_RE.search(output):
                         logger.debug(f"[HOP] Prompt detected")
                         time.sleep(0.5)
-                        
-                        # CRITICAL: Verify hostname changed
                         reached_hostname = get_hostname(agg_shell)
                         logger.debug(f"[HOP] Parent: {parent_hostname}, Reached: {reached_hostname}")
-                        
                         if reached_hostname == parent_hostname:
-                            # FAILURE: We're still on the same switch!
                             logger.warning(f"[HOP] HOSTNAME UNCHANGED with credential {cred_idx} - still on {parent_hostname}")
                             cleanup_failed_session()
-                            continue  # ✅ CHANGED: Try next credential set
-                        
-                        # Verify expected hostname if provided
+                            continue
                         if expected_hostname and reached_hostname != expected_hostname:
                             logger.warning(f"[HOP] Hostname mismatch: expected '{expected_hostname}', got '{reached_hostname}'")
-                        
-                        # SUCCESS!
                         logger.info(f"[HOP] Successfully reached {reached_hostname} at {target_ip} using credential {cred_idx}")
-                        
-                        # Enter enable mode
                         enable_candidates = [enable_pw, password, ""]
                         if not _ensure_enable(agg_shell, enable_candidates, timeout=10):
                             logger.warning(f"[HOP] Could not enter enable mode")
-                        
-                        # Set terminal length
                         send_cmd(agg_shell, "terminal length 0", timeout=5, silent=True)
-                        
-                        # Update tracking
                         session_depth += 1
                         device_creds[target_ip] = cred_set
                         hostname_to_ip[reached_hostname] = target_ip
-                        
-                        return {
-                            "success": True,
-                            "hostname": reached_hostname
-                        }
-                
+                        return {"success": True, "hostname": reached_hostname}
                 time.sleep(0.1)
-            
-            # Timeout reached for this credential
             logger.debug(f"[HOP] Timeout with credential {cred_idx}")
             cleanup_failed_session()
-            # Continue to next credential (implicit)
-            
         except Exception as e:
             logger.error(f"[HOP] Exception during SSH with credential {cred_idx}: {e}")
             cleanup_failed_session()
-            continue  # ✅ Try next credential
-    
-    # All credentials failed
+            continue
     logger.warning(f"[HOP] All {len(CREDENTIAL_SETS)} credential sets failed for {target_ip}")
-    return {
-        "success": False,
-        "reason": "auth_failed_all_credentials"
-    }
-
+    return {"success": False, "reason": "auth_failed_all_credentials"}
 
 def ssh_to_device(target_ip, expected_hostname=None, parent_hostname=None):
-    """
-    SSH from current switch to target IP with retry logic and hostname verification.
-    
-    Args:
-        target_ip: IP address to connect to
-        expected_hostname: Expected hostname of target device (optional)
-        parent_hostname: Hostname of current device (for verification)
-    
-    Returns:
-        True on success, False on failure after all retries
-    """
     global agg_shell, session_depth, device_creds, hostname_to_ip
-    
-    # Get current hostname if not provided
     if parent_hostname is None:
         try:
             parent_hostname = get_hostname(agg_shell) or agg_hostname or "UNKNOWN"
         except Exception:
             parent_hostname = agg_hostname or "UNKNOWN"
-    
     logger.debug(f"[RETRY] Attempting SSH to {target_ip} from {parent_hostname}")
-    
-    # Check if we're already on the target switch
     try:
         ip_brief_out = send_cmd(agg_shell, "show ip interface brief", timeout=10, silent=True)
         for line in ip_brief_out.splitlines():
             if target_ip in line and ("up" in line.lower() or "administratively" in line.lower()):
                 logger.info(f"Target IP {target_ip} belongs to current switch {parent_hostname} - already connected")
                 logger.info(f"This is not a separate device to SSH to - it's an interface on current switch")
-                return None  # Return None to indicate "already here, skip this"
+                return None
     except Exception as e:
         logger.debug(f"Could not check local IPs: {e}")
-    
     for attempt in range(1, SSH_HOP_RETRY_ATTEMPTS + 1):
-        # Calculate delay for this attempt (exponential backoff)
         if attempt > 1:
             if SSH_HOP_USE_EXPONENTIAL_BACKOFF:
                 delay = SSH_HOP_RETRY_BASE_DELAY * (2 ** (attempt - 2))
             else:
                 delay = SSH_HOP_RETRY_BASE_DELAY
-            
             logger.info(f"[RETRY] Waiting {delay}s before attempt {attempt}/{SSH_HOP_RETRY_ATTEMPTS}...")
             time.sleep(delay)
-        
         logger.info(f"[RETRY] SSH hop attempt {attempt}/{SSH_HOP_RETRY_ATTEMPTS} to {target_ip}")
-        
-        # Optional: Verify routing/reachability before attempting SSH
         if SSH_HOP_VERIFY_ROUTE and attempt == 1:
             if not verify_ip_reachable_quick(target_ip, agg_shell):
                 logger.warning(f"[RETRY] {target_ip} not reachable via ping")
-        
-        # Ensure we're in a clean state before retry
         if attempt > 1:
             if not verify_aggregate_connection():
                 logger.error(f"[RETRY] Lost connection to parent switch before attempt {attempt}")
                 raise NetworkConnectionError("Lost parent connection", reconnect_needed=True)
-            
-            # Make sure we're back at parent hostname
             current_host = get_hostname(agg_shell)
             if current_host != parent_hostname:
                 logger.warning(f"[RETRY] Not at parent hostname ({current_host} != {parent_hostname})")
@@ -607,39 +500,24 @@ def ssh_to_device(target_ip, expected_hostname=None, parent_hostname=None):
                 if not cleanup_and_return_to_parent(parent_hostname):
                     logger.error(f"[RETRY] Could not return to parent switch")
                     raise NetworkConnectionError("Cannot return to parent", reconnect_needed=True)
-        
-        # Attempt the SSH hop
         result = attempt_ssh_hop(
             target_ip=target_ip,
             parent_hostname=parent_hostname,
             expected_hostname=expected_hostname,
             attempt_number=attempt
         )
-        
         if result["success"]:
             logger.info(f"[RETRY] SUCCESS on attempt {attempt}/{SSH_HOP_RETRY_ATTEMPTS}")
             return True
-        
-        # Log why this attempt failed
         failure_reason = result.get("reason", "Unknown")
         logger.warning(f"[RETRY] Attempt {attempt} failed: {failure_reason}")
-        
-        # Determine if we should retry based on failure type
         if result.get("fatal", False):
             logger.error(f"[RETRY] Fatal error - no retry possible")
             return False
-        
-        # Special handling for specific failure types
         if "hostname_unchanged" in failure_reason:
             logger.warning(f"[RETRY] Hostname didn't change - target may be unreachable or misconfigured")
-    
-    # All retries exhausted
     logger.error(f"[RETRY] Failed to connect to {target_ip} after {SSH_HOP_RETRY_ATTEMPTS} attempts")
     return False
-
-# ============================================================================
-# END NEW RETRY LOGIC FUNCTIONS
-# ============================================================================
 
 def exit_device():
     global agg_shell, session_depth
@@ -696,113 +574,102 @@ def parse_cdp_neighbors(output):
     return neighbors
 
 def parse_lldp_neighbors(output):
-    """
-    Parse LLDP neighbors - returns ONLY Cisco network devices (filters out cameras, phones, etc.)
-    """
     neighbors = []
-    
-    # Split on dashes separator (40 or more dashes)
     blocks = re.split(r'[-]{40,}', output)
-    
     for block in blocks:
         if not block.strip():
             continue
-        
-        # Skip header/footer blocks
         if "Capability codes:" in block or "Total entries" in block or "Device ID" in block:
             continue
-        
-        # Must have Local Intf to be a valid neighbor entry
         if "Local Intf:" not in block:
             continue
-        
-        neighbor = {
-            "hostname": None, 
-            "mgmt_ip": None, 
-            "local_intf": None, 
-            "remote_intf": None, 
-            "sys_descr": "", 
-            "source": "LLDP"
-        }
-        
-        # Extract local interface
+        neighbor = {"hostname": None, "mgmt_ip": None, "local_intf": None, "remote_intf": None, "sys_descr": "", "source": "LLDP"}
         if m := re.search(r'^Local Intf:\s*(\S+)', block, re.M):
             neighbor["local_intf"] = m.group(1)
-        
-        # Extract remote port ID
         if m := re.search(r'^Port id:\s*(\S+)', block, re.M | re.I):
             neighbor["remote_intf"] = m.group(1)
-        
-        # Extract system name (hostname)
         if m := re.search(r'^System Name:\s*(.+?)$', block, re.M):
             hostname = m.group(1).strip().strip('"').strip("'")
             neighbor["hostname"] = hostname
-        
-        # Extract system description - CRITICAL for filtering
         if m := re.search(r'^System Description:\s*\n([\s\S]+?)(?=^Time remaining:|^System Capabilities:|^Management Addresses:|$)', block, re.M):
             neighbor["sys_descr"] = m.group(1).strip()
-        
-        # FILTER: Skip non-Cisco devices (Axis cameras, IP phones, etc.)
         if neighbor["sys_descr"]:
             sys_desc_lower = neighbor["sys_descr"].lower()
-            # Only accept Cisco devices
             if "cisco ios" not in sys_desc_lower and "cisco nx-os" not in sys_desc_lower:
                 logger.debug(f"  ⊗ Skipping non-Cisco LLDP device: {neighbor.get('hostname', 'Unknown')} "
                            f"(Desc: {neighbor['sys_descr'][:50]}...)")
                 continue
         else:
-            # No system description - cannot verify it's Cisco, skip it
             logger.debug(f"  ⊗ Skipping LLDP device without System Description: {neighbor.get('hostname', 'Unknown')}")
             continue
-        
-        # If no hostname found in System Name, try extracting from System Description
         if not neighbor["hostname"] and neighbor["sys_descr"]:
             m = re.search(r'(\S+)\s+Software', neighbor["sys_descr"], re.I)
             if m:
                 neighbor["hostname"] = m.group(1)
-        
-        # Extract management IP address - try multiple patterns
-        # Pattern 1: Standard format
         if m := re.search(r'^Management Addresses:\s*\n\s*IP:\s*(\d+\.\d+\.\d+\.\d+)', block, re.M):
             neighbor["mgmt_ip"] = m.group(1)
-        
-        # Pattern 2: Single-line format
         if not neighbor["mgmt_ip"]:
             if m := re.search(r'Management Address.*?:\s*(\d+\.\d+\.\d+\.\d+)', block, re.I):
                 neighbor["mgmt_ip"] = m.group(1)
-        
-        # Pattern 3: IPv4 explicit
         if not neighbor["mgmt_ip"]:
             if m := re.search(r'IPv4:\s*(\d+\.\d+\.\d+\.\d+)', block, re.I):
                 neighbor["mgmt_ip"] = m.group(1)
-        
-        # Only add if we have minimum required fields
         if neighbor["mgmt_ip"]:
             if not neighbor["hostname"]:
                 neighbor["hostname"] = f"LLDP-Device-{neighbor['mgmt_ip']}"
                 logger.warning(f"No hostname in LLDP for {neighbor['mgmt_ip']}")
-            
             neighbors.append(neighbor)
             logger.debug(f"  ✓ Cisco LLDP neighbor: {neighbor['hostname']} ({neighbor['mgmt_ip']}) "
                         f"via {neighbor['local_intf']} ↔ {neighbor['remote_intf']}")
         else:
             logger.debug(f"  ⊗ Skipping LLDP neighbor without mgmt IP: {neighbor.get('hostname', 'Unknown')}")
-    
     return neighbors
 
 def get_interface_status(shell):
+    """
+    Get all UP physical interfaces from the switch.
+    Excludes: VLANs, Access Points, and other logical interfaces
+    """
     out = send_cmd(shell, "show ip interface brief", timeout=10)
     up_interfaces = []
+    
+    # Interfaces to exclude (virtual/logical/management)
+    excluded_prefixes = (
+        "Vlan", "Loopback", "Tunnel", "Null", 
+        "Port-channel", "Po",
+        "Ap", "AP",  # Access Point interfaces (CRITICAL FIX)
+        "Management", "Mgmt"
+    )
+    
     for line in out.splitlines():
         line = line.strip()
-        if not line or "Interface" in line or line.startswith("Vlan"):
+        if not line or "Interface" in line:
             continue
+        
         parts = re.split(r"\s+", line)
-        if len(parts) >= 5:
-            intf, status = parts[0], parts[4]
-            if status.lower() == "up":
-                if re.match(r"(Gig|Ten|FastEthernet|Ethernet)", intf, re.IGNORECASE):
+        if len(parts) >= 6:
+            intf = parts[0]
+            
+            # Skip excluded interface types
+            if intf.startswith(excluded_prefixes):
+                logger.debug(f"Skipping virtual/logical interface: {intf}")
+                continue
+            
+            # Handle "administratively down" case
+            if parts[4] == "administratively" and len(parts) >= 7:
+                status = "down"
+                protocol = parts[6]
+            else:
+                status = parts[4]
+                protocol = parts[5]
+            
+            # Only include physical interfaces that are up/up
+            if status.lower() == "up" and protocol.lower() == "up":
+                if re.match(r"(Gi|Te|Fa|Eth|Fo|Tw|"
+                           r"GigabitEthernet|TenGigabitEthernet|FastEthernet|"
+                           r"FourtyGig|FortyGig|TwentyFiveGig)", intf, re.IGNORECASE):
                     up_interfaces.append(intf)
+    
     return up_interfaces
 
 def parse_mac_table_interface(raw):
@@ -864,6 +731,10 @@ def is_same_interface(intf1, intf2):
     return False
 
 def get_uplink_ports_from_neighbors(shell):
+    """
+    Discover uplink ports using CDP and LLDP.
+    FIXED: Only excludes AGGREGATE switches, not SERVER switches.
+    """
     logger.info("Discovering uplink ports using CDP and LLDP...")
     uplink_ports = []
     uplink_ports_normalized = set()
@@ -905,8 +776,10 @@ def get_uplink_ports_from_neighbors(shell):
                         all_neighbors_by_hostname.setdefault(nbr["hostname"], []).append(nbr)
     else:
         logger.info("LLDP not enabled")
+    
+    # FIXED: Only mark AGGREGATE switches as uplinks (removed SERVER check)
     for hostname, links in all_neighbors_by_hostname.items():
-        if is_aggregate_switch(hostname) or is_server_switch(hostname):
+        if is_aggregate_switch(hostname):  # ONLY aggregate switches are uplinks
             for nbr in links:
                 uplink_port = nbr.get("local_intf")
                 if uplink_port:
@@ -920,7 +793,7 @@ def get_uplink_ports_from_neighbors(shell):
                 else:
                     logger.warning(f"Could not determine uplink port for {hostname}")
         else:
-            logger.debug(f"Skipping {hostname} (not AGG/SRV)")
+            logger.debug(f"Skipping {hostname} (not AGGREGATE)")
     logger.info(f"Total uplinks identified: {len(uplink_ports)}")
     return uplink_ports
 
@@ -938,60 +811,153 @@ def select_camera_mac(entries, interface):
         logger.warning(f"  {interface}: {count} MACs found - Taking first")
         return entries[0]
 
+def poll_port_for_mac(shell, interface, max_attempts=MAC_POLL_MAX_ATTEMPTS, interval=MAC_POLL_INTERVAL):
+    """
+    Poll a specific port until MAC address appears or timeout.
+    
+    Features:
+    - Hard timeout protection
+    - Early exit for empty ports
+    - Visible progress
+    - Exception handling
+    """
+    logger.info(f"  [POLL] {interface}")
+    
+    start_time = time.time()
+    consecutive_empty = 0
+    early_exit_threshold = 3
+    
+    for attempt in range(1, max_attempts + 1):
+        # Hard timeout check
+        elapsed = time.time() - start_time
+        if elapsed > MAC_POLL_HARD_TIMEOUT:
+            logger.warning(f"  [TIMEOUT] {interface}: Hard timeout at {MAC_POLL_HARD_TIMEOUT}s")
+            return None
+        
+        try:
+            cmd = f"show mac address-table interface {interface}"
+            mac_out = send_cmd(shell, cmd, timeout=10, silent=True)
+            entries = parse_mac_table_interface(mac_out)
+            
+            if entries:
+                elapsed = time.time() - start_time
+                logger.info(f"  [✓] {interface}: MAC found (attempt {attempt}, {elapsed:.1f}s)")
+                return select_camera_mac(entries, interface)
+            else:
+                consecutive_empty += 1
+                if attempt <= 3 or attempt % 2 == 1:
+                    logger.info(f"  [⏳] {interface}: Empty (attempt {attempt}/{max_attempts})")
+            
+            # Early exit for consistently empty ports
+            if consecutive_empty >= early_exit_threshold:
+                elapsed = time.time() - start_time
+                logger.info(f"  [○] {interface}: No device (checked {early_exit_threshold}x, {elapsed:.1f}s)")
+                return None
+            
+            if attempt < max_attempts:
+                time.sleep(interval)
+                
+        except Exception as e:
+            logger.error(f"  [✗] {interface}: Exception: {e}")
+            return None
+    
+    elapsed = time.time() - start_time
+    logger.warning(f"  [TIMEOUT] {interface}: No MAC after {max_attempts} attempts ({elapsed:.1f}s)")
+    return None
+
 def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
+    """
+    Enhanced camera discovery with per-port MAC polling and progress tracking.
+    """
     logger.info("="*80)
     logger.info(f"Scanning {switch_type} switch: {switch_hostname}")
     logger.info("="*80)
+    
+    overall_start = time.time()
+    
     logger.info("Clearing dynamic MAC address table...")
     send_cmd(shell, "clear mac address-table dynamic", timeout=10)
-    logger.info("Waiting 60 seconds for MAC table to repopulate...")
-    time.sleep(60)
-    logger.info("MAC table refresh complete")
+    
+    logger.info(f"Waiting {MAC_POLL_INITIAL_WAIT}s for initial MAC table repopulation...")
+    time.sleep(MAC_POLL_INITIAL_WAIT)
+    logger.info("Starting per-port MAC polling...")
+    
     uplink_ports = get_uplink_ports_from_neighbors(shell)
     if not uplink_ports:
         logger.warning(f"No uplink ports detected on {switch_hostname}")
     else:
         logger.info(f"Uplink ports to exclude: {uplink_ports}")
+    
     up_interfaces = get_interface_status(shell)
     logger.info(f"Found {len(up_interfaces)} UP interfaces total")
+    
     camera_count = 0
     scanned_count = 0
+    no_mac_count = 0
+    uplink_skip_count = 0
+    
+    ports_to_scan = []
     for intf in up_interfaces:
         is_uplink = False
         for upl in uplink_ports:
             if is_same_interface(intf, upl):
                 is_uplink = True
-                logger.info(f"SKIP: {intf} - UPLINK PORT")
+                logger.debug(f"SKIP: {intf} - UPLINK PORT")
+                uplink_skip_count += 1
                 break
-        if is_uplink:
-            continue
-        scanned_count += 1
-        cmd = f"show mac address-table interface {intf}"
-        mac_out = send_cmd(shell, cmd, timeout=10)
-        entries = parse_mac_table_interface(mac_out)
-        if entries:
-            selected_entry = select_camera_mac(entries, intf)
-            if selected_entry:
-                mac_formatted = convert_mac_format(selected_entry["mac_address"])
+        if not is_uplink:
+            ports_to_scan.append(intf)
+    
+    logger.info(f"Ports to scan for cameras: {len(ports_to_scan)}")
+    logger.info("")
+    
+    for batch_start in range(0, len(ports_to_scan), MAC_POLL_BATCH_SIZE):
+        batch = ports_to_scan[batch_start:batch_start + MAC_POLL_BATCH_SIZE]
+        batch_num = (batch_start // MAC_POLL_BATCH_SIZE) + 1
+        total_batches = (len(ports_to_scan) + MAC_POLL_BATCH_SIZE - 1) // MAC_POLL_BATCH_SIZE
+        
+        batch_start_time = time.time()
+        logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} ports)...")
+        
+        for idx, intf in enumerate(batch, 1):
+            scanned_count += 1
+            logger.info(f"  Port {batch_start + idx}/{len(ports_to_scan)}: {intf}")
+            
+            mac_entry = poll_port_for_mac(shell, intf)
+            
+            if mac_entry:
+                mac_formatted = convert_mac_format(mac_entry["mac_address"])
                 camera_info = {
                     "switch_name": switch_hostname,
                     "switch_type": switch_type,
-                    "port": selected_entry["port"],
+                    "port": mac_entry["port"],
                     "mac_address": mac_formatted,
-                    "vlan": selected_entry["vlan"]
+                    "vlan": mac_entry["vlan"]
                 }
                 camera_data.append(camera_info)
                 camera_count += 1
                 discovery_stats["total_cameras_found"] += 1
-                logger.info(f"  [+] Camera: {mac_formatted} on {selected_entry['port']} (VLAN {selected_entry['vlan']})")
-        else:
-            logger.debug(f"No dynamic MAC entries on {intf}")
+                logger.info(f"  [+] Camera: {mac_formatted} on {mac_entry['port']} (VLAN {mac_entry['vlan']})")
+            else:
+                no_mac_count += 1
+                discovery_stats["total_ports_no_mac"] += 1
+        
+        batch_elapsed = time.time() - batch_start_time
+        logger.info(f"  Batch {batch_num} complete: {len(batch)} ports in {batch_elapsed:.1f}s")
+        
+        if batch_start + MAC_POLL_BATCH_SIZE < len(ports_to_scan):
+            logger.info(f"  Pausing {MAC_POLL_BATCH_PAUSE}s before next batch...")
+            time.sleep(MAC_POLL_BATCH_PAUSE)
+    
+    overall_elapsed = time.time() - overall_start
     logger.info("")
     logger.info(f"Summary for {switch_hostname}:")
     logger.info(f"  - Total UP interfaces: {len(up_interfaces)}")
-    logger.info(f"  - Uplink ports excluded: {len(uplink_ports)}")
+    logger.info(f"  - Uplink ports excluded: {uplink_skip_count}")
     logger.info(f"  - Ports scanned: {scanned_count}")
     logger.info(f"  - Cameras found: {camera_count}")
+    logger.info(f"  - Ports with no MAC: {no_mac_count}")
+    logger.info(f"  - Total time: {overall_elapsed:.1f}s")
     logger.info("="*80)
 
 def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=False):
@@ -1646,6 +1612,7 @@ def main():
     logger.info(f"Aggregate reconnections: {discovery_stats['aggregates_reconnections']}")
     logger.info(f"Switches retried from seed: {discovery_stats['switches_retried_from_seed']}")
     logger.info(f"Total cameras: {discovery_stats['total_cameras_found']}")
+    logger.info(f"Ports with no MAC: {discovery_stats['total_ports_no_mac']}")
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     json_file = f"camera_inventory_{len(camera_data)}cameras_{timestamp}.json"
     output_data = {
