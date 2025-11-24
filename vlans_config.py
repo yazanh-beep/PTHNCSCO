@@ -7,9 +7,9 @@ import re
 from typing import Tuple, List, Optional
 
 # ========================= USER CONFIG =========================
-AGG_IP = "192.168.100.11"  # Aggregation switch IP - configure this!
-USERNAME = "admin"
-PASSWORD = "cisco"
+AGG_IP = ""  # Aggregation switch IP - configure this!
+USERNAME = ""
+PASSWORD = ""
 TIMEOUT = 10
 MAX_READ = 65535
 
