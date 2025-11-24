@@ -11,34 +11,6 @@ from datetime import datetime
 from collections import deque
 
 # ============================================================================
-# USER CONFIG
-# ============================================================================
-
-SEED_SWITCH_IP = ""
-TIMEOUT = 150
-MAX_READ = 65535
-CREDENTIAL_SETS = [
-    {"username": "", "password": "", "enable": ""},
-]
-AGG_MAX_RETRIES = 3
-AGG_RETRY_DELAY = 5
-CDP_LLDP_TIMEOUT = 35
-
-# --- RETRY CONFIGURATION ---
-SSH_HOP_RETRY_ATTEMPTS = 5
-SSH_HOP_RETRY_BASE_DELAY = 2
-SSH_HOP_USE_EXPONENTIAL_BACKOFF = True
-SSH_HOP_VERIFY_ROUTE = True
-
-# --- MAC TABLE POLLING CONFIGURATION ---
-MAC_POLL_INTERVAL = 5            # Check every 5 seconds
-MAC_POLL_MAX_ATTEMPTS = 999999   # Effectively infinite (relies on hard timeout)
-MAC_POLL_INITIAL_WAIT = 15       # Initial wait after clearing table
-MAC_POLL_BATCH_SIZE = 100        # Ports per batch
-MAC_POLL_BATCH_PAUSE = 2         # Pause between batches
-MAC_POLL_HARD_TIMEOUT = 600      # 10 minutes absolute maximum per port (safety net)
-
-# ============================================================================
 # IDLE-SAFE LOGGING CONFIGURATION
 # ============================================================================
 
@@ -93,6 +65,34 @@ else:
     )
 
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# USER CONFIG
+# ============================================================================
+
+SEED_SWITCH_IP = ""
+TIMEOUT = 150
+MAX_READ = 65535
+CREDENTIAL_SETS = [
+    {"username": "admin", "password": "cisco", "enable": ""},
+]
+AGG_MAX_RETRIES = 3
+AGG_RETRY_DELAY = 5
+CDP_LLDP_TIMEOUT = 35
+
+# --- RETRY CONFIGURATION ---
+SSH_HOP_RETRY_ATTEMPTS = 5
+SSH_HOP_RETRY_BASE_DELAY = 2
+SSH_HOP_USE_EXPONENTIAL_BACKOFF = True
+SSH_HOP_VERIFY_ROUTE = True
+
+# --- MAC TABLE POLLING CONFIGURATION ---
+MAC_POLL_INTERVAL = 5            # Check every 5 seconds
+MAC_POLL_MAX_ATTEMPTS = 999999   # Effectively infinite (relies on hard timeout)
+MAC_POLL_INITIAL_WAIT = 15       # Initial wait after clearing table
+MAC_POLL_BATCH_SIZE = 100        # Ports per batch
+MAC_POLL_BATCH_PAUSE = 2         # Pause between batches
+MAC_POLL_HARD_TIMEOUT = 600      # 10 minutes absolute maximum per port (safety net)
 
 # ============================================================================
 # GLOBAL VARIABLES
@@ -178,15 +178,7 @@ def send_cmd(shell, cmd, timeout=TIMEOUT, silent=False):
     try:
         _ = _drain(shell)
         shell.send(cmd + "\n")
-        output = expect_prompt(shell, timeout=timeout)
-        
-        # Clean backspace characters from output
-        # Replace \b followed by any character with nothing (simulates backspace)
-        output = re.sub(r'.\b', '', output)
-        # Remove any remaining standalone backspaces
-        output = output.replace('\b', '')
-        
-        return output
+        return expect_prompt(shell, timeout=timeout)
     except Exception as e:
         logger.error(f"Exception in send_cmd('{cmd}'): {e}")
         raise NetworkConnectionError(f"Send command failed: {e}", reconnect_needed=True)
@@ -705,56 +697,98 @@ def parse_mac_table_interface(raw):
     lines = raw.splitlines()
     in_table = False
     
-    for line in lines:
+    logger.info(f"  [PARSE] Processing {len(lines)} lines from MAC table output")
+    
+    for line_num, line in enumerate(lines, 1):
+        # Remove any remaining backspaces and clean the line
         line_clean = line.strip()
         
         # Skip empty lines
         if not line_clean:
             continue
         
-        # Skip command echo (may contain backspaces \b)
-        if '\b' in line_clean or 'show mac' in line_clean.lower():
+        # Skip command echo lines (contains show, mac, address-table, etc.)
+        lower_line = line_clean.lower()
+        if any(keyword in lower_line for keyword in ['show mac', 'address-table', 'interface gi', 'interface te', 'interface fa']):
+            logger.info(f"  [PARSE] Line {line_num}: COMMAND ECHO - skipping")
             continue
         
         # Detect table header - start processing after this
-        if "Mac Address Table" in line_clean:
+        if "Mac Address Table" in line_clean or "MAC Address Table" in line_clean or "MaAddresTabl" in line_clean:
+            logger.info(f"  [PARSE] Line {line_num}: TABLE HEADER detected")
             in_table = False  # Wait for the actual column headers
             continue
         
-        # Detect column headers
-        if "Vlan" in line_clean and "Mac Address" in line_clean and "Type" in line_clean:
+        # Detect column headers - FLEXIBLE matching for corrupted text
+        # Original: "Vlan    Mac Address       Type        Ports"
+        # Corrupted: "Vla   MaAddres      Typ       Port"
+        lower_for_header = line_clean.lower()
+        if ("vla" in lower_for_header and 
+            ("mac" in lower_for_header or "addr" in lower_for_header) and 
+            "typ" in lower_for_header and 
+            "port" in lower_for_header):
+            logger.info(f"  [PARSE] Line {line_num}: COLUMN HEADERS detected (flexible match) - NOW PARSING ENTRIES")
             in_table = True
             continue
         
         # Skip separator lines
-        if line_clean.startswith("---") or line_clean.startswith("====") or "----" in line_clean:
+        if re.match(r'^[-=]+$', line_clean) or "----" in line_clean:
+            logger.info(f"  [PARSE] Line {line_num}: SEPARATOR - skipping")
             continue
         
         # Skip total/summary lines
-        if "Total" in line_clean or "All" in line_clean:
+        if "Total" in line_clean or "All" in line_clean or "Tota" in line_clean:
+            logger.info(f"  [PARSE] Line {line_num}: SUMMARY - skipping")
             continue
         
         # Only process if we're in the table section
         if not in_table:
+            logger.info(f"  [PARSE] Line {line_num}: NOT IN TABLE YET - skipping")
             continue
         
         # Parse the MAC table entry
+        logger.info(f"  [PARSE] Line {line_num}: ATTEMPTING TO PARSE AS MAC ENTRY: '{line_clean}'")
         parts = re.split(r"\s+", line_clean)
+        logger.info(f"  [PARSE] Line {line_num}: Split into {len(parts)} parts: {parts}")
         
         # Need at least 4 parts: VLAN, MAC, Type, Port
         if len(parts) < 4:
+            logger.warning(f"  [PARSE] Line {line_num}: TOO FEW PARTS ({len(parts)}) - need at least 4")
             continue
         
         vlan = parts[0]
         mac = parts[1]
+        logger.info(f"  [PARSE] Line {line_num}: VLAN='{vlan}', MAC='{mac}'")
         
-        # Validate VLAN (should be numeric or a valid VLAN identifier)
-        if not vlan.isdigit() and not vlan.startswith("Vlan"):
+        # Validate VLAN (should be numeric or start with digit)
+        if not vlan[0].isdigit():
+            logger.warning(f"  [PARSE] Line {line_num}: VLAN '{vlan}' doesn't start with digit - skipping")
             continue
         
-        # Validate MAC address format (should be xxxx.xxxx.xxxx)
+        # Validate MAC address format
+        # Corrupted format might be: b8a4f5a2e (dots removed by backspaces!)
+        # Need to be flexible here too
+        mac_has_dots = '.' in mac
+        mac_has_correct_length = len(mac.replace('.', '')) >= 8
+        
+        if not mac_has_correct_length:
+            logger.warning(f"  [PARSE] Line {line_num}: MAC '{mac}' too short - skipping")
+            continue
+        
+        # If MAC doesn't have dots, try to reconstruct it
+        if not mac_has_dots:
+            mac_clean = mac.replace('.', '')
+            if len(mac_clean) == 12 and all(c in '0123456789abcdefABCDEF' for c in mac_clean):
+                # Reconstruct: b8a44f55a2ef -> b8a4.4f55.a2ef
+                mac = f"{mac_clean[0:4]}.{mac_clean[4:8]}.{mac_clean[8:12]}"
+                logger.info(f"  [PARSE] Line {line_num}: Reconstructed MAC: {mac}")
+            elif len(mac_clean) < 12:
+                logger.warning(f"  [PARSE] Line {line_num}: MAC '{mac}' incomplete - skipping")
+                continue
+        
+        # Final validation: check proper format
         if not re.match(r'^[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}$', mac):
-            logger.debug(f"Skipping invalid MAC format: {mac}")
+            logger.warning(f"  [PARSE] Line {line_num}: MAC '{mac}' still invalid after processing - skipping")
             continue
         
         # Find the port (starts with Gi, Te, Fa, etc.)
@@ -764,15 +798,17 @@ def parse_mac_table_interface(raw):
         for i in range(2, len(parts)):
             if re.match(r'^(Gi|Te|Fa|Et|Po|Vl|Tw|Fo)', parts[i], re.IGNORECASE):
                 port = parts[i]
+                logger.info(f"  [PARSE] Line {line_num}: Found PORT '{port}' at index {i}")
                 break
             else:
                 mac_type_parts.append(parts[i])
         
         mac_type = " ".join(mac_type_parts)
+        logger.info(f"  [PARSE] Line {line_num}: MAC Type='{mac_type}'")
         
         # Accept any entry with a valid port (DYNAMIC, STATIC, etc.)
         if port:
-            logger.debug(f"Found MAC: VLAN={vlan}, MAC={mac}, Type={mac_type}, Port={port}")
+            logger.info(f"  [PARSE] Line {line_num}: SUCCESS! Adding MAC entry: VLAN={vlan}, MAC={mac}, Type='{mac_type}', Port={port}")
             entries.append({
                 "vlan": vlan,
                 "mac_address": mac,
@@ -780,8 +816,9 @@ def parse_mac_table_interface(raw):
                 "port": port
             })
         else:
-            logger.debug(f"Skipping entry with no port: {line_clean}")
+            logger.warning(f"  [PARSE] Line {line_num}: NO PORT FOUND - skipping. Parts were: {parts}")
     
+    logger.info(f"  [PARSE] ===== TOTAL ENTRIES FOUND: {len(entries)} =====")
     return entries
 
 def normalize_interface_name(intf):
@@ -906,7 +943,7 @@ def poll_port_for_mac(shell, interface, max_attempts=MAC_POLL_MAX_ATTEMPTS, inte
     MUST have a device connected that will eventually send traffic.
     
     Returns:
-        dict: MAC entry when found (never returns None for UP ports unless critical timeout)
+        dict: MAC entry when found, or dict with UNKNOWN MAC on timeout
     """
     logger.info(f"  [POLL] {interface} - waiting for MAC address...")
     
@@ -923,12 +960,24 @@ def poll_port_for_mac(shell, interface, max_attempts=MAC_POLL_MAX_ATTEMPTS, inte
             logger.error(f"  [CRITICAL] {interface}: Hard timeout at {MAC_POLL_HARD_TIMEOUT}s ({attempt} attempts)")
             logger.error(f"  [CRITICAL] {interface}: UP/UP port with no MAC - port may be misconfigured!")
             discovery_stats["total_ports_no_mac"] += 1
-            return None
+            
+            # Return a special entry for UNKNOWN MAC
+            return {
+                "vlan": "UNKNOWN",
+                "mac_address": "UNKNOWN",
+                "type": "TIMEOUT",
+                "port": interface
+            }
         
         try:
             cmd = f"show mac address-table interface {interface}"
             mac_out = send_cmd(shell, cmd, timeout=10, silent=True)
-            entries = parse_mac_table_interface(mac_out)
+            
+            # Clean backspace characters from MAC table output
+            mac_out_clean = re.sub(r'.\b', '', mac_out)
+            mac_out_clean = mac_out_clean.replace('\b', '')
+            
+            entries = parse_mac_table_interface(mac_out_clean)
             
             if entries:
                 # SUCCESS - Found MAC address
@@ -938,26 +987,23 @@ def poll_port_for_mac(shell, interface, max_attempts=MAC_POLL_MAX_ATTEMPTS, inte
             # Log progress periodically
             time_since_last_log = elapsed - (last_log_time - start_time)
             if attempt <= 3:
-                # Always log first 3 attempts
                 logger.info(f"  [WAIT] {interface}: No MAC yet (attempt {attempt})")
                 last_log_time = time.time()
             elif time_since_last_log >= 30:
-                # Log every 30 seconds after that
                 logger.info(f"  [WAIT] {interface}: Still waiting... (attempt {attempt}, {elapsed:.1f}s elapsed)")
                 last_log_time = time.time()
             
-            # Keep polling - sleep and continue
             time.sleep(interval)
                 
         except Exception as e:
             logger.error(f"  [ERROR] {interface}: Exception during polling: {e}")
-            # Even on exception, keep trying after a brief pause
             time.sleep(interval)
             continue
 
 def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
     """
     Enhanced camera discovery with infinite MAC polling for UP ports.
+    Tracks both found cameras and ports with UNKNOWN MACs.
     """
     logger.info("="*80)
     logger.info(f"Scanning {switch_type} switch: {switch_hostname}")
@@ -1016,21 +1062,36 @@ def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
             mac_entry = poll_port_for_mac(shell, intf)
             
             if mac_entry:
-                mac_formatted = convert_mac_format(mac_entry["mac_address"])
-                camera_info = {
-                    "switch_name": switch_hostname,
-                    "switch_type": switch_type,
-                    "port": mac_entry["port"],
-                    "mac_address": mac_formatted,
-                    "vlan": mac_entry["vlan"]
-                }
-                camera_data.append(camera_info)
-                camera_count += 1
-                discovery_stats["total_cameras_found"] += 1
-                logger.info(f"  [+] Camera: {mac_formatted} on {mac_entry['port']} (VLAN {mac_entry['vlan']})")
-            else:
-                # Should only happen on hard timeout (critical error)
-                no_mac_count += 1
+                # Check if this is an UNKNOWN MAC (timeout case)
+                if mac_entry["mac_address"] == "UNKNOWN":
+                    # Port timed out - record as unknown
+                    camera_info = {
+                        "switch_name": switch_hostname,
+                        "switch_type": switch_type,
+                        "port": mac_entry["port"],
+                        "mac_address": "UNKNOWN",
+                        "vlan": "UNKNOWN",
+                        "status": "TIMEOUT - No MAC learned after 10 minutes",
+                        "timeout_seconds": MAC_POLL_HARD_TIMEOUT
+                    }
+                    camera_data.append(camera_info)
+                    no_mac_count += 1
+                    logger.warning(f"  [!] UNKNOWN MAC on {mac_entry['port']} - Port UP but no MAC learned (TIMEOUT)")
+                else:
+                    # Normal camera with valid MAC
+                    mac_formatted = convert_mac_format(mac_entry["mac_address"])
+                    camera_info = {
+                        "switch_name": switch_hostname,
+                        "switch_type": switch_type,
+                        "port": mac_entry["port"],
+                        "mac_address": mac_formatted,
+                        "vlan": mac_entry["vlan"],
+                        "status": "OK"
+                    }
+                    camera_data.append(camera_info)
+                    camera_count += 1
+                    discovery_stats["total_cameras_found"] += 1
+                    logger.info(f"  [+] Camera: {mac_formatted} on {mac_entry['port']} (VLAN {mac_entry['vlan']})")
         
         batch_elapsed = time.time() - batch_start_time
         logger.info(f"  Batch {batch_num} complete: {len(batch)} ports in {batch_elapsed:.1f}s")
@@ -1046,7 +1107,7 @@ def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
     logger.info(f"  - Uplink ports excluded: {uplink_skip_count}")
     logger.info(f"  - Ports scanned: {scanned_count}")
     logger.info(f"  - Cameras found: {camera_count}")
-    logger.info(f"  - Ports with no MAC (critical timeouts): {no_mac_count}")
+    logger.info(f"  - Ports with UNKNOWN MAC (timeouts): {no_mac_count}")
     logger.info(f"  - Total time: {overall_elapsed:.1f}s")
     logger.info("="*80)
 
@@ -1643,6 +1704,7 @@ def main():
             logger.info("Closed connection to seed")
         except:
             pass
+    
     logger.info("="*80)
     logger.info("DISCOVERY COMPLETE")
     logger.info("="*80)
@@ -1650,7 +1712,7 @@ def main():
     for agg_ip in sorted(discovered_aggregates):
         agg_name = aggregate_hostnames.get(agg_ip, "Unknown")
         logger.info(f"  - {agg_name} ({agg_ip})")
-    logger.info(f"Total cameras found: {len(camera_data)}")
+    logger.info(f"Total devices found: {len(camera_data)}")
     logger.info("")
     logger.info("DISCOVERY STATISTICS")
     logger.info("="*80)
@@ -1665,15 +1727,25 @@ def main():
     logger.info(f"Final failures: {final_failures}")
     logger.info(f"Aggregate reconnections: {discovery_stats['aggregates_reconnections']}")
     logger.info(f"Switches retried from seed: {discovery_stats['switches_retried_from_seed']}")
-    logger.info(f"Total cameras: {discovery_stats['total_cameras_found']}")
+    
+    # Enhanced camera statistics
+    cameras_with_mac = sum(1 for cam in camera_data if cam.get("mac_address") != "UNKNOWN")
+    cameras_without_mac = sum(1 for cam in camera_data if cam.get("mac_address") == "UNKNOWN")
+    
+    logger.info(f"Total devices found: {len(camera_data)}")
+    logger.info(f"  - Cameras with MAC: {cameras_with_mac}")
+    logger.info(f"  - Ports with UNKNOWN MAC (timeouts): {cameras_without_mac}")
     logger.info(f"Ports with no MAC (critical timeouts): {discovery_stats['total_ports_no_mac']}")
+    
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    json_file = f"camera_inventory_{len(camera_data)}cameras_{timestamp}.json"
+    json_file = f"camera_inventory_{len(camera_data)}devices_{timestamp}.json"
     output_data = {
         "discovery_metadata": {
             "timestamp": timestamp,
             "seed_switch": SEED_SWITCH_IP,
-            "total_cameras": len(camera_data),
+            "total_devices": len(camera_data),
+            "cameras_with_mac": cameras_with_mac,
+            "ports_with_unknown_mac": cameras_without_mac,
             "total_aggregates": len(discovered_aggregates),
             "mac_poll_hard_timeout": MAC_POLL_HARD_TIMEOUT,
             "mac_poll_interval": MAC_POLL_INTERVAL
@@ -1684,12 +1756,19 @@ def main():
     with open(json_file, "w", encoding='utf-8') as f:
         json.dump(output_data, f, indent=2)
     logger.info(f"Saved: {json_file}")
+    
     if camera_data:
-        csv_file = f"camera_inventory_{len(camera_data)}cameras_{timestamp}.csv"
+        csv_file = f"camera_inventory_{len(camera_data)}devices_{timestamp}.csv"
         with open(csv_file, "w", newline="", encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=["switch_name", "switch_type", "port", "mac_address", "vlan"])
+            # Include status field in CSV
+            writer = csv.DictWriter(f, fieldnames=["switch_name", "switch_type", "port", "mac_address", "vlan", "status"])
             writer.writeheader()
-            writer.writerows(camera_data)
+            
+            # Write rows with status (default to "OK" for legacy entries)
+            for row in camera_data:
+                if "status" not in row:
+                    row["status"] = "OK"
+                writer.writerow(row)
         logger.info(f"Saved: {csv_file}")
     logger.info(f"Log file: {log_filename}")
 
