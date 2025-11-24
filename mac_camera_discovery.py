@@ -9,11 +9,11 @@ from datetime import datetime
 from collections import deque
 
 # --- USER CONFIG -------------------------------------------------------------
-SEED_SWITCH_IP = "192.168.1.18"
+SEED_SWITCH_IP = ""
 TIMEOUT = 150
 MAX_READ = 65535
 CREDENTIAL_SETS = [
-    {"username": "admin", "password": "/2/_HKX6YvCGMwzAdJp", "enable": ""},
+    {"username": "", "password": "", "enable": ""},
 ]
 AGG_MAX_RETRIES = 3
 AGG_RETRY_DELAY = 5
@@ -26,12 +26,12 @@ SSH_HOP_USE_EXPONENTIAL_BACKOFF = True
 SSH_HOP_VERIFY_ROUTE = True
 
 # --- MAC TABLE POLLING CONFIGURATION ---
-MAC_POLL_INTERVAL = 5           # Seconds between checks
-MAC_POLL_MAX_ATTEMPTS = 10      # Max attempts per port (reduced from 20)
-MAC_POLL_INITIAL_WAIT = 10      # Initial wait after clearing table
-MAC_POLL_BATCH_SIZE = 10        # Ports per batch
-MAC_POLL_BATCH_PAUSE = 2        # Pause between batches
-MAC_POLL_HARD_TIMEOUT = 30      # Hard limit per port (seconds)
+MAC_POLL_INTERVAL = 5            # Check every 5 seconds
+MAC_POLL_MAX_ATTEMPTS = 999999   # Effectively infinite (relies on hard timeout)
+MAC_POLL_INITIAL_WAIT = 15       # Initial wait after clearing table
+MAC_POLL_BATCH_SIZE = 100        # Ports per batch
+MAC_POLL_BATCH_PAUSE = 2         # Pause between batches
+MAC_POLL_HARD_TIMEOUT = 600      # 10 minutes absolute maximum per port (safety net)
 # -----------------------------------------------------------------------------
 
 PROMPT_RE = re.compile(r"(?m)^[^\r\n#>\s][^\r\n#>]*[>#]\s?$")
@@ -628,7 +628,7 @@ def parse_lldp_neighbors(output):
 def get_interface_status(shell):
     """
     Get all UP physical interfaces from the switch.
-    Excludes: VLANs, Access Points, and other logical interfaces
+    Excludes: VLANs, Access Points (AppGigabitEthernet), and other logical interfaces
     """
     out = send_cmd(shell, "show ip interface brief", timeout=10)
     up_interfaces = []
@@ -637,7 +637,7 @@ def get_interface_status(shell):
     excluded_prefixes = (
         "Vlan", "Loopback", "Tunnel", "Null", 
         "Port-channel", "Po",
-        "Ap", "AP",  # Access Point interfaces (CRITICAL FIX)
+        "Ap", "AP",  # AppGigabitEthernet (IOx application hosting)
         "Management", "Mgmt"
     )
     
@@ -733,7 +733,7 @@ def is_same_interface(intf1, intf2):
 def get_uplink_ports_from_neighbors(shell):
     """
     Discover uplink ports using CDP and LLDP.
-    FIXED: Only excludes AGGREGATE switches, not SERVER switches.
+    Only marks AGGREGATE switches as uplinks (SERVER switches are scanned for cameras).
     """
     logger.info("Discovering uplink ports using CDP and LLDP...")
     uplink_ports = []
@@ -777,9 +777,9 @@ def get_uplink_ports_from_neighbors(shell):
     else:
         logger.info("LLDP not enabled")
     
-    # FIXED: Only mark AGGREGATE switches as uplinks (removed SERVER check)
+    # Only mark AGGREGATE switches as uplinks
     for hostname, links in all_neighbors_by_hostname.items():
-        if is_aggregate_switch(hostname):  # ONLY aggregate switches are uplinks
+        if is_aggregate_switch(hostname):
             for nbr in links:
                 uplink_port = nbr.get("local_intf")
                 if uplink_port:
@@ -813,25 +813,29 @@ def select_camera_mac(entries, interface):
 
 def poll_port_for_mac(shell, interface, max_attempts=MAC_POLL_MAX_ATTEMPTS, interval=MAC_POLL_INTERVAL):
     """
-    Poll a specific port until MAC address appears or timeout.
+    Poll a specific port until MAC address appears.
     
-    Features:
-    - Hard timeout protection
-    - Early exit for empty ports
-    - Visible progress
-    - Exception handling
+    For UP/UP ports, we poll indefinitely (up to hard timeout) since an UP port
+    MUST have a device connected that will eventually send traffic.
+    
+    Returns:
+        dict: MAC entry when found (never returns None for UP ports unless critical timeout)
     """
-    logger.info(f"  [POLL] {interface}")
+    logger.info(f"  [POLL] {interface} - waiting for MAC address...")
     
     start_time = time.time()
-    consecutive_empty = 0
-    early_exit_threshold = 3
+    attempt = 0
+    last_log_time = start_time
     
-    for attempt in range(1, max_attempts + 1):
-        # Hard timeout check
+    while True:
+        attempt += 1
         elapsed = time.time() - start_time
+        
+        # Hard timeout check (safety net - should rarely trigger)
         if elapsed > MAC_POLL_HARD_TIMEOUT:
-            logger.warning(f"  [TIMEOUT] {interface}: Hard timeout at {MAC_POLL_HARD_TIMEOUT}s")
+            logger.error(f"  [CRITICAL] {interface}: Hard timeout at {MAC_POLL_HARD_TIMEOUT}s ({attempt} attempts)")
+            logger.error(f"  [CRITICAL] {interface}: UP/UP port with no MAC - port may be misconfigured!")
+            discovery_stats["total_ports_no_mac"] += 1
             return None
         
         try:
@@ -840,34 +844,33 @@ def poll_port_for_mac(shell, interface, max_attempts=MAC_POLL_MAX_ATTEMPTS, inte
             entries = parse_mac_table_interface(mac_out)
             
             if entries:
-                elapsed = time.time() - start_time
+                # SUCCESS - Found MAC address
                 logger.info(f"  [✓] {interface}: MAC found (attempt {attempt}, {elapsed:.1f}s)")
                 return select_camera_mac(entries, interface)
-            else:
-                consecutive_empty += 1
-                if attempt <= 3 or attempt % 2 == 1:
-                    logger.info(f"  [⏳] {interface}: Empty (attempt {attempt}/{max_attempts})")
             
-            # Early exit for consistently empty ports
-            if consecutive_empty >= early_exit_threshold:
-                elapsed = time.time() - start_time
-                logger.info(f"  [○] {interface}: No device (checked {early_exit_threshold}x, {elapsed:.1f}s)")
-                return None
+            # Log progress periodically
+            time_since_last_log = elapsed - (last_log_time - start_time)
+            if attempt <= 3:
+                # Always log first 3 attempts
+                logger.info(f"  [⏳] {interface}: No MAC yet (attempt {attempt})")
+                last_log_time = time.time()
+            elif time_since_last_log >= 30:
+                # Log every 30 seconds after that
+                logger.info(f"  [⏳] {interface}: Still waiting... (attempt {attempt}, {elapsed:.1f}s elapsed)")
+                last_log_time = time.time()
             
-            if attempt < max_attempts:
-                time.sleep(interval)
+            # Keep polling - sleep and continue
+            time.sleep(interval)
                 
         except Exception as e:
-            logger.error(f"  [✗] {interface}: Exception: {e}")
-            return None
-    
-    elapsed = time.time() - start_time
-    logger.warning(f"  [TIMEOUT] {interface}: No MAC after {max_attempts} attempts ({elapsed:.1f}s)")
-    return None
+            logger.error(f"  [✗] {interface}: Exception during polling: {e}")
+            # Even on exception, keep trying after a brief pause
+            time.sleep(interval)
+            continue
 
 def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
     """
-    Enhanced camera discovery with per-port MAC polling and progress tracking.
+    Enhanced camera discovery with infinite MAC polling for UP ports.
     """
     logger.info("="*80)
     logger.info(f"Scanning {switch_type} switch: {switch_hostname}")
@@ -880,7 +883,7 @@ def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
     
     logger.info(f"Waiting {MAC_POLL_INITIAL_WAIT}s for initial MAC table repopulation...")
     time.sleep(MAC_POLL_INITIAL_WAIT)
-    logger.info("Starting per-port MAC polling...")
+    logger.info("Starting per-port MAC polling (will wait indefinitely for UP ports)...")
     
     uplink_ports = get_uplink_ports_from_neighbors(shell)
     if not uplink_ports:
@@ -939,8 +942,8 @@ def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
                 discovery_stats["total_cameras_found"] += 1
                 logger.info(f"  [+] Camera: {mac_formatted} on {mac_entry['port']} (VLAN {mac_entry['vlan']})")
             else:
+                # Should only happen on hard timeout (critical error)
                 no_mac_count += 1
-                discovery_stats["total_ports_no_mac"] += 1
         
         batch_elapsed = time.time() - batch_start_time
         logger.info(f"  Batch {batch_num} complete: {len(batch)} ports in {batch_elapsed:.1f}s")
@@ -956,22 +959,13 @@ def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
     logger.info(f"  - Uplink ports excluded: {uplink_skip_count}")
     logger.info(f"  - Ports scanned: {scanned_count}")
     logger.info(f"  - Cameras found: {camera_count}")
-    logger.info(f"  - Ports with no MAC: {no_mac_count}")
+    logger.info(f"  - Ports with no MAC (critical timeouts): {no_mac_count}")
     logger.info(f"  - Total time: {overall_elapsed:.1f}s")
     logger.info("="*80)
 
 def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=False):
     """
     Process a switch with enhanced retry logic, hostname verification, and failure tracking.
-    
-    Args:
-        parent_ip: IP of the parent aggregate
-        neighbor_info: Dict with switch details
-        switch_type: Type of switch (EDGE, SERVER, etc.)
-        is_retry: True if this is a retry attempt from seed
-        
-    Returns:
-        True on success, False on failure
     """
     global failed_switches
     
@@ -979,13 +973,13 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
     switch_name = neighbor_info["remote_name"]
     local_intf = neighbor_info["local_intf"]
     
-    # CRITICAL: Skip aggregate switches - they never have cameras directly connected
+    # Skip aggregate switches - they never have cameras directly connected
     if switch_type == "AGGREGATE":
         logger.debug(f"Skipping {switch_name} - aggregate switches don't have cameras")
         return True
     
     if not switch_ip or (switch_ip in visited_switches and not is_retry):
-        return True  # Skip already processed
+        return True
     
     logger.info("")
     logger.info("*"*80)
@@ -1000,10 +994,8 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
         discovery_stats["switches_attempted"] += 1
         discovery_stats["switches_by_type"][switch_type]["attempted"] += 1
     else:
-        # Don't increment attempted for retries - already counted in Phase 2
         discovery_stats["switches_retried_from_seed"] += 1
     
-    # Get parent hostname for verification
     try:
         parent_hostname = get_hostname(agg_shell)
     except Exception:
@@ -1013,17 +1005,14 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
         if not verify_aggregate_connection():
             raise NetworkConnectionError("Parent connection lost", reconnect_needed=True)
         
-        # Use new ssh_to_device with retry logic and hostname verification
         ssh_success = ssh_to_device(
             target_ip=switch_ip,
             expected_hostname=switch_name,
             parent_hostname=parent_hostname
         )
         
-        # Handle case where target IP belongs to current switch
         if ssh_success is None:
-            logger.info(f"Skipping {switch_name} ({switch_ip}) - IP belongs to current switch, not a separate device")
-            # Don't count as failure, just skip it
+            logger.info(f"Skipping {switch_name} ({switch_ip}) - IP belongs to current switch")
             return True
         
         if not ssh_success:
@@ -1041,16 +1030,14 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
             }
             
             if not is_retry:
-                # Only add to failed list if this wasn't already a retry
                 failed_switches.append(failure_info)
                 logger.warning(f"Added {switch_name} to retry queue for Phase 3")
             
             discovery_stats["switches_by_type"][switch_type]["failed"] += 1
             discovery_stats["switches_failed_unreachable"] += 1
             discovery_stats["failure_details"].append(failure_info)
-            return False  # Indicate failure
+            return False
         
-        # Verify we actually changed switches
         actual_hostname = get_hostname(agg_shell)
         if actual_hostname == parent_hostname:
             logger.error(f"FATAL: Still on parent {parent_hostname} after supposedly successful hop!")
@@ -1095,7 +1082,6 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
                 logger.warning(f"[EXIT] Exit may have failed")
             time.sleep(1)
             
-            # Verify we returned to parent
             final_hostname = get_hostname(agg_shell)
             if final_hostname != parent_hostname:
                 logger.error(f"After exit: at {final_hostname}, expected {parent_hostname}")
@@ -1106,7 +1092,7 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
             if not verify_aggregate_connection():
                 raise NetworkConnectionError("Lost parent connection", reconnect_needed=True)
                 
-            return True  # Success!
+            return True
             
         except Exception as e:
             logger.error(f"Error exiting: {e}")
@@ -1117,8 +1103,6 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
         reconnect_needed = getattr(e, 'reconnect_needed', False)
         if reconnect_needed:
             logger.error(f"Parent connection lost while processing {switch_name}")
-            # IMPORTANT: Still add to failed list even if parent connection lost
-            # This switch should be retried in Phase 3 from seed
             if not is_retry:
                 failed_switches.append({
                     "switch_name": switch_name,
@@ -1131,7 +1115,7 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
                     "is_retry": is_retry
                 })
                 logger.warning(f"Added {switch_name} to retry queue for Phase 3 (connection lost)")
-            raise  # Propagate to trigger reconnection
+            raise
         logger.error(f"Cannot connect - SKIPPING: {e}")
         discovery_stats["switches_by_type"][switch_type]["failed"] += 1
         
@@ -1308,9 +1292,6 @@ def scan_aggregate_switch(shell, agg_ip, resume_mode=False):
 def retry_failed_switches_from_seed():
     """
     PHASE 3: Retry all failed switches from the seed switch.
-    
-    Since this is Layer 2, all edge switches should be reachable from the seed
-    via CDP/LLDP regardless of which aggregate they're connected to.
     """
     global failed_switches, agg_shell
     
@@ -1325,7 +1306,6 @@ def retry_failed_switches_from_seed():
     logger.info("="*80)
     logger.info("Since this is Layer 2, all edge switches should be reachable from seed")
     
-    # Ensure we're connected to seed
     try:
         if not verify_aggregate_connection():
             logger.info("Reconnecting to seed for retry phase...")
@@ -1334,7 +1314,6 @@ def retry_failed_switches_from_seed():
         logger.error(f"Cannot reconnect to seed for retries: {e}")
         return
     
-    # Verify we're on seed
     current_hostname = get_hostname(agg_shell)
     seed_hostname = agg_hostname or "UNKNOWN"
     
@@ -1342,8 +1321,7 @@ def retry_failed_switches_from_seed():
         logger.warning(f"Not on seed switch (on {current_hostname}, expected {seed_hostname})")
         logger.warning(f"Attempting to return to seed...")
         try:
-            # Try to exit back to seed
-            for _ in range(5):  # Max 5 exits
+            for _ in range(5):
                 exit_device()
                 time.sleep(0.5)
                 current_hostname = get_hostname(agg_shell)
@@ -1363,7 +1341,6 @@ def retry_failed_switches_from_seed():
     
     logger.info(f"Ready to retry from seed switch: {seed_hostname}")
     
-    # Create a copy of failed switches to retry
     switches_to_retry = failed_switches.copy()
     retry_successes = 0
     retry_failures = 0
@@ -1379,7 +1356,6 @@ def retry_failed_switches_from_seed():
         logger.info(f"  Originally failed from: {original_parent}")
         logger.info(f"  Retrying from: {seed_hostname} (seed)")
         
-        # Create neighbor_info for retry
         neighbor_info = {
             "remote_name": switch_name,
             "mgmt_ip": switch_ip,
@@ -1387,7 +1363,6 @@ def retry_failed_switches_from_seed():
         }
         
         try:
-            # Retry the switch from seed
             success = process_switch(
                 parent_ip=SEED_SWITCH_IP,
                 neighbor_info=neighbor_info,
@@ -1406,7 +1381,6 @@ def retry_failed_switches_from_seed():
             logger.error(f"Network error during retry: {e}")
             retry_failures += 1
             
-            # Try to reconnect to seed if connection lost
             if getattr(e, 'reconnect_needed', False):
                 logger.warning("Lost seed connection during retry - reconnecting...")
                 try:
@@ -1434,6 +1408,7 @@ def main():
     logger.info("="*80)
     logger.info("CAMERA DISCOVERY SCRIPT STARTED")
     logger.info(f"Seed switch: {SEED_SWITCH_IP}")
+    logger.info(f"MAC polling: Infinite (up to {MAC_POLL_HARD_TIMEOUT}s hard timeout per port)")
     logger.info("="*80)
     try:
         connect_to_seed()
@@ -1441,7 +1416,6 @@ def main():
         logger.error(f"Failed to connect to seed: {e}")
         return
     
-    # Get all IPs of the seed switch to avoid trying to SSH to it later
     seed_ips = set([SEED_SWITCH_IP])
     try:
         ip_brief_out = send_cmd(agg_shell, "show ip interface brief", timeout=10, silent=True)
@@ -1472,7 +1446,6 @@ def main():
                 else:
                     new_aggregates = scan_aggregate_switch(agg_shell, SEED_SWITCH_IP, resume_mode=False)
                     for agg in new_aggregates:
-                        # Skip if this IP belongs to the seed switch
                         if agg["mgmt_ip"] in seed_ips:
                             logger.info(f"Skipping {agg['hostname']} ({agg['mgmt_ip']}) - same as seed switch")
                             continue
@@ -1504,7 +1477,6 @@ def main():
         while aggregates_to_process:
             agg_ip = aggregates_to_process.popleft()
             
-            # Skip if this IP belongs to the seed switch
             if agg_ip in seed_ips:
                 logger.info(f"Skipping aggregate {agg_ip} - same as seed switch")
                 continue
@@ -1523,7 +1495,6 @@ def main():
                         raise NetworkConnectionError("Seed lost", reconnect_needed=True)
                     logger.info("Hopping to aggregate...")
                     
-                    # Get parent hostname before hop
                     parent_hostname = get_hostname(agg_shell)
                     
                     hop_success = ssh_to_device(
@@ -1538,7 +1509,6 @@ def main():
                     
                     new_aggregates = scan_aggregate_switch(agg_shell, agg_ip)
                     for agg in new_aggregates:
-                        # Skip if this IP belongs to the seed switch
                         if agg["mgmt_ip"] in seed_ips:
                             logger.info(f"Skipping {agg['hostname']} ({agg['mgmt_ip']}) - same as seed switch")
                             continue
@@ -1575,9 +1545,6 @@ def main():
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
     finally:
-        # ====================================================================
-        # PHASE 3: RETRY FAILED SWITCHES FROM SEED
-        # ====================================================================
         try:
             retry_failed_switches_from_seed()
         except Exception as e:
@@ -1612,7 +1579,7 @@ def main():
     logger.info(f"Aggregate reconnections: {discovery_stats['aggregates_reconnections']}")
     logger.info(f"Switches retried from seed: {discovery_stats['switches_retried_from_seed']}")
     logger.info(f"Total cameras: {discovery_stats['total_cameras_found']}")
-    logger.info(f"Ports with no MAC: {discovery_stats['total_ports_no_mac']}")
+    logger.info(f"Ports with no MAC (critical timeouts): {discovery_stats['total_ports_no_mac']}")
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     json_file = f"camera_inventory_{len(camera_data)}cameras_{timestamp}.json"
     output_data = {
@@ -1620,12 +1587,14 @@ def main():
             "timestamp": timestamp,
             "seed_switch": SEED_SWITCH_IP,
             "total_cameras": len(camera_data),
-            "total_aggregates": len(discovered_aggregates)
+            "total_aggregates": len(discovered_aggregates),
+            "mac_poll_hard_timeout": MAC_POLL_HARD_TIMEOUT,
+            "mac_poll_interval": MAC_POLL_INTERVAL
         },
         "discovery_statistics": discovery_stats,
         "cameras": camera_data
     }
-    with open(json_file, "w", encoding='utf-8' ) as f:
+    with open(json_file, "w", encoding='utf-8') as f:
         json.dump(output_data, f, indent=2)
     logger.info(f"Saved: {json_file}")
     if camera_data:
