@@ -74,7 +74,7 @@ SEED_SWITCH_IP = ""
 TIMEOUT = 150
 MAX_READ = 65535
 CREDENTIAL_SETS = [
-    {"username": "admin", "password": "cisco", "enable": ""},
+    {"username": "", "password": "", "enable": ""},
 ]
 AGG_MAX_RETRIES = 3
 AGG_RETRY_DELAY = 5
@@ -688,137 +688,87 @@ def get_interface_status(shell):
 
 def parse_mac_table_interface(raw):
     """
-    Parse MAC address table output.
-    Enhanced to handle command echoes, backspaces, and validate MAC addresses.
+    Parse MAC address table output - handles backspaces and corruption.
     """
     entries = []
-    
-    # Split into lines and start processing after we see the table header
     lines = raw.splitlines()
     in_table = False
     
-    logger.info(f"  [PARSE] Processing {len(lines)} lines from MAC table output")
-    
-    for line_num, line in enumerate(lines, 1):
-        # Remove any remaining backspaces and clean the line
+    for line in lines:
         line_clean = line.strip()
-        
-        # Skip empty lines
         if not line_clean:
             continue
         
-        # Skip command echo lines (contains show, mac, address-table, etc.)
+        # Skip command echoes
         lower_line = line_clean.lower()
-        if any(keyword in lower_line for keyword in ['show mac', 'address-table', 'interface gi', 'interface te', 'interface fa']):
-            logger.info(f"  [PARSE] Line {line_num}: COMMAND ECHO - skipping")
+        if 'show mac' in lower_line or 'address-table' in lower_line:
             continue
         
-        # Detect table header - start processing after this
+        # Detect table header
         if "Mac Address Table" in line_clean or "MAC Address Table" in line_clean or "MaAddresTabl" in line_clean:
-            logger.info(f"  [PARSE] Line {line_num}: TABLE HEADER detected")
-            in_table = False  # Wait for the actual column headers
+            in_table = False
             continue
         
-        # Detect column headers - FLEXIBLE matching for corrupted text
-        # Original: "Vlan    Mac Address       Type        Ports"
-        # Corrupted: "Vla   MaAddres      Typ       Port"
-        lower_for_header = line_clean.lower()
-        if ("vla" in lower_for_header and 
-            ("mac" in lower_for_header or "addr" in lower_for_header) and 
-            "typ" in lower_for_header and 
-            "port" in lower_for_header):
-            logger.info(f"  [PARSE] Line {line_num}: COLUMN HEADERS detected (flexible match) - NOW PARSING ENTRIES")
+        # Detect column headers (flexible matching for corrupted text)
+        if ("vla" in lower_line and ("mac" in lower_line or "addr" in lower_line) and 
+            "typ" in lower_line and "port" in lower_line):
             in_table = True
             continue
         
-        # Skip separator lines
+        # Skip separators
         if re.match(r'^[-=]+$', line_clean) or "----" in line_clean:
-            logger.info(f"  [PARSE] Line {line_num}: SEPARATOR - skipping")
             continue
         
-        # Skip total/summary lines
-        if "Total" in line_clean or "All" in line_clean or "Tota" in line_clean:
-            logger.info(f"  [PARSE] Line {line_num}: SUMMARY - skipping")
+        # Skip summaries
+        if "Total" in line_clean or "Tota" in line_clean:
             continue
         
-        # Only process if we're in the table section
+        # Must be in table
         if not in_table:
-            logger.info(f"  [PARSE] Line {line_num}: NOT IN TABLE YET - skipping")
             continue
         
-        # Parse the MAC table entry
-        logger.info(f"  [PARSE] Line {line_num}: ATTEMPTING TO PARSE AS MAC ENTRY: '{line_clean}'")
+        # Parse entry
         parts = re.split(r"\s+", line_clean)
-        logger.info(f"  [PARSE] Line {line_num}: Split into {len(parts)} parts: {parts}")
-        
-        # Need at least 4 parts: VLAN, MAC, Type, Port
         if len(parts) < 4:
-            logger.warning(f"  [PARSE] Line {line_num}: TOO FEW PARTS ({len(parts)}) - need at least 4")
             continue
         
         vlan = parts[0]
         mac = parts[1]
-        logger.info(f"  [PARSE] Line {line_num}: VLAN='{vlan}', MAC='{mac}'")
         
-        # Validate VLAN (should be numeric or start with digit)
+        # VLAN must start with digit
         if not vlan[0].isdigit():
-            logger.warning(f"  [PARSE] Line {line_num}: VLAN '{vlan}' doesn't start with digit - skipping")
             continue
         
-        # Validate MAC address format
-        # Corrupted format might be: b8a4f5a2e (dots removed by backspaces!)
-        # Need to be flexible here too
-        mac_has_dots = '.' in mac
-        mac_has_correct_length = len(mac.replace('.', '')) >= 8
-        
-        if not mac_has_correct_length:
-            logger.warning(f"  [PARSE] Line {line_num}: MAC '{mac}' too short - skipping")
-            continue
-        
-        # If MAC doesn't have dots, try to reconstruct it
-        if not mac_has_dots:
-            mac_clean = mac.replace('.', '')
-            if len(mac_clean) == 12 and all(c in '0123456789abcdefABCDEF' for c in mac_clean):
-                # Reconstruct: b8a44f55a2ef -> b8a4.4f55.a2ef
+        # Look for something that looks like a MAC
+        # Valid: xxxx.xxxx.xxxx or xxxxxxxxxxxx (dots optional due to corruption)
+        mac_clean = mac.replace('.', '')
+        if len(mac_clean) >= 10 and all(c in '0123456789abcdefABCDEF' for c in mac_clean):
+            # Looks like hex - accept it
+            if '.' not in mac and len(mac_clean) == 12:
+                # Reconstruct dots: b8a44f55a2ef -> b8a4.4f55.a2ef
                 mac = f"{mac_clean[0:4]}.{mac_clean[4:8]}.{mac_clean[8:12]}"
-                logger.info(f"  [PARSE] Line {line_num}: Reconstructed MAC: {mac}")
-            elif len(mac_clean) < 12:
-                logger.warning(f"  [PARSE] Line {line_num}: MAC '{mac}' incomplete - skipping")
-                continue
-        
-        # Final validation: check proper format
-        if not re.match(r'^[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}$', mac):
-            logger.warning(f"  [PARSE] Line {line_num}: MAC '{mac}' still invalid after processing - skipping")
+        else:
             continue
         
-        # Find the port (starts with Gi, Te, Fa, etc.)
+        # Find port
         port = None
         mac_type_parts = []
-        
         for i in range(2, len(parts)):
             if re.match(r'^(Gi|Te|Fa|Et|Po|Vl|Tw|Fo)', parts[i], re.IGNORECASE):
                 port = parts[i]
-                logger.info(f"  [PARSE] Line {line_num}: Found PORT '{port}' at index {i}")
                 break
             else:
                 mac_type_parts.append(parts[i])
         
-        mac_type = " ".join(mac_type_parts)
-        logger.info(f"  [PARSE] Line {line_num}: MAC Type='{mac_type}'")
-        
-        # Accept any entry with a valid port (DYNAMIC, STATIC, etc.)
         if port:
-            logger.info(f"  [PARSE] Line {line_num}: SUCCESS! Adding MAC entry: VLAN={vlan}, MAC={mac}, Type='{mac_type}', Port={port}")
+            mac_type = " ".join(mac_type_parts)
             entries.append({
                 "vlan": vlan,
                 "mac_address": mac,
                 "type": mac_type,
                 "port": port
             })
-        else:
-            logger.warning(f"  [PARSE] Line {line_num}: NO PORT FOUND - skipping. Parts were: {parts}")
     
-    logger.info(f"  [PARSE] ===== TOTAL ENTRIES FOUND: {len(entries)} =====")
     return entries
 
 def normalize_interface_name(intf):
@@ -973,11 +923,8 @@ def poll_port_for_mac(shell, interface, max_attempts=MAC_POLL_MAX_ATTEMPTS, inte
             cmd = f"show mac address-table interface {interface}"
             mac_out = send_cmd(shell, cmd, timeout=10, silent=True)
             
-            # Clean backspace characters from MAC table output
-            mac_out_clean = re.sub(r'.\b', '', mac_out)
-            mac_out_clean = mac_out_clean.replace('\b', '')
-            
-            entries = parse_mac_table_interface(mac_out_clean)
+            # NO BACKSPACE CLEANING - parser handles raw output
+            entries = parse_mac_table_interface(mac_out)
             
             if entries:
                 # SUCCESS - Found MAC address
