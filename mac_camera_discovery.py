@@ -14,11 +14,11 @@ from collections import deque
 # USER CONFIG
 # ============================================================================
 
-SEED_SWITCH_IP = "192.168.1.18"
+SEED_SWITCH_IP = ""
 TIMEOUT = 150
 MAX_READ = 65535
 CREDENTIAL_SETS = [
-    {"username": "admin", "password": "/2/_HKX6YvCGMwzAdJp", "enable": ""},
+    {"username": "", "password": "", "enable": ""},
 ]
 AGG_MAX_RETRIES = 3
 AGG_RETRY_DELAY = 5
