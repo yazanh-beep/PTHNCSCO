@@ -6,9 +6,9 @@ import logging
 from typing import Tuple, List, Optional
 
 # USER CONFIG
-AGG_IP = "192.168.1.1"
-USERNAME = "admin"
-PASSWORD = "cisco"
+AGG_IP = ""
+USERNAME = ""
+PASSWORD = ""
 TIMEOUT = 10
 MAX_READ = 65535
 
