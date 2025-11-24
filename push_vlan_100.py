@@ -8,8 +8,8 @@ import re
 from typing import Tuple, List, Optional
 
 # ========================= USER CONFIG =========================
-AGG_IP = "192.168.100.11"
-USERNAME = "admin"
+AGG_IP = ""
+USERNAME = ""
 PASSWORD = "cisco"
 TIMEOUT = 10
 MAX_READ = 65535
