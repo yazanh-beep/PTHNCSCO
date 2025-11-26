@@ -70,11 +70,11 @@ logger = logging.getLogger(__name__)
 # USER CONFIG
 # ============================================================================
 
-SEED_SWITCH_IP = ""
+SEED_SWITCH_IP = "192.168.1.1"
 TIMEOUT = 150
 MAX_READ = 65535
 CREDENTIAL_SETS = [
-    {"username": "", "password": "", "enable": ""},
+    {"username": "admin", "password": "cisco", "enable": ""},
 ]
 AGG_MAX_RETRIES = 3
 AGG_RETRY_DELAY = 5
@@ -482,15 +482,26 @@ def ssh_to_device(target_ip, expected_hostname=None, parent_hostname=None):
         except Exception:
             parent_hostname = agg_hostname or "UNKNOWN"
     logger.debug(f"[RETRY] Attempting SSH to {target_ip} from {parent_hostname}")
+    
+    # ========================================================================
+    # FIX: EXACT IP MATCHING (NOT SUBSTRING)
+    # ========================================================================
     try:
         ip_brief_out = send_cmd(agg_shell, "show ip interface brief", timeout=10, silent=True)
         for line in ip_brief_out.splitlines():
-            if target_ip in line and ("up" in line.lower() or "administratively" in line.lower()):
-                logger.info(f"Target IP {target_ip} belongs to current switch {parent_hostname} - already connected")
-                logger.info(f"This is not a separate device to SSH to - it's an interface on current switch")
-                return None
+            # Parse the IP address from the line (exact match, not substring)
+            parts = re.split(r"\s+", line.strip())
+            if len(parts) >= 2:
+                line_ip = parts[1]
+                # Exact IP match (not substring)
+                if line_ip == target_ip and ("up" in line.lower() or "administratively" in line.lower()):
+                    logger.info(f"Target IP {target_ip} belongs to current switch {parent_hostname} - already connected")
+                    logger.info(f"This is not a separate device to SSH to - it's an interface on current switch")
+                    return None
     except Exception as e:
         logger.debug(f"Could not check local IPs: {e}")
+    # ========================================================================
+    
     for attempt in range(1, SSH_HOP_RETRY_ATTEMPTS + 1):
         if attempt > 1:
             if SSH_HOP_USE_EXPONENTIAL_BACKOFF:
@@ -1018,8 +1029,7 @@ def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
                         "port": mac_entry["port"],
                         "mac_address": "UNKNOWN",
                         "vlan": "UNKNOWN",
-                        "status": "TIMEOUT - No MAC learned after 10 minutes",
-                        "timeout_seconds": MAC_POLL_HARD_TIMEOUT
+                        "status": "TIMEOUT - No MAC learned after 10 minutes"
                     }
                     camera_data.append(camera_info)
                     no_mac_count += 1
@@ -1707,15 +1717,18 @@ def main():
     if camera_data:
         csv_file = f"camera_inventory_{len(camera_data)}devices_{timestamp}.csv"
         with open(csv_file, "w", newline="", encoding='utf-8') as f:
-            # Include status field in CSV
+            # Include status field in CSV - no timeout_seconds field
             writer = csv.DictWriter(f, fieldnames=["switch_name", "switch_type", "port", "mac_address", "vlan", "status"])
             writer.writeheader()
             
             # Write rows with status (default to "OK" for legacy entries)
+            # Remove timeout_seconds if present (not in fieldnames)
             for row in camera_data:
                 if "status" not in row:
                     row["status"] = "OK"
-                writer.writerow(row)
+                # Create a copy without timeout_seconds
+                csv_row = {k: v for k, v in row.items() if k != "timeout_seconds"}
+                writer.writerow(csv_row)
         logger.info(f"Saved: {csv_file}")
     logger.info(f"Log file: {log_filename}")
 
