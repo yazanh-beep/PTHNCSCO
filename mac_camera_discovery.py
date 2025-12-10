@@ -850,10 +850,14 @@ def is_same_interface(intf1, intf2):
         return short_type1 == short_type2 and num1_clean == num2_clean
     return False
 
-def get_uplink_ports_from_neighbors(shell):
+def get_uplink_ports_from_neighbors(shell, current_switch_type="UNKNOWN"):
     """
     Discover uplink ports using CDP and LLDP.
-    Only marks AGGREGATE switches as uplinks (SERVER switches are scanned for cameras).
+    
+    Logic:
+    - On EDGE/SERVER switches: Only mark AGGREGATE switches as uplinks
+    - On AGGREGATE switches: Mark other AGGREGATE switches as uplinks
+    - This allows daisy-chained edge switches to scan each other
     """
     logger.info("Discovering uplink ports using CDP and LLDP...")
     uplink_ports = []
@@ -897,8 +901,11 @@ def get_uplink_ports_from_neighbors(shell):
     else:
         logger.info("LLDP not enabled")
     
-    # Only mark AGGREGATE switches as uplinks
+    # Determine which neighbor types should be considered uplinks
     for hostname, links in all_neighbors_by_hostname.items():
+        neighbor_type = determine_switch_type(hostname)
+        
+        # Only mark AGGREGATE switches as uplinks (this allows edge-to-edge scanning)
         if is_aggregate_switch(hostname):
             for nbr in links:
                 uplink_port = nbr.get("local_intf")
@@ -907,13 +914,15 @@ def get_uplink_ports_from_neighbors(shell):
                     if uplink_norm not in uplink_ports_normalized:
                         uplink_ports.append(uplink_port)
                         uplink_ports_normalized.add(uplink_norm)
-                        logger.info(f"UPLINK DETECTED: {uplink_port} -> {hostname} (via {nbr.get('source','?')})")
+                        logger.info(f"UPLINK DETECTED: {uplink_port} -> {hostname} (AGGREGATE via {nbr.get('source','?')})")
                     else:
                         logger.debug(f"UPLINK DUPLICATE: {uplink_port}")
                 else:
                     logger.warning(f"Could not determine uplink port for {hostname}")
         else:
-            logger.debug(f"Skipping {hostname} (not AGGREGATE)")
+            # Edge/Server/Other switches are NOT uplinks - they may have cameras
+            logger.debug(f"NOT marking as uplink: {hostname} ({neighbor_type})")
+    
     logger.info(f"Total uplinks identified: {len(uplink_ports)}")
     return uplink_ports
 
@@ -997,12 +1006,72 @@ def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
     """
     Enhanced camera discovery with infinite MAC polling for UP ports.
     Tracks both found cameras and ports with UNKNOWN MACs.
+    Also discovers downstream edge switches connected to this switch.
     """
     logger.info("="*80)
     logger.info(f"Scanning {switch_type} switch: {switch_hostname}")
     logger.info("="*80)
     
     overall_start = time.time()
+    
+    # FIRST: Discover downstream edge switches (before clearing MAC table)
+    downstream_switches = []
+    logger.info("Checking for downstream edge switches via CDP/LLDP...")
+    
+    # Get CDP neighbors
+    cdp_output = send_cmd(shell, "show cdp neighbors detail", timeout=CDP_LLDP_TIMEOUT, silent=True)
+    if "CDP is not enabled" not in cdp_output and "Invalid input" not in cdp_output:
+        cdp_neighbors = parse_cdp_neighbors(cdp_output)
+        for nbr in cdp_neighbors:
+            if nbr["hostname"] and nbr["mgmt_ip"]:
+                # CDP parser already filters for Cisco devices via platform field
+                hostname_to_ip.setdefault(nbr["hostname"], nbr["mgmt_ip"])
+                nbr_type = determine_switch_type(nbr["hostname"])
+                if nbr_type in ["EDGE", "SERVER"] and nbr["mgmt_ip"] not in visited_switches:
+                    downstream_switches.append({
+                        "hostname": nbr["hostname"],
+                        "ip": nbr["mgmt_ip"],
+                        "type": nbr_type,
+                        "local_port": nbr.get("local_intf")
+                    })
+                    logger.info(f"Found downstream {nbr_type} switch: {nbr['hostname']} ({nbr['mgmt_ip']}) on {nbr.get('local_intf')} [CDP/Cisco]")
+    
+    # Get LLDP neighbors
+    lldp_output = send_cmd(shell, "show lldp neighbors detail", timeout=CDP_LLDP_TIMEOUT, silent=True)
+    if "LLDP is not enabled" not in lldp_output and "Invalid input" not in lldp_output:
+        lldp_neighbors = parse_lldp_neighbors(lldp_output)
+        for nbr in lldp_neighbors:
+            if nbr["hostname"] and nbr["mgmt_ip"]:
+                # Verify it's a Cisco device (LLDP parser already does this, but double-check)
+                sys_descr = nbr.get("sys_descr", "").lower()
+                if not sys_descr or ("cisco ios" not in sys_descr and "cisco nx-os" not in sys_descr):
+                    logger.debug(f"Skipping non-Cisco LLDP neighbor: {nbr['hostname']}")
+                    continue
+                
+                if nbr["hostname"] in hostname_to_ip:
+                    authoritative_ip = hostname_to_ip[nbr["hostname"]]
+                    if authoritative_ip != nbr["mgmt_ip"]:
+                        nbr["mgmt_ip"] = authoritative_ip
+                else:
+                    hostname_to_ip[nbr["hostname"]] = nbr["mgmt_ip"]
+                
+                nbr_type = determine_switch_type(nbr["hostname"])
+                if nbr_type in ["EDGE", "SERVER"] and nbr["mgmt_ip"] not in visited_switches:
+                    # Check if already found via CDP
+                    already_found = any(ds["ip"] == nbr["mgmt_ip"] for ds in downstream_switches)
+                    if not already_found:
+                        downstream_switches.append({
+                            "hostname": nbr["hostname"],
+                            "ip": nbr["mgmt_ip"],
+                            "type": nbr_type,
+                            "local_port": nbr.get("local_intf")
+                        })
+                        logger.info(f"Found downstream {nbr_type} switch: {nbr['hostname']} ({nbr['mgmt_ip']}) on {nbr.get('local_intf')} [LLDP/Cisco]")
+    
+    if downstream_switches:
+        logger.info(f"Total downstream switches to process: {len(downstream_switches)}")
+    else:
+        logger.info("No downstream edge/server switches detected")
     
     logger.info("Clearing dynamic MAC address table...")
     send_cmd(shell, "clear mac address-table dynamic", timeout=10)
@@ -1011,7 +1080,7 @@ def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
     time.sleep(MAC_POLL_INITIAL_WAIT)
     logger.info("Starting per-port MAC polling (will wait indefinitely for UP ports)...")
     
-    uplink_ports = get_uplink_ports_from_neighbors(shell)
+    uplink_ports = get_uplink_ports_from_neighbors(shell, switch_type)
     if not uplink_ports:
         logger.warning(f"No uplink ports detected on {switch_hostname}")
     else:
@@ -1024,9 +1093,19 @@ def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
     scanned_count = 0
     no_mac_count = 0
     uplink_skip_count = 0
+    downstream_skip_count = 0
+    
+    # Build list of downstream switch ports to exclude from camera scanning
+    downstream_ports_normalized = set()
+    for ds in downstream_switches:
+        if ds["local_port"]:
+            downstream_ports_normalized.add(normalize_interface_name(ds["local_port"]))
     
     ports_to_scan = []
     for intf in up_interfaces:
+        intf_norm = normalize_interface_name(intf)
+        
+        # Check if it's an uplink
         is_uplink = False
         for upl in uplink_ports:
             if is_same_interface(intf, upl):
@@ -1034,10 +1113,21 @@ def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
                 logger.debug(f"SKIP: {intf} - UPLINK PORT")
                 uplink_skip_count += 1
                 break
-        if not is_uplink:
-            ports_to_scan.append(intf)
+        
+        if is_uplink:
+            continue
+        
+        # Check if it's a downstream switch port
+        if intf_norm in downstream_ports_normalized:
+            logger.debug(f"SKIP: {intf} - DOWNSTREAM SWITCH PORT")
+            downstream_skip_count += 1
+            continue
+        
+        ports_to_scan.append(intf)
     
     logger.info(f"Ports to scan for cameras: {len(ports_to_scan)}")
+    if downstream_skip_count > 0:
+        logger.info(f"Downstream switch ports excluded: {downstream_skip_count}")
     logger.info("")
     
     for batch_start in range(0, len(ports_to_scan), MAC_POLL_BATCH_SIZE):
@@ -1097,11 +1187,16 @@ def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
     logger.info(f"Summary for {switch_hostname}:")
     logger.info(f"  - Total UP interfaces: {len(up_interfaces)}")
     logger.info(f"  - Uplink ports excluded: {uplink_skip_count}")
+    if downstream_skip_count > 0:
+        logger.info(f"  - Downstream switch ports excluded: {downstream_skip_count}")
     logger.info(f"  - Ports scanned: {scanned_count}")
     logger.info(f"  - Cameras found: {camera_count}")
     logger.info(f"  - Ports with UNKNOWN MAC (timeouts): {no_mac_count}")
     logger.info(f"  - Total time: {overall_elapsed:.1f}s")
     logger.info("="*80)
+    
+    # Return list of downstream switches to be processed
+    return downstream_switches
 
 def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=False):
     """
@@ -1198,13 +1293,31 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
             return False
         
         try:
-            discover_cameras_from_switch(agg_shell, actual_hostname, switch_type)
+            downstream_switches = discover_cameras_from_switch(agg_shell, actual_hostname, switch_type)
             discovery_stats["switches_successfully_scanned"] += 1
             discovery_stats["switches_by_type"][switch_type]["successful"] += 1
             
             if is_retry:
                 discovery_stats["switches_recovered_on_retry"] += 1
                 logger.info(f"[RECOVERED] RETRY SUCCESS: {switch_name} recovered on retry from seed")
+            
+            # Process any downstream switches discovered
+            if downstream_switches:
+                logger.info(f"Processing {len(downstream_switches)} downstream switches from {actual_hostname}...")
+                for ds in downstream_switches:
+                    ds_neighbor_info = {
+                        "remote_name": ds["hostname"],
+                        "mgmt_ip": ds["ip"],
+                        "local_intf": ds["local_port"]
+                    }
+                    try:
+                        process_switch(switch_ip, ds_neighbor_info, ds["type"], is_retry=False)
+                    except NetworkConnectionError as ds_e:
+                        if getattr(ds_e, 'reconnect_needed', False):
+                            logger.error(f"Lost connection while processing downstream switch {ds['hostname']}")
+                            raise
+                        else:
+                            logger.error(f"Failed to process downstream switch {ds['hostname']}: {ds_e}")
             
         except NetworkConnectionError as e:
             if getattr(e, 'reconnect_needed', False):
