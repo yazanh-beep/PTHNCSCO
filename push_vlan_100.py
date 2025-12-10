@@ -430,20 +430,10 @@ def main():
         logger.error(f"Failed to connect to aggregation switch: {e}")
         sys.exit(1)
 
-    # 1) Configure aggregation switch itself first
+    # Use aggregation switch as jump host only (not configuring it)
     logger.info("=" * 68)
-    logger.info("CONFIGURING AGGREGATION SWITCH (FIRST)")
+    logger.info("USING AGGREGATION SWITCH AS JUMP HOST")
     logger.info("=" * 68)
-    try:
-        agg_label = agg_name.replace(" ", "_").replace(".", "_")
-        backup_config(shell, agg_label)
-        # Apply VLAN 100 on aggregation with the start_ip (adjust if you prefer a fixed agg IP)
-        apply_vlan_config(shell, start_ip_str, netmask)
-        trunks = find_trunk_interfaces(shell)
-        add_vlan_to_trunks(shell, trunks, VLAN_ID)
-    except Exception as e:
-        logger.error(f"[AGG] Failed to configure aggregation switch: {e}")
-        # Continue to devices anyway
 
     successful = []
     failed = []
