@@ -1736,8 +1736,9 @@ def main():
                 continue
                 
             if agg_ip in discovered_aggregates:
-                logger.info(f"Aggregate {agg_ip} already processed")
+                logger.info(f"Aggregate {agg_ip} already processed - skipping")
                 continue
+                
             logger.info("*"*80)
             logger.info(f"PROCESSING AGGREGATE: {agg_ip}")
             logger.info("*"*80)
@@ -1762,12 +1763,20 @@ def main():
                         break
                     
                     new_aggregates = scan_aggregate_switch(agg_shell, agg_ip)
+                    
+                    # ADD NEW AGGREGATES TO QUEUE - ensures aggregates discovered during Phase 2 are processed
                     for agg in new_aggregates:
                         if agg["mgmt_ip"] in seed_ips:
                             logger.info(f"Skipping {agg['hostname']} ({agg['mgmt_ip']}) - same as seed switch")
                             continue
-                        if agg["mgmt_ip"] not in discovered_aggregates and agg["mgmt_ip"] not in aggregates_to_process:
-                            aggregates_to_process.append(agg["mgmt_ip"])
+                        if agg["mgmt_ip"] not in discovered_aggregates:
+                            # Check if already in queue to avoid duplicates
+                            if agg["mgmt_ip"] not in aggregates_to_process:
+                                aggregates_to_process.append(agg["mgmt_ip"])
+                                logger.info(f">>> ADDED NEW AGGREGATE TO QUEUE: {agg['hostname']} ({agg['mgmt_ip']})")
+                            else:
+                                logger.debug(f"Aggregate {agg['hostname']} already in queue")
+
                             logger.info(f"Added new aggregate: {agg['hostname']} ({agg['mgmt_ip']})")
                     logger.info("Returning to seed...")
                     exit_device()
@@ -1782,20 +1791,31 @@ def main():
                         logger.error(f"Connection lost processing {agg_ip}")
                         discovery_stats["aggregates_reconnections"] += 1
                         if aggregate_reconnect_attempts < max_reconnects:
-                            logger.info(f"Reconnecting (attempt {aggregate_reconnect_attempts + 1})...")
+                            logger.info(f"Reconnecting (attempt {aggregate_reconnect_attempts + 1}/{max_reconnects})...")
                             try:
                                 reconnect_to_aggregate(f"Aggregate {agg_ip}")
-                                logger.info("Reconnected - will retry")
+                                logger.info("Reconnected - will continue with remaining aggregates")
+                                # Mark this aggregate as processed and move to next
+                                aggregate_processed = True
                             except NetworkConnectionError:
                                 if aggregate_reconnect_attempts >= max_reconnects - 1:
-                                    logger.error("Max reconnects reached. Moving to next.")
-                                    break
+                                    logger.error("Max reconnects reached. Moving to next aggregate.")
+                                    aggregate_processed = True
                         else:
-                            logger.error("Max reconnects reached. Moving to next.")
-                            break
+                            logger.error("Max reconnects reached. Moving to next aggregate.")
+                            aggregate_processed = True
                     else:
                         logger.error(f"Error processing {agg_ip}: {e}")
-                        break
+                        aggregate_processed = True
+            
+            # Log remaining queue size to monitor progress
+            if aggregates_to_process:
+                logger.info(f">>> {len(aggregates_to_process)} aggregate(s) remaining in queue")
+        
+        logger.info("="*80)
+        logger.info("PHASE 2 COMPLETE - ALL AGGREGATES PROCESSED")
+        logger.info("="*80)
+        
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
     finally:
