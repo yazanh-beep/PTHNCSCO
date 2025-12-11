@@ -98,7 +98,7 @@ MAC_POLL_HARD_TIMEOUT = 600      # 10 minutes absolute maximum per port (safety 
 # GLOBAL VARIABLES
 # ============================================================================
 
-PROMPT_RE = re.compile(r"(?m)^[^\r\n#>\s][^\r\n#>]*[>#]\s?$")
+PROMPT_RE = re.compile(r"(?m)^[^\r\n>\s][^\r\n>]*[>#]\s?$")
 
 visited_switches = set()
 discovered_aggregates = set()
