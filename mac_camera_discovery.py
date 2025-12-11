@@ -261,7 +261,8 @@ def get_hostname(shell):
     buff = expect_prompt(shell, timeout=4)
     for line in reversed(buff.splitlines()):
         line = line.strip()
-        m = re.match(r"^([^#>\s]+(?:\.[^#>\s]+)*)[#>]", line)
+        # Match anything except # > and whitespace, then ending with # or >
+        m = re.match(r"^([^\s#>]+)[#>]", line)
         if m:
             return m.group(1)
     return "Unknown"
