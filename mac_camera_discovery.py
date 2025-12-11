@@ -1699,14 +1699,21 @@ def main():
                     seed_scan_complete = True
                 else:
                     new_aggregates = scan_aggregate_switch(agg_shell, SEED_SWITCH_IP, resume_mode=False)
-                    for agg in new_aggregates:
-                        if agg["mgmt_ip"] in seed_ips:
-                            logger.info(f"Skipping {agg['hostname']} ({agg['mgmt_ip']}) - same as seed switch")
-                            continue
-                        if agg["mgmt_ip"] not in discovered_aggregates and agg["mgmt_ip"] not in aggregates_to_process:
-                            aggregates_to_process.append(agg["mgmt_ip"])
-                            logger.info(f"Added aggregate to queue: {agg['hostname']} ({agg['mgmt_ip']})")
-                    seed_scan_complete = True
+                
+                # Process discovered aggregates (OUTSIDE the if/else) - FIXED INDENTATION
+                for agg in new_aggregates:
+                    if agg["mgmt_ip"] in seed_ips:
+                        logger.info(f"Skipping {agg['hostname']} ({agg['mgmt_ip']}) - same as seed switch")
+                        continue
+                    
+                    # Add to queue if not already in queue
+                    if agg["mgmt_ip"] not in aggregates_to_process:
+                        aggregates_to_process.append(agg["mgmt_ip"])
+                        logger.info(f">>> ADDED NEW AGGREGATE TO QUEUE: {agg['hostname']} ({agg['mgmt_ip']})")
+                    else:
+                        logger.debug(f"Aggregate {agg['hostname']} already in queue")
+                
+                seed_scan_complete = True
                 break
             except NetworkConnectionError as e:
                 if getattr(e, 'reconnect_needed', False) or not verify_aggregate_connection():
@@ -1725,6 +1732,7 @@ def main():
                     else:
                         logger.error("Max reconnects reached. Exiting.")
                         return
+
         logger.info("="*80)
         logger.info(f"PHASE 2: PROCESSING {len(aggregates_to_process)} ADDITIONAL AGGREGATES")
         logger.info("="*80)
@@ -1764,18 +1772,19 @@ def main():
                     
                     new_aggregates = scan_aggregate_switch(agg_shell, agg_ip)
                     
-                    # ADD NEW AGGREGATES TO QUEUE - ensures aggregates discovered during Phase 2 are processed
+                    # ADD NEW AGGREGATES TO QUEUE - FIXED: removed discovered_aggregates check
                     for agg in new_aggregates:
                         if agg["mgmt_ip"] in seed_ips:
                             logger.info(f"Skipping {agg['hostname']} ({agg['mgmt_ip']}) - same as seed switch")
                             continue
-                        if agg["mgmt_ip"] not in discovered_aggregates:
-                            # Check if already in queue to avoid duplicates
-                            if agg["mgmt_ip"] not in aggregates_to_process:
-                                aggregates_to_process.append(agg["mgmt_ip"])
-                                logger.info(f">>> ADDED NEW AGGREGATE TO QUEUE: {agg['hostname']} ({agg['mgmt_ip']})")
-                            else:
-                                logger.debug(f"Aggregate {agg['hostname']} already in queue")
+                        
+                        # Add to queue if not already in queue (FIXED: no discovered_aggregates check)
+                        if agg["mgmt_ip"] not in aggregates_to_process:
+                            aggregates_to_process.append(agg["mgmt_ip"])
+                            logger.info(f">>> ADDED NEW AGGREGATE TO QUEUE: {agg['hostname']} ({agg['mgmt_ip']})")
+                        else:
+                            logger.debug(f"Aggregate {agg['hostname']} already in queue")
+                    
                     logger.info("Returning to seed...")
                     exit_device()
                     time.sleep(1)
