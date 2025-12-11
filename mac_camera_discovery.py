@@ -261,10 +261,10 @@ def get_hostname(shell):
     buff = expect_prompt(shell, timeout=4)
     for line in reversed(buff.splitlines()):
         line = line.strip()
-        # Match anything except # > and whitespace, then ending with # or >
-        m = re.match(r"^([^\s#>]+)[#>]", line)
-        if m:
-            return m.group(1)
+        # Cisco prompts always end with # or >
+        if line.endswith('#') or line.endswith('>'):
+            hostname = line[:-1]  # Remove last character
+            return hostname
     return "Unknown"
 
 def determine_switch_type(hostname):
