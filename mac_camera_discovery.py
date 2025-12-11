@@ -1776,8 +1776,6 @@ def main():
                                 logger.info(f">>> ADDED NEW AGGREGATE TO QUEUE: {agg['hostname']} ({agg['mgmt_ip']})")
                             else:
                                 logger.debug(f"Aggregate {agg['hostname']} already in queue")
-
-                            logger.info(f"Added new aggregate: {agg['hostname']} ({agg['mgmt_ip']})")
                     logger.info("Returning to seed...")
                     exit_device()
                     time.sleep(1)
