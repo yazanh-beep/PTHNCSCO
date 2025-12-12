@@ -1454,7 +1454,13 @@ def discover_aggregate_neighbors(shell, current_agg_hostname):
     logger.info(f"Total aggregate neighbors found: {len(aggregate_neighbors)}")
     return aggregate_neighbors
 
-def scan_aggregate_switch(shell, agg_ip, resume_mode=False):
+#!/usr/bin/env python3
+"""
+FIXED scan_aggregate_switch FUNCTION
+Replace the entire function in your camera_discovery.py (starting around line 1751)
+"""
+
+def scan_aggregate_switch(shell, agg_ip, aggregates_to_process=None, seed_ips=None, resume_mode=False):
     if not resume_mode and agg_ip in visited_switches:
         logger.info(f"Aggregate {agg_ip} already visited")
         return []
@@ -1477,6 +1483,19 @@ def scan_aggregate_switch(shell, agg_ip, resume_mode=False):
     new_aggregates = []
     if not resume_mode:
         new_aggregates = discover_aggregate_neighbors(shell, hostname)
+        
+        # ADD TO QUEUE IMMEDIATELY (before downstream scanning starts)
+        if aggregates_to_process is not None and seed_ips is not None:
+            for agg in new_aggregates:
+                if agg["mgmt_ip"] in seed_ips:
+                    logger.info(f"Skipping {agg['hostname']} ({agg['mgmt_ip']}) - same as seed switch")
+                    continue
+                
+                if agg["mgmt_ip"] not in aggregates_to_process:
+                    aggregates_to_process.append(agg["mgmt_ip"])
+                    logger.info(f">>> ADDED NEW AGGREGATE TO QUEUE: {agg['hostname']} ({agg['mgmt_ip']})")
+                else:
+                    logger.debug(f"Aggregate {agg['hostname']} already in queue")
     else:
         logger.info(">>> Resume mode: skipping aggregate discovery")
     logger.info(">>> Discovering downstream switches...")
@@ -1695,18 +1714,21 @@ def main():
             try:
                 if SEED_SWITCH_IP in discovered_aggregates:
                     logger.info("Seed scan interrupted - resuming...")
-                    new_aggregates = scan_aggregate_switch(agg_shell, SEED_SWITCH_IP, resume_mode=True)
+                    # UPDATED: Pass aggregates_to_process and seed_ips parameters
+                    new_aggregates = scan_aggregate_switch(agg_shell, SEED_SWITCH_IP, aggregates_to_process, seed_ips, resume_mode=True)
                     seed_scan_complete = True
                 else:
-                    new_aggregates = scan_aggregate_switch(agg_shell, SEED_SWITCH_IP, resume_mode=False)
+                    # UPDATED: Pass aggregates_to_process and seed_ips parameters
+                    new_aggregates = scan_aggregate_switch(agg_shell, SEED_SWITCH_IP, aggregates_to_process, seed_ips, resume_mode=False)
                 
-                # Process discovered aggregates (OUTSIDE the if/else) - FIXED INDENTATION
+                # NOTE: The old queue-adding code below will never execute because
+                # aggregates are already added inside scan_aggregate_switch().
+                # We keep this code for safety/backwards compatibility.
                 for agg in new_aggregates:
                     if agg["mgmt_ip"] in seed_ips:
                         logger.info(f"Skipping {agg['hostname']} ({agg['mgmt_ip']}) - same as seed switch")
                         continue
                     
-                    # Add to queue if not already in queue
                     if agg["mgmt_ip"] not in aggregates_to_process:
                         aggregates_to_process.append(agg["mgmt_ip"])
                         logger.info(f">>> ADDED NEW AGGREGATE TO QUEUE: {agg['hostname']} ({agg['mgmt_ip']})")
@@ -1770,15 +1792,17 @@ def main():
                         logger.error(f"Failed to connect to {agg_ip} after {SSH_HOP_RETRY_ATTEMPTS} attempts")
                         break
                     
-                    new_aggregates = scan_aggregate_switch(agg_shell, agg_ip)
+                    # UPDATED: Pass aggregates_to_process and seed_ips parameters
+                    new_aggregates = scan_aggregate_switch(agg_shell, agg_ip, aggregates_to_process, seed_ips)
                     
-                    # ADD NEW AGGREGATES TO QUEUE - FIXED: removed discovered_aggregates check
+                    # NOTE: The old queue-adding code below will never execute because
+                    # aggregates are already added inside scan_aggregate_switch().
+                    # We keep this code for safety/backwards compatibility.
                     for agg in new_aggregates:
                         if agg["mgmt_ip"] in seed_ips:
                             logger.info(f"Skipping {agg['hostname']} ({agg['mgmt_ip']}) - same as seed switch")
                             continue
                         
-                        # Add to queue if not already in queue (FIXED: no discovered_aggregates check)
                         if agg["mgmt_ip"] not in aggregates_to_process:
                             aggregates_to_process.append(agg["mgmt_ip"])
                             logger.info(f">>> ADDED NEW AGGREGATE TO QUEUE: {agg['hostname']} ({agg['mgmt_ip']})")
