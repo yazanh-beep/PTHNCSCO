@@ -18,12 +18,12 @@ from datetime import datetime
 from collections import deque
 
 # ─── USER CONFIG ─────────────────────────────────────────────────────────────
-AGGREGATE_ENTRY_IP = "192.168.195.254"  # First hop from the server
+AGGREGATE_ENTRY_IP = ""  # First hop from the server
 
 # Ordered credential sets to try (add more as needed)
 # "enable": "" means "reuse the login password as enable"
 CREDENTIAL_SETS = [
-    {"username": "admin",  "password": "S1mplex",  "enable": ""}
+    {"username": "",  "password": "",  "enable": ""}
 ]
 
 # Optional: pre-known aggregate SVI mgmt IPs (besides seed)
