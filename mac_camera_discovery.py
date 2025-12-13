@@ -856,9 +856,8 @@ def get_uplink_ports_from_neighbors(shell, current_switch_type="UNKNOWN"):
     Discover uplink ports using CDP and LLDP.
     
     Logic:
-    - On EDGE/SERVER switches: Only mark AGGREGATE switches as uplinks
-    - On AGGREGATE switches: Mark other AGGREGATE switches as uplinks
-    - This allows daisy-chained edge switches to scan each other
+    - Mark ALL switch neighbors as uplinks (aggregate, edge, server, other)
+    - This prevents scanning ANY port that connects to another switch
     """
     logger.info("Discovering uplink ports using CDP and LLDP...")
     uplink_ports = []
@@ -902,12 +901,12 @@ def get_uplink_ports_from_neighbors(shell, current_switch_type="UNKNOWN"):
     else:
         logger.info("LLDP not enabled")
     
-    # Determine which neighbor types should be considered uplinks
+    # Mark ALL switches as uplinks (don't scan ANY switch-connected ports)
     for hostname, links in all_neighbors_by_hostname.items():
         neighbor_type = determine_switch_type(hostname)
         
-        # Only mark AGGREGATE switches as uplinks (this allows edge-to-edge scanning)
-        if is_aggregate_switch(hostname):
+        # CHANGED: Mark ALL switch types as uplinks, not just aggregates
+        if neighbor_type in ["AGGREGATE", "EDGE", "SERVER", "OTHER"]:
             for nbr in links:
                 uplink_port = nbr.get("local_intf")
                 if uplink_port:
@@ -915,41 +914,59 @@ def get_uplink_ports_from_neighbors(shell, current_switch_type="UNKNOWN"):
                     if uplink_norm not in uplink_ports_normalized:
                         uplink_ports.append(uplink_port)
                         uplink_ports_normalized.add(uplink_norm)
-                        logger.info(f"UPLINK DETECTED: {uplink_port} -> {hostname} (AGGREGATE via {nbr.get('source','?')})")
+                        logger.info(f"UPLINK DETECTED: {uplink_port} -> {hostname} ({neighbor_type} via {nbr.get('source','?')})")
                     else:
                         logger.debug(f"UPLINK DUPLICATE: {uplink_port}")
                 else:
                     logger.warning(f"Could not determine uplink port for {hostname}")
         else:
-            # Edge/Server/Other switches are NOT uplinks - they may have cameras
-            logger.debug(f"NOT marking as uplink: {hostname} ({neighbor_type})")
+            # Not a switch - log it but don't mark as uplink
+            logger.debug(f"Non-switch neighbor detected: {hostname} ({neighbor_type})")
     
     logger.info(f"Total uplinks identified: {len(uplink_ports)}")
     return uplink_ports
 
 def select_camera_mac(entries, interface):
+    """
+    Return ALL unique MAC addresses found on the port.
+    Now returns a list of unique MACs instead of just one.
+    """
     count = len(entries)
     if count == 0:
         return None
-    elif count == 1:
+    
+    # Extract all unique MACs
+    unique_macs = []
+    seen_macs = set()
+    
+    for entry in entries:
+        mac = entry["mac_address"]
+        if mac not in seen_macs:
+            unique_macs.append(entry)
+            seen_macs.add(mac)
+    
+    unique_count = len(unique_macs)
+    total_count = len(entries)
+    dup_count = total_count - unique_count
+    
+    if unique_count == 1:
         logger.debug(f"  {interface}: Single MAC found")
-        return entries[0]
-    elif count == 2:
-        logger.info(f"  {interface}: 2 MACs found - Private VLAN detected")
-        return entries[0]
+    elif unique_count == 2:
+        logger.info(f"  {interface}: 2 unique MACs found (Private VLAN detected)")
+    elif dup_count > 0:
+        logger.info(f"  {interface}: {unique_count} unique MACs found ({dup_count} duplicates removed from {total_count} total)")
     else:
-        logger.warning(f"  {interface}: {count} MACs found - Taking first")
-        return entries[0]
+        logger.info(f"  {interface}: {unique_count} unique MACs found")
+    
+    return unique_macs  # Return list of all unique MAC entries
+
 
 def poll_port_for_mac(shell, interface, max_attempts=MAC_POLL_MAX_ATTEMPTS, interval=MAC_POLL_INTERVAL):
     """
-    Poll a specific port until MAC address appears.
-    
-    For UP/UP ports, we poll indefinitely (up to hard timeout) since an UP port
-    MUST have a device connected that will eventually send traffic.
+    Poll a specific port until MAC addresses appear.
     
     Returns:
-        dict: MAC entry when found, or dict with UNKNOWN MAC on timeout
+        list: List of MAC entries when found, or list with UNKNOWN MAC on timeout
     """
     logger.info(f"  [POLL] {interface} - waiting for MAC address...")
     
@@ -968,24 +985,23 @@ def poll_port_for_mac(shell, interface, max_attempts=MAC_POLL_MAX_ATTEMPTS, inte
             discovery_stats["total_ports_no_mac"] += 1
             
             # Return a special entry for UNKNOWN MAC
-            return {
+            return [{
                 "vlan": "UNKNOWN",
                 "mac_address": "UNKNOWN",
                 "type": "TIMEOUT",
                 "port": interface
-            }
+            }]
         
         try:
             cmd = f"show mac address-table interface {interface}"
             mac_out = send_cmd(shell, cmd, timeout=10, silent=True)
             
-            # NO BACKSPACE CLEANING - parser handles raw output
             entries = parse_mac_table_interface(mac_out)
             
             if entries:
-                # SUCCESS - Found MAC address
+                # SUCCESS - Found MAC addresses
                 logger.info(f"  [OK] {interface}: MAC found (attempt {attempt}, {elapsed:.1f}s)")
-                return select_camera_mac(entries, interface)
+                return select_camera_mac(entries, interface)  # Returns list of unique MACs
             
             # Log progress periodically
             time_since_last_log = elapsed - (last_log_time - start_time)
@@ -1006,7 +1022,7 @@ def poll_port_for_mac(shell, interface, max_attempts=MAC_POLL_MAX_ATTEMPTS, inte
 def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
     """
     Enhanced camera discovery with infinite MAC polling for UP ports.
-    Tracks both found cameras and ports with UNKNOWN MACs.
+    Tracks ALL unique MACs per port (not just one).
     Also discovers downstream edge switches connected to this switch.
     """
     logger.info("="*80)
@@ -1143,38 +1159,45 @@ def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
             scanned_count += 1
             logger.info(f"  Port {batch_start + idx}/{len(ports_to_scan)}: {intf}")
             
-            mac_entry = poll_port_for_mac(shell, intf)
+            mac_entries = poll_port_for_mac(shell, intf)  # Returns LIST of MAC entries
             
-            if mac_entry:
-                # Check if this is an UNKNOWN MAC (timeout case)
-                if mac_entry["mac_address"] == "UNKNOWN":
-                    # Port timed out - record as unknown
-                    camera_info = {
-                        "switch_name": switch_hostname,
-                        "switch_type": switch_type,
-                        "port": mac_entry["port"],
-                        "mac_address": "UNKNOWN",
-                        "vlan": "UNKNOWN",
-                        "status": "TIMEOUT - No MAC learned after 10 minutes"
-                    }
-                    camera_data.append(camera_info)
-                    no_mac_count += 1
-                    logger.warning(f"  [!] UNKNOWN MAC on {mac_entry['port']} - Port UP but no MAC learned (TIMEOUT)")
-                else:
-                    # Normal camera with valid MAC
-                    mac_formatted = convert_mac_format(mac_entry["mac_address"])
-                    camera_info = {
-                        "switch_name": switch_hostname,
-                        "switch_type": switch_type,
-                        "port": mac_entry["port"],
-                        "mac_address": mac_formatted,
-                        "vlan": mac_entry["vlan"],
-                        "status": "OK"
-                    }
-                    camera_data.append(camera_info)
-                    camera_count += 1
-                    discovery_stats["total_cameras_found"] += 1
-                    logger.info(f"  [+] Camera: {mac_formatted} on {mac_entry['port']} (VLAN {mac_entry['vlan']})")
+            if mac_entries:
+                for mac_entry in mac_entries:  # Loop through ALL MACs found on port
+                    # Check if this is an UNKNOWN MAC (timeout case)
+                    if mac_entry["mac_address"] == "UNKNOWN":
+                        camera_info = {
+                            "switch_name": switch_hostname,
+                            "switch_type": switch_type,
+                            "port": mac_entry["port"],
+                            "mac_address": "UNKNOWN",
+                            "vlan": "UNKNOWN",
+                            "mac_count": 1,
+                            "status": "TIMEOUT - No MAC learned after 10 minutes"
+                        }
+                        camera_data.append(camera_info)
+                        no_mac_count += 1
+                        logger.warning(f"  [!] UNKNOWN MAC on {mac_entry['port']} - Port UP but no MAC learned (TIMEOUT)")
+                    else:
+                        # Normal camera with valid MAC
+                        mac_formatted = convert_mac_format(mac_entry["mac_address"])
+                        camera_info = {
+                            "switch_name": switch_hostname,
+                            "switch_type": switch_type,
+                            "port": mac_entry["port"],
+                            "mac_address": mac_formatted,
+                            "vlan": mac_entry["vlan"],
+                            "mac_count": len(mac_entries),  # Track how many total MACs on this port
+                            "status": "OK"
+                        }
+                        camera_data.append(camera_info)
+                        camera_count += 1
+                        discovery_stats["total_cameras_found"] += 1
+                        
+                        # Enhanced logging for multiple MACs
+                        if len(mac_entries) > 1:
+                            logger.info(f"  [+] MAC {mac_entries.index(mac_entry)+1}/{len(mac_entries)}: {mac_formatted} on {mac_entry['port']} (VLAN {mac_entry['vlan']})")
+                        else:
+                            logger.info(f"  [+] Camera: {mac_formatted} on {mac_entry['port']} (VLAN {mac_entry['vlan']})")
         
         batch_elapsed = time.time() - batch_start_time
         logger.info(f"  Batch {batch_num} complete: {len(batch)} ports in {batch_elapsed:.1f}s")
@@ -1917,15 +1940,15 @@ def main():
     if camera_data:
         csv_file = f"camera_inventory_{len(camera_data)}devices_{timestamp}.csv"
         with open(csv_file, "w", newline="", encoding='utf-8') as f:
-            # Include status field in CSV - no timeout_seconds field
-            writer = csv.DictWriter(f, fieldnames=["switch_name", "switch_type", "port", "mac_address", "vlan", "status"])
+            # Updated fieldnames to include mac_count
+            writer = csv.DictWriter(f, fieldnames=["switch_name", "switch_type", "port", "mac_address", "vlan", "mac_count", "status"])
             writer.writeheader()
             
-            # Write rows with status (default to "OK" for legacy entries)
-            # Remove timeout_seconds if present (not in fieldnames)
             for row in camera_data:
                 if "status" not in row:
                     row["status"] = "OK"
+                if "mac_count" not in row:
+                    row["mac_count"] = 1
                 # Create a copy without timeout_seconds
                 csv_row = {k: v for k, v in row.items() if k != "timeout_seconds"}
                 writer.writerow(csv_row)
