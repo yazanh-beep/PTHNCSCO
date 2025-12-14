@@ -8,6 +8,8 @@ Smart Network Topology Discovery Tool (Cisco-CLI Nested SSH, Depth-Safe)
 - Robust cleanup on failed hops; reconnect seed only when truly lost
 - Hostname-change verification after hop (prevents false successes)
 - Handles hostnames with special characters (including # in the name)
+- Hardware-based device role recognition (C3850=aggregate, IE=field, etc.)
+- Tracks visited devices by hostname only (simpler, more reliable)
 - Exports: network_topology.json + discovery_metadata.txt
 """
 import paramiko
@@ -23,7 +25,9 @@ AGGREGATE_ENTRY_IP = ""  # First hop from the server
 # Ordered credential sets to try (add more as needed)
 # "enable": "" means "reuse the login password as enable"
 CREDENTIAL_SETS = [
-    {"username": "",  "password": "",  "enable": ""}
+       {"username": "",  "password": "",  "enable": ""} ,
+       {"username": "",  "password": "",  "enable": ""}
+
 ]
 
 # Optional: pre-known aggregate SVI mgmt IPs (besides seed)
@@ -81,9 +85,8 @@ class NetworkDiscovery:
     def __init__(self):
         # State
         self.devices = {}
-        self.to_visit = deque()
-        self.visited = set()
-        self.hostname_to_ip = {}
+        self.to_visit = deque()  # Queue of (ip, hostname) tuples
+        self.visited_hostnames = set()  # Track by hostname only
         self.seed_aggregate_ip = None
         self.agg_shell = None
         self.agg_client = None
@@ -110,6 +113,63 @@ class NetworkDiscovery:
                 self.log_file.flush()
             except Exception:
                 pass
+    
+    # ── Device Tracking Helpers ───────────────────────────────────────────
+    def is_device_visited(self, hostname):
+        """Check if a device has been visited by hostname."""
+        if not hostname:
+            return False
+        return hostname in self.visited_hostnames
+    
+    def mark_device_visited(self, hostname):
+        """Mark a device as visited using hostname."""
+        if hostname:
+            self.visited_hostnames.add(hostname)
+            self.log(f"  [TRACK] Marked hostname as visited: {hostname}", "DEBUG")
+    
+    def is_seed_device(self, hostname):
+        """Check if a hostname belongs to the seed aggregate switch."""
+        if not hostname or not self.agg_hostname:
+            return False
+        return hostname == self.agg_hostname
+    
+    def should_visit_device(self, ip, hostname):
+        """
+        Determine if a device should be added to the visit queue.
+        Returns True only if hostname has not been visited.
+        """
+        if not hostname:
+            self.log(f"  [TRACK] Skipping {ip} - no hostname", "DEBUG")
+            return False
+        
+        # Check if it's the seed device
+        if self.is_seed_device(hostname):
+            self.log(f"  [TRACK] Skipping seed device {hostname} ({ip})", "DEBUG")
+            return False
+        
+        # Check if already visited
+        if self.is_device_visited(hostname):
+            self.log(f"  [TRACK] Skipping {hostname} ({ip}) - already visited", "DEBUG")
+            return False
+        
+        # Check if already in queue
+        for queued_ip, queued_hostname in self.to_visit:
+            if queued_hostname == hostname:
+                self.log(f"  [TRACK] Skipping {hostname} ({ip}) - already in queue", "DEBUG")
+                return False
+        
+        return True
+    
+    def get_device_identifier(self, ip=None, hostname=None):
+        """Get a string identifier for a device (for logging)."""
+        if hostname and ip:
+            return f"{hostname} ({ip})"
+        elif hostname:
+            return hostname
+        elif ip:
+            return ip
+        else:
+            return "Unknown"
     
     # ── Prompt Detection ──────────────────────────────────────────────────
     def _looks_like_prompt(self, text):
@@ -326,6 +386,7 @@ class NetworkDiscovery:
             "CL-SCL-CNO1A-SMSACC1.4-1-12.CAM.INT" -> "CL-SCL-CNO1A-SMSACC1.4-1-12"
             "CL-SCL-CNO1A-SMSACC1.1K-1-17.CAM.INT" -> "CL-SCL-CNO1A-SMSACC1.1K-1-17"
             "P-035_#1_VSW30.CAM.INT" -> "P-035_#1_VSW30"
+            "US-DFW-MDN1A-SMSACC-2-500-2.switch18.loc" -> "US-DFW-MDN1A-SMSACC-2-500-2"
         """
         if not hostname:
             return hostname
@@ -334,6 +395,8 @@ class NetworkDiscovery:
         domain_suffixes = [
             r'\.CAM\.INT$',
             r'\.cam\.int$',
+            r'\.switch\d+\.loc(al)?$',  # .switch18.loc or .switch18.local
+            r'\.local$',
             # Add more domain patterns here if needed
             # r'\.example\.com$',
         ]
@@ -344,13 +407,126 @@ class NetworkDiscovery:
         
         return hostname
     
-    # ── Device role helper ────────────────────────────────────────────────
-    def determine_device_role(self, hostname):
-        up = (hostname or "").upper()
-        if "SRV" in up: return "server"
-        if "AGG" in up: return "aggregate"
-        if "ACC" in up: return "access"
-        if "IE"  in up: return "field"
+    # ── Device role determination (hardware + hostname based) ────────────
+    def determine_device_role(self, hostname, switch_model=None):
+        """
+        Determine device role based on hardware model and hostname.
+        
+        Hardware-based rules (highest priority):
+        - C3850/WS-C3850 -> Always aggregate
+        - IE-* (Industrial Ethernet) -> Always field
+        - C9300/WS-C9300 -> Depends on hostname (server if SRV, else access)
+        
+        Hostname-based rules (fallback):
+        - SRV -> server
+        - AGG/CORE -> aggregate
+        - ACC -> access
+        - IE/FIELD -> field
+        - EDGE -> access
+        
+        Args:
+            hostname: Device hostname
+            switch_model: Hardware model string (e.g., "WS-C3850-24P", "IE-4000-4TC4G-E")
+        
+        Returns:
+            str: Device role (aggregate, server, access, field, unknown)
+        """
+        # Normalize inputs
+        hostname_upper = (hostname or "").upper()
+        model_upper = (switch_model or "").upper()
+        
+        # ═══════════════════════════════════════════════════════════════
+        # HARDWARE-BASED RECOGNITION (Highest Priority)
+        # ═══════════════════════════════════════════════════════════════
+        
+        # Rule 1: Catalyst 3850 → Always aggregate
+        if any(pattern in model_upper for pattern in ['C3850', 'WS-C3850', 'CATALYST3850']):
+            self.log(f"  [ROLE] Hardware match: {switch_model} → aggregate (C3850 series)", "DEBUG")
+            return "aggregate"
+        
+        # Rule 2: Industrial Ethernet (IE-*) → Always field
+        if any(pattern in model_upper for pattern in ['IE-', 'INDUSTRIAL']):
+            self.log(f"  [ROLE] Hardware match: {switch_model} → field (Industrial Ethernet)", "DEBUG")
+            return "field"
+        
+        # Rule 3: Catalyst 9300 → Check hostname for server/access distinction
+        if any(pattern in model_upper for pattern in ['C9300', 'WS-C9300', 'CATALYST9300', 'C93']):
+            if "SRV" in hostname_upper or "SERVER" in hostname_upper:
+                self.log(f"  [ROLE] Hardware+Name match: {switch_model} + {hostname} → server (C9300 with SRV)", "DEBUG")
+                return "server"
+            else:
+                self.log(f"  [ROLE] Hardware match: {switch_model} → access (C9300 default)", "DEBUG")
+                return "access"
+        
+        # Rule 4: Other Catalyst 9000 series (9200, 9400, 9500, etc.)
+        if any(pattern in model_upper for pattern in ['C9200', 'C9400', 'C9500', 'C9600', 'WS-C9']):
+            # 9400/9500/9600 are typically aggregates or cores
+            if any(core in model_upper for core in ['C9400', 'C9500', 'C9600']):
+                self.log(f"  [ROLE] Hardware match: {switch_model} → aggregate (C9400/9500/9600 series)", "DEBUG")
+                return "aggregate"
+            # 9200 are typically access
+            if 'C9200' in model_upper:
+                self.log(f"  [ROLE] Hardware match: {switch_model} → access (C9200 series)", "DEBUG")
+                return "access"
+        
+        # Rule 5: Catalyst 2960 → Typically access
+        if any(pattern in model_upper for pattern in ['C2960', 'WS-C2960', 'CATALYST2960']):
+            self.log(f"  [ROLE] Hardware match: {switch_model} → access (C2960 series)", "DEBUG")
+            return "access"
+        
+        # Rule 6: Catalyst 2950 → Access
+        if any(pattern in model_upper for pattern in ['C2950', 'WS-C2950', 'CATALYST2950']):
+            self.log(f"  [ROLE] Hardware match: {switch_model} → access (C2950 series)", "DEBUG")
+            return "access"
+        
+        # Rule 7: Catalyst 3650 → Access (typically)
+        if any(pattern in model_upper for pattern in ['C3650', 'WS-C3650', 'CATALYST3650']):
+            self.log(f"  [ROLE] Hardware match: {switch_model} → access (C3650 series)", "DEBUG")
+            return "access"
+        
+        # Rule 8: Catalyst 3750 → Could be aggregate or access, check hostname
+        if any(pattern in model_upper for pattern in ['C3750', 'WS-C3750', 'CATALYST3750']):
+            if "AGG" in hostname_upper or "CORE" in hostname_upper or "DIST" in hostname_upper:
+                self.log(f"  [ROLE] Hardware+Name match: {switch_model} + {hostname} → aggregate (C3750 with AGG/CORE)", "DEBUG")
+                return "aggregate"
+            else:
+                self.log(f"  [ROLE] Hardware match: {switch_model} → access (C3750 default)", "DEBUG")
+                return "access"
+        
+        # Rule 9: Nexus switches → Typically aggregates/cores
+        if any(pattern in model_upper for pattern in ['NEXUS', 'N9K', 'N7K', 'N5K', 'N3K']):
+            self.log(f"  [ROLE] Hardware match: {switch_model} → aggregate (Nexus series)", "DEBUG")
+            return "aggregate"
+        
+        # ═══════════════════════════════════════════════════════════════
+        # HOSTNAME-BASED RECOGNITION (Fallback)
+        # ═══════════════════════════════════════════════════════════════
+        
+        if "SRV" in hostname_upper or "SERVER" in hostname_upper:
+            self.log(f"  [ROLE] Hostname match: {hostname} → server (SRV pattern)", "DEBUG")
+            return "server"
+        
+        if "AGG" in hostname_upper or "CORE" in hostname_upper or "DIST" in hostname_upper:
+            self.log(f"  [ROLE] Hostname match: {hostname} → aggregate (AGG/CORE pattern)", "DEBUG")
+            return "aggregate"
+        
+        if "ACC" in hostname_upper or "ACCESS" in hostname_upper:
+            self.log(f"  [ROLE] Hostname match: {hostname} → access (ACC pattern)", "DEBUG")
+            return "access"
+        
+        if "EDGE" in hostname_upper:
+            self.log(f"  [ROLE] Hostname match: {hostname} → access (EDGE pattern)", "DEBUG")
+            return "access"
+        
+        if "IE" in hostname_upper or "FIELD" in hostname_upper:
+            self.log(f"  [ROLE] Hostname match: {hostname} → field (IE/FIELD pattern)", "DEBUG")
+            return "field"
+        
+        # ═══════════════════════════════════════════════════════════════
+        # DEFAULT
+        # ═══════════════════════════════════════════════════════════════
+        
+        self.log(f"  [ROLE] No match for hostname='{hostname}' model='{switch_model}' → unknown", "DEBUG")
         return "unknown"
     
     # ── Basic getters ─────────────────────────────────────────────────────
@@ -418,23 +594,50 @@ class NetworkDiscovery:
         return None
     
     def get_switch_model(self, shell):
+        """
+        Extract switch model from 'show version' output.
+        Returns the most specific model identifier found.
+        """
         output = self.send_cmd(shell, "show version", timeout=10, silent=True)
+        
+        # Ordered patterns - more specific first
         pats = (
+            # Exact model number formats
             r"Model [Nn]umber\s*:?\s*(\S+)",
-            r"cisco\s+([A-Z0-9\-]+)\s+\([^\)]+\)\s+processor",
             r"Model:\s*(\S+)",
+            
+            # Catalyst formats (WS-C3850-24P, etc.)
+            r"cisco\s+(WS-C\d{4}[A-Z0-9\-]+)",
+            
+            # Modern Catalyst formats (C9300-24P, C3850-48T, etc.)
+            r"cisco\s+(C\d{4}[A-Z0-9\-]+)",
+            
+            # Industrial Ethernet formats (IE-4000-4TC4G-E, etc.)
+            r"cisco\s+(IE-\d{4}[A-Z0-9\-]+)",
+            
+            # Nexus formats
+            r"cisco\s+(N\d+K[A-Z0-9\-]*)",
+            
+            # Generic Cisco processor format
+            r"cisco\s+([A-Z0-9\-]+)\s+\([^\)]+\)\s+processor",
+            
+            # Hardware line
             r"Hardware:\s*(\S+)",
-            r"cisco\s+(WS-[A-Z0-9\-]+)",
-            r"cisco\s+(C[0-9]{4}[A-Z0-9\-]*)",
-            r"cisco\s+(IE-[0-9]{4}[A-Z0-9\-]*)",
+            
+            # System image file (less reliable)
             r"System image file is.*?:([A-Z0-9\-]+)",
         )
+        
         for pat in pats:
             m = re.search(pat, output, re.I)
             if m:
                 model = m.group(1)
-                if model.lower() not in ("unknown", "n/a", "bytes"):
+                # Filter out common false positives
+                if model.lower() not in ("unknown", "n/a", "bytes", "memory"):
+                    self.log(f"  [MODEL] Detected: {model}", "DEBUG")
                     return model
+        
+        self.log(f"  [MODEL] Could not detect switch model", "DEBUG")
         return None
     
     # ── Discovery pieces ──────────────────────────────────────────────────
@@ -617,21 +820,6 @@ class NetworkDiscovery:
                     neighbor["mgmt_ip"] = None
                     neighbor["note"] = "No management IP in LLDP"
                 
-                # Optional: Extract chassis ID for additional info
-                chassis_match = re.search(r"Chassis id:\s*([a-fA-F0-9.:]+)", block)
-                if chassis_match:
-                    neighbor["chassis_id"] = chassis_match.group(1)
-                
-                # Optional: Extract system capabilities
-                cap_match = re.search(r"System Capabilities:\s*([A-Z,\s]+)", block)
-                if cap_match:
-                    neighbor["capabilities"] = cap_match.group(1).strip()
-                
-                # Optional: Extract port description
-                port_desc_match = re.search(r"Port Description:\s*(.+?)(?=\n|$)", block)
-                if port_desc_match:
-                    neighbor["port_description"] = port_desc_match.group(1).strip()
-                
                 # Add discovery method marker
                 neighbor["discovered_via"] = "LLDP"
                 
@@ -663,10 +851,7 @@ class NetworkDiscovery:
                 protocols_used.append("CDP")
                 for nbr in cdp_neighbors:
                     nbr["discovered_via"] = "CDP"
-                    normalized_hn = nbr["hostname"]  # Already normalized by parser
-                    self.log(f"  [CDP] Storing {normalized_hn} -> {nbr['mgmt_ip']} globally", "DEBUG")
-                    # Store in global hostname_to_ip (CDP always wins)
-                    self.hostname_to_ip[normalized_hn] = nbr["mgmt_ip"]
+                    normalized_hn = nbr["hostname"]
                     all_by_host.setdefault(normalized_hn, []).append(nbr)
         else:
             self.log("CDP not enabled or available")
@@ -689,11 +874,9 @@ class NetworkDiscovery:
                 protocols_used.append("LLDP")
                 for nbr in lldp_neighbors:
                     nbr["discovered_via"] = "LLDP"
-                    normalized_hn = nbr["hostname"]  # Already normalized by parser
+                    normalized_hn = nbr["hostname"]
                     
-                    self.log(f"  [LLDP] Processing {normalized_hn} with IP {nbr.get('mgmt_ip')}", "DEBUG")
-                    
-                    # Check for duplicates BEFORE modifying IP or adding to all_by_host
+                    # Check for duplicates BEFORE adding
                     is_dup_intf = False
                     if normalized_hn in all_by_host:
                         lldp_intf_norm = self.normalize_interface_name(nbr["local_intf"]) if nbr["local_intf"] else None
@@ -708,21 +891,7 @@ class NetworkDiscovery:
                     if is_dup_intf:
                         continue
                     
-                    # Process IP address (prefer globally-known CDP IP if available)
-                    if normalized_hn in self.hostname_to_ip:
-                        auth_ip = self.hostname_to_ip[normalized_hn]
-                        if nbr["mgmt_ip"] != auth_ip:
-                            self.log(f"  [LLDP] IP differs: Global={auth_ip} vs LLDP={nbr['mgmt_ip']}, using Global IP", "INFO")
-                            nbr["lldp_ip"] = nbr["mgmt_ip"]
-                            nbr["mgmt_ip"] = auth_ip
-                        else:
-                            self.log(f"  [LLDP] IPs match, both are {auth_ip}", "DEBUG")
-                    else:
-                        self.log(f"  [LLDP] {normalized_hn} NOT in global map, using LLDP IP {nbr['mgmt_ip']}", "DEBUG")
-                        if nbr["mgmt_ip"]:
-                            self.hostname_to_ip[normalized_hn] = nbr["mgmt_ip"]
-                    
-                    # Add to all_by_host only if not a duplicate
+                    # Add to all_by_host
                     all_by_host.setdefault(normalized_hn, []).append(nbr)
         else:
             self.log("LLDP not enabled or available")
@@ -911,12 +1080,12 @@ class NetworkDiscovery:
         
         raise NetworkConnectionError(f"Failed to connect to seed after {AGG_MAX_RETRIES} attempts: {last_err}")
     
-    def ssh_to_device(self, target_ip, attempt=1):
+    def ssh_to_device(self, target_ip, target_hostname=None, attempt=1):
         """SSH hop from aggregate to target using IOS CLI."""
         if not self.agg_shell or self.agg_shell.closed:
             raise NetworkConnectionError("SSH shell to aggregation switch is closed", reconnect_needed=True)
         
-        self.log(f"SSH hop to {target_ip} (attempt {attempt}/{SSH_RETRY_ATTEMPTS})")
+        self.log(f"SSH hop to {self.get_device_identifier(target_ip, target_hostname)} (attempt {attempt}/{SSH_RETRY_ATTEMPTS})")
         
         try:
             pre_host = self.get_hostname(self.agg_shell) or self.agg_hostname or "UNKNOWN"
@@ -965,11 +1134,11 @@ class NetworkDiscovery:
                     post_host = ""
                 
                 if post_host.strip() == pre_host.strip():
-                    self.log(f"Hop to {target_ip} did not change hostname (still '{pre_host}'). Treating as failure.", "WARN")
+                    self.log(f"[SSH] Hop to {target_ip} did not change hostname (still '{pre_host}').", "WARN")
+                    self.log(f"[SSH] This means {target_ip} is another IP on the seed device - skipping", "INFO")
                     self.cleanup_failed_session()
-                    if not self.verify_aggregate_connection():
-                        raise NetworkConnectionError("Connection to aggregation switch lost", reconnect_needed=True)
-                    continue
+                    # Return False to mark as inaccessible (seed device)
+                    return False
                 
                 # Success!
                 self.session_depth += 1
@@ -984,7 +1153,7 @@ class NetworkDiscovery:
             time.sleep(SSH_RETRY_DELAY)
             if not self.verify_aggregate_connection():
                 raise NetworkConnectionError("Lost connection to aggregation switch during retry delay", reconnect_needed=True)
-            return self.ssh_to_device(target_ip, attempt + 1)
+            return self.ssh_to_device(target_ip, target_hostname, attempt + 1)
         
         raise NetworkConnectionError(f"SSH to {target_ip} failed after {SSH_RETRY_ATTEMPTS} attempts",
                                      reconnect_needed=False, retry_allowed=False)
@@ -1012,9 +1181,9 @@ class NetworkDiscovery:
             return False
     
     # ── Core collection ───────────────────────────────────────────────────
-    def collect_device_info(self, mgmt_ip, skip_discovery=False):
+    def collect_device_info(self, mgmt_ip, hostname=None, skip_discovery=False):
         self.log("\n" + "="*60)
-        self.log(f"Collecting data from: {mgmt_ip}")
+        self.log(f"Collecting data from: {self.get_device_identifier(mgmt_ip, hostname)}")
         
         if skip_discovery:
             self.log("  Skipping discovery for seed aggregate switch")
@@ -1026,57 +1195,45 @@ class NetworkDiscovery:
         ssh_accessible = True
         if mgmt_ip != AGGREGATE_ENTRY_IP:
             try:
-                if not self.ssh_to_device(mgmt_ip):
+                if not self.ssh_to_device(mgmt_ip, hostname):
                     ssh_accessible = False
             except NetworkConnectionError as e:
                 if getattr(e, 'reconnect_needed', False) or not self.verify_aggregate_connection():
                     self.reconnect_to_aggregate("Lost while hopping to device")
                     try:
-                        if not self.ssh_to_device(mgmt_ip):
+                        if not self.ssh_to_device(mgmt_ip, hostname):
                             ssh_accessible = False
                     except Exception:
                         ssh_accessible = False
                 else:
                     ssh_accessible = False
             
-            if ssh_accessible:
-                current_host = self.get_hostname(self.agg_shell)
-                if current_host.strip() == (self.agg_hostname or "").strip():
-                    self.log("Detected aggregate prompt after hop; retrying hop once...", "WARN")
-                    self.cleanup_failed_session()
-                    if not self.verify_aggregate_connection():
-                        self.reconnect_to_aggregate("Seed lost after false hop")
-                    if not self.ssh_to_device(mgmt_ip):
-                        ssh_accessible = False
-            
             if not ssh_accessible:
                 self.log(f" Cannot SSH to {mgmt_ip} - marking as inaccessible", "WARN")
-                hostname = "Unknown"
-                platform = None
-                discovered_via = None
                 
-                for device_ip, device_data in self.devices.items():
-                    for nbr in device_data.get("neighbors", []):
-                        if nbr.get("neighbor_mgmt_ip") == mgmt_ip:
-                            hostname = nbr.get("neighbor_hostname", "Unknown")
-                            discovered_via = nbr.get("discovered_via")
-                            if hasattr(self, '_neighbor_platform_cache'):
-                                platform = self._neighbor_platform_cache.get(mgmt_ip)
-                            break
-                    if hostname != "Unknown":
-                        break
-                
-                if hostname == "Unknown":
-                    for hn, ip in self.hostname_to_ip.items():
-                        if ip == mgmt_ip:
-                            hostname = hn
+                # Use the hostname from the queue if available
+                if not hostname:
+                    # Search through neighbor data
+                    for device_ip, device_data in self.devices.items():
+                        for nbr in device_data.get("neighbors", []):
+                            if nbr.get("neighbor_mgmt_ip") == mgmt_ip:
+                                hostname = nbr.get("neighbor_hostname", "Unknown")
+                                discovered_via = nbr.get("discovered_via")
+                                if hasattr(self, '_neighbor_platform_cache'):
+                                    platform = self._neighbor_platform_cache.get(mgmt_ip)
+                                break
+                        if hostname:
                             break
                 
-                device_role = self.determine_device_role(hostname) if hostname != "Unknown" else "unknown"
+                if not hostname:
+                    hostname = "Unknown"
+                
+                platform = self._neighbor_platform_cache.get(mgmt_ip) if hasattr(self, '_neighbor_platform_cache') else None
+                
+                # Use hardware-based role determination with platform info
+                device_role = self.determine_device_role(hostname, platform)
                 
                 note_parts = ["Inaccessible via SSH"]
-                if discovered_via:
-                    note_parts.append(f"Discovered via {discovered_via}")
                 
                 return {
                     "hostname": hostname,
@@ -1098,13 +1255,12 @@ class NetworkDiscovery:
             actual_mgmt_ip = self.get_management_ip(shell) or mgmt_ip
             self.log(f"Management IP (SVI): {actual_mgmt_ip}")
             
-            if hostname not in self.hostname_to_ip:
-                self.hostname_to_ip[hostname] = actual_mgmt_ip
-            
             serial = self.get_serial_number(shell)
             ios_version = self.get_ios_version(shell)
             switch_model = self.get_switch_model(shell)
-            device_role = self.determine_device_role(hostname)
+            
+            # Use hardware + hostname based role determination
+            device_role = self.determine_device_role(hostname, switch_model)
             
             self.log(f"Serial Number: {serial}")
             self.log(f"IOS Version: {ios_version}")
@@ -1128,13 +1284,16 @@ class NetworkDiscovery:
             for nbr in neighbors:
                 discovery_method = nbr.get("discovered_via", "Unknown")
                 link_note = nbr.get("link_note", "")
-                self.log(f"  → Neighbor: {nbr['hostname']} ({nbr['mgmt_ip']}) "
+                neighbor_hostname = nbr['hostname']
+                neighbor_ip = nbr['mgmt_ip']
+                
+                self.log(f"  → Neighbor: {neighbor_hostname} ({neighbor_ip}) "
                          f"via {nbr['local_intf']} ↔ {nbr['remote_intf']} [{discovery_method}]"
                          f"{' ['+link_note+']' if link_note else ''}")
                 
                 neighbor_entry = {
-                    "neighbor_hostname": nbr["hostname"],
-                    "neighbor_mgmt_ip": nbr["mgmt_ip"],
+                    "neighbor_hostname": neighbor_hostname,
+                    "neighbor_mgmt_ip": neighbor_ip,
                     "local_interface": nbr["local_intf"],
                     "remote_interface": nbr["remote_intf"],
                     "discovered_via": discovery_method
@@ -1144,14 +1303,10 @@ class NetworkDiscovery:
                 
                 device_info["neighbors"].append(neighbor_entry)
                 
-                if nbr["mgmt_ip"] not in self.visited and nbr["mgmt_ip"] != self.seed_aggregate_ip:
-                    if nbr["mgmt_ip"] not in self.to_visit:
-                        self.to_visit.append(nbr["mgmt_ip"])
-                        self.log(f"    Added {nbr['mgmt_ip']} to discovery queue")
-                    else:
-                        self.log(f"    {nbr['mgmt_ip']} already in discovery queue")
-                elif nbr["mgmt_ip"] == self.seed_aggregate_ip:
-                    self.log(f"    Skipping seed aggregate {nbr['mgmt_ip']} - already discovered")
+                # Check if we should visit this neighbor
+                if self.should_visit_device(neighbor_ip, neighbor_hostname):
+                    self.to_visit.append((neighbor_ip, neighbor_hostname))
+                    self.log(f"    Added {self.get_device_identifier(neighbor_ip, neighbor_hostname)} to discovery queue")
             
             if mgmt_ip != AGGREGATE_ENTRY_IP:
                 ok = self.exit_device()
@@ -1190,13 +1345,12 @@ class NetworkDiscovery:
             hostname = self.get_hostname(self.agg_shell)
             self.log(f"Hostname: {hostname}")
             
-            if hostname not in self.hostname_to_ip:
-                self.hostname_to_ip[hostname] = agg_mgmt_ip
-            
             serial = self.get_serial_number(self.agg_shell)
             ios_version = self.get_ios_version(self.agg_shell)
             switch_model = self.get_switch_model(self.agg_shell)
-            device_role = self.determine_device_role(hostname)
+            
+            # Use hardware + hostname based role determination
+            device_role = self.determine_device_role(hostname, switch_model)
             
             neighbors, protocol = self.discover_neighbors(self.agg_shell, agg_mgmt_ip)
             
@@ -1215,13 +1369,16 @@ class NetworkDiscovery:
             for nbr in neighbors:
                 discovery_method = nbr.get("discovered_via", "Unknown")
                 link_note = nbr.get("link_note", "")
-                self.log(f"  → Neighbor: {nbr['hostname']} ({nbr['mgmt_ip']}) "
+                neighbor_hostname = nbr['hostname']
+                neighbor_ip = nbr['mgmt_ip']
+                
+                self.log(f"  → Neighbor: {neighbor_hostname} ({neighbor_ip}) "
                          f"via {nbr['local_intf']} ↔ {nbr['remote_intf']} [{discovery_method}]"
                          f"{' ['+link_note+']' if link_note else ''}")
                 
                 entry = {
-                    "neighbor_hostname": nbr["hostname"],
-                    "neighbor_mgmt_ip": nbr["mgmt_ip"],
+                    "neighbor_hostname": neighbor_hostname,
+                    "neighbor_mgmt_ip": neighbor_ip,
                     "local_interface": nbr["local_intf"],
                     "remote_interface": nbr["remote_intf"],
                     "discovered_via": discovery_method
@@ -1231,39 +1388,55 @@ class NetworkDiscovery:
                 
                 seed_info["neighbors"].append(entry)
                 
-                if nbr["mgmt_ip"] not in self.to_visit:
-                    self.to_visit.append(nbr["mgmt_ip"])
-                    self.log(f"    Added {nbr['mgmt_ip']} to discovery queue")
-                else:
-                    self.log(f"    {nbr['mgmt_ip']} already in discovery queue")
+                # Check if we should visit this neighbor
+                if self.should_visit_device(neighbor_ip, neighbor_hostname):
+                    self.to_visit.append((neighbor_ip, neighbor_hostname))
+                    self.log(f"    Added {self.get_device_identifier(neighbor_ip, neighbor_hostname)} to discovery queue")
             
-            self.devices[agg_mgmt_ip] = seed_info
-            self.visited.add(agg_mgmt_ip)
+            self.devices[hostname] = seed_info  # Store by hostname
+            self.mark_device_visited(hostname)
         
         except NetworkConnectionError:
             self.reconnect_to_aggregate("During seed info collection")
         except Exception as e:
             self.log(f"Error collecting seed aggregate info: {e}", "ERROR")
         
+        # Add any pre-configured aggregate IPs
         for ip in AGGREGATE_MGMT_IPS:
-            if ip != agg_mgmt_ip and ip not in self.visited and ip not in self.to_visit:
-                self.to_visit.append(ip)
+            # We don't know the hostname yet, so we'll discover it when we visit
+            if (ip, None) not in self.to_visit:
+                self.to_visit.append((ip, None))
+                self.log(f"  Added pre-configured aggregate {ip} to queue")
         
+        # Main discovery loop
         while self.to_visit:
-            current_ip = self.to_visit.popleft()
-            if current_ip in self.visited:
-                self.log(f"Skipping {current_ip} - already visited")
+            current_ip, current_hostname = self.to_visit.popleft()
+            
+            # Double-check if already visited by hostname
+            if current_hostname and self.is_device_visited(current_hostname):
+                self.log(f"Skipping {self.get_device_identifier(current_ip, current_hostname)} - already visited")
                 continue
             
             if not self.verify_aggregate_connection():
                 self.reconnect_to_aggregate("Before visiting next device")
             
-            self.visited.add(current_ip)
-            info = self.collect_device_info(current_ip)
+            # Collect device info
+            info = self.collect_device_info(current_ip, current_hostname)
             if info:
-                self.devices[current_ip] = info
+                discovered_hostname = info.get("hostname")
+                if discovered_hostname and discovered_hostname != "Unknown":
+                    self.devices[discovered_hostname] = info  # Store by hostname
+                    self.mark_device_visited(discovered_hostname)
+                else:
+                    # Fallback to IP if no hostname
+                    self.devices[current_ip] = info
+                    if current_hostname:
+                        self.mark_device_visited(current_hostname)
             else:
                 self.log(f"Failed to collect info from {current_ip}", "ERROR")
+                # Still mark as visited to avoid retrying
+                if current_hostname:
+                    self.mark_device_visited(current_hostname)
         
         try:
             if self.agg_client:
@@ -1275,6 +1448,7 @@ class NetworkDiscovery:
         self.log("="*60)
         self.log(f"Discovery complete! Found {len(self.devices)} devices")
         self.log(f"Total discovery time: {duration:.1f} seconds")
+        self.log(f"Devices tracked by hostname: {len(self.visited_hostnames)}")
         self.log("="*60)
     
     # ── Output writers ────────────────────────────────────────────────────
@@ -1322,8 +1496,10 @@ class NetworkDiscovery:
             f.write(f"Discovery Time: {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Entry Point: {AGGREGATE_ENTRY_IP}\n")
             f.write(f"Seed Aggregate: {self.seed_aggregate_ip}\n")
+            f.write(f"Seed Hostname: {self.agg_hostname}\n")
             f.write(f"Duration: {duration:.1f} seconds\n")
-            f.write(f"Total Devices Discovered: {len(self.devices)}\n\n")
+            f.write(f"Total Devices Discovered: {len(self.devices)}\n")
+            f.write(f"Devices Tracked by Hostname: {len(self.visited_hostnames)}\n\n")
             
             f.write("="*60 + "\n")
             f.write("DEVICE ROLES\n")
@@ -1375,10 +1551,15 @@ class NetworkDiscovery:
                 f.write(f"Connections with multiple links: {multiple_link_count}\n")
             
             f.write("\n" + "="*60 + "\n")
-            f.write("HOSTNAME TO IP MAPPING\n")
+            f.write("DISCOVERED DEVICES (BY HOSTNAME)\n")
             f.write("="*60 + "\n")
-            for hostname, ip in sorted(self.hostname_to_ip.items()):
-                f.write(f"{hostname} → {ip}\n")
+            for hostname in sorted(self.visited_hostnames):
+                # Find the device info
+                device_info = self.devices.get(hostname)
+                if device_info:
+                    f.write(f"{hostname} → {device_info.get('management_ip', 'N/A')}\n")
+                else:
+                    f.write(f"{hostname} → (info not available)\n")
         
         self.log(f"✓ Metadata saved to {filename}")
 
