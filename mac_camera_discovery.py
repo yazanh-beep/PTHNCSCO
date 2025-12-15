@@ -74,7 +74,8 @@ SEED_SWITCH_IP = ""
 TIMEOUT = 150
 MAX_READ = 65535
 CREDENTIAL_SETS = [
-    {"username": "", "password": "", "enable": ""},
+    {"username": "",  "password": "",  "enable": ""} ,
+    {"username": "",  "password": "",  "enable": ""}
 ]
 AGG_MAX_RETRIES = 3
 AGG_RETRY_DELAY = 5
@@ -92,7 +93,30 @@ MAC_POLL_MAX_ATTEMPTS = 999999   # Effectively infinite (relies on hard timeout)
 MAC_POLL_INITIAL_WAIT = 15       # Initial wait after clearing table
 MAC_POLL_BATCH_SIZE = 100        # Ports per batch
 MAC_POLL_BATCH_PAUSE = 2         # Pause between batches
-MAC_POLL_HARD_TIMEOUT = 600      # 10 minutes absolute maximum per port (safety net)
+MAC_POLL_HARD_TIMEOUT = 180      # 10 minutes absolute maximum per port (safety net)
+
+#--- SWITCH TYPE DETECTION BY HARDWARE MODEL ---
+HARDWARE_MODEL_MAPPING = {
+    # Catalyst 3850 = Always Aggregate
+    "3850": "AGGREGATE",
+    "WS-C3850": "AGGREGATE",
+    
+    # Catalyst 3650 = Always Access/Edge
+    "3650": "EDGE",
+    "WS-C3650": "EDGE",
+    
+    # Catalyst 9300 = Access or Server (we'll check hostname for "SRV")
+    "9300": "EDGE",  # Default to EDGE, but override if hostname has "SRV"
+    "C9300": "EDGE",
+    
+    # Industrial Ethernet = Always Field/Edge
+    "IE-": "EDGE",           # IE-3300, IE-3400, etc.
+    "IE-3": "EDGE",
+    "IE-4": "EDGE",
+    "IE-5": "EDGE",
+    "ESS-": "EDGE",
+    "CGS-": "EDGE",
+}
 
 # ============================================================================
 # GLOBAL VARIABLES
@@ -283,8 +307,21 @@ def determine_switch_type(hostname):
         return "EDGE"
     return "OTHER"
 
-def is_aggregate_switch(hostname):
-    return determine_switch_type(hostname) == "AGGREGATE"
+def is_aggregate_switch(hostname, hardware_model=None):
+    """
+    Check if a switch is an aggregate switch.
+    Now supports hardware model detection.
+    
+    Args:
+        hostname: Switch hostname
+        hardware_model: Hardware model string (optional)
+    
+    Returns:
+        bool: True if aggregate switch
+    """
+    switch_type = determine_switch_type(hostname, hardware_model)
+    return switch_type == "AGGREGATE"
+
 
 def is_server_switch(hostname):
     return determine_switch_type(hostname) == "SERVER"
@@ -733,6 +770,154 @@ def get_interface_status(shell):
     
     return up_interfaces
 
+def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
+    """
+    Enhanced camera discovery with infinite MAC polling for UP ports.
+    Tracks ALL unique MACs per port (not just one).
+    Excludes ANY port with a CDP/LLDP neighbor.
+    
+    FIXED: Uses normalized interface name sets for reliable port exclusion
+    """
+    logger.info("="*80)
+    logger.info(f"Scanning {switch_type} switch: {switch_hostname}")
+    logger.info("="*80)
+
+    hardware_model = get_switch_hardware_model(shell)
+    if hardware_model:
+        logger.info(f"Hardware model: {hardware_model}")
+        # Re-determine switch type with hardware info
+        detected_type = determine_switch_type(switch_hostname, hardware_model)
+        if detected_type != switch_type:
+            logger.info(f"Switch type updated: {switch_type} -> {detected_type} (based on hardware)")
+            switch_type = detected_type
+    
+    overall_start = time.time()
+    
+    # No more downstream switch discovery - handled by neighbor port exclusion
+    downstream_switches = []
+    
+    logger.info("Clearing dynamic MAC address table...")
+    send_cmd(shell, "clear mac address-table dynamic", timeout=10)
+    
+    logger.info(f"Waiting {MAC_POLL_INITIAL_WAIT}s for initial MAC table repopulation...")
+    time.sleep(MAC_POLL_INITIAL_WAIT)
+    logger.info("Starting per-port MAC polling (will wait indefinitely for UP ports)...")
+    
+    # Get ALL ports with CDP/LLDP neighbors (these will be excluded)
+    neighbor_ports = get_uplink_ports_from_neighbors(shell, switch_type)
+    if not neighbor_ports:
+        logger.warning(f"No CDP/LLDP neighbors detected on {switch_hostname}")
+    else:
+        logger.info(f"Ports with neighbors to exclude: {len(neighbor_ports)}")
+    
+    # FIXED: Pre-normalize all neighbor ports for faster/reliable comparison
+    neighbor_ports_normalized = set()
+    for port in neighbor_ports:
+        normalized = normalize_interface_name(port)
+        neighbor_ports_normalized.add(normalized)
+        logger.debug(f"Neighbor port normalized: {port} -> {normalized}")
+    
+    up_interfaces = get_interface_status(shell)
+    logger.info(f"Found {len(up_interfaces)} UP interfaces total")
+    
+    camera_count = 0
+    scanned_count = 0
+    no_mac_count = 0
+    neighbor_skip_count = 0
+    
+    # Build list of ports to scan (exclude any with neighbors)
+    ports_to_scan = []
+    for intf in up_interfaces:
+        # FIXED: Normalize interface before checking
+        intf_normalized = normalize_interface_name(intf)
+        
+        # Check if this port has a CDP/LLDP neighbor
+        if intf_normalized in neighbor_ports_normalized:
+            logger.debug(f"SKIP: {intf} (normalized: {intf_normalized}) - HAS CDP/LLDP NEIGHBOR")
+            neighbor_skip_count += 1
+            continue
+        
+        ports_to_scan.append(intf)
+    
+    logger.info(f"Ports to scan for cameras: {len(ports_to_scan)}")
+    if neighbor_skip_count > 0:
+        logger.info(f"Ports with neighbors excluded: {neighbor_skip_count}")
+    logger.info("")
+    
+    for batch_start in range(0, len(ports_to_scan), MAC_POLL_BATCH_SIZE):
+        batch = ports_to_scan[batch_start:batch_start + MAC_POLL_BATCH_SIZE]
+        batch_num = (batch_start // MAC_POLL_BATCH_SIZE) + 1
+        total_batches = (len(ports_to_scan) + MAC_POLL_BATCH_SIZE - 1) // MAC_POLL_BATCH_SIZE
+        
+        batch_start_time = time.time()
+        logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} ports)...")
+        
+        for idx, intf in enumerate(batch, 1):
+            scanned_count += 1
+            logger.info(f"  Port {batch_start + idx}/{len(ports_to_scan)}: {intf}")
+            
+            mac_entries = poll_port_for_mac(shell, intf)  # Returns LIST of MAC entries
+            
+            if mac_entries:
+                for mac_entry in mac_entries:  # Loop through ALL MACs found on port
+                    # Check if this is an UNKNOWN MAC (timeout case)
+                    if mac_entry["mac_address"] == "UNKNOWN":
+                        camera_info = {
+                            "switch_name": switch_hostname,
+                            "switch_type": switch_type,
+                            "port": mac_entry["port"],
+                            "mac_address": "UNKNOWN",
+                            "vlan": "UNKNOWN",
+                            "mac_count": 1,
+                            "status": "TIMEOUT - No MAC learned after 10 minutes"
+                        }
+                        camera_data.append(camera_info)
+                        no_mac_count += 1
+                        logger.warning(f"  [!] UNKNOWN MAC on {mac_entry['port']} - Port UP but no MAC learned (TIMEOUT)")
+                    else:
+                        # Normal camera with valid MAC
+                        mac_formatted = convert_mac_format(mac_entry["mac_address"])
+                        camera_info = {
+                            "switch_name": switch_hostname,
+                            "switch_type": switch_type,
+                            "port": mac_entry["port"],
+                            "mac_address": mac_formatted,
+                            "vlan": mac_entry["vlan"],
+                            "mac_count": len(mac_entries),  # Track how many total MACs on this port
+                            "status": "OK"
+                        }
+                        camera_data.append(camera_info)
+                        camera_count += 1
+                        discovery_stats["total_cameras_found"] += 1
+                        
+                        # Enhanced logging for multiple MACs
+                        if len(mac_entries) > 1:
+                            logger.info(f"  [+] MAC {mac_entries.index(mac_entry)+1}/{len(mac_entries)}: {mac_formatted} on {mac_entry['port']} (VLAN {mac_entry['vlan']})")
+                        else:
+                            logger.info(f"  [+] Camera: {mac_formatted} on {mac_entry['port']} (VLAN {mac_entry['vlan']})")
+        
+        batch_elapsed = time.time() - batch_start_time
+        logger.info(f"  Batch {batch_num} complete: {len(batch)} ports in {batch_elapsed:.1f}s")
+        
+        if batch_start + MAC_POLL_BATCH_SIZE < len(ports_to_scan):
+            logger.info(f"  Pausing {MAC_POLL_BATCH_PAUSE}s before next batch...")
+            time.sleep(MAC_POLL_BATCH_PAUSE)
+    
+    overall_elapsed = time.time() - overall_start
+    logger.info("")
+    logger.info(f"Summary for {switch_hostname}:")
+    logger.info(f"  - Total UP interfaces: {len(up_interfaces)}")
+    logger.info(f"  - Ports with neighbors excluded: {neighbor_skip_count}")
+    logger.info(f"  - Ports scanned: {scanned_count}")
+    logger.info(f"  - Cameras found: {camera_count}")
+    logger.info(f"  - Ports with UNKNOWN MAC (timeouts): {no_mac_count}")
+    logger.info(f"  - Total time: {overall_elapsed:.1f}s")
+    logger.info("="*80)
+    
+    # Return empty list (no downstream switch processing)
+    return downstream_switches
+
+
 def parse_mac_table_interface(raw):
     """
     Parse MAC address table output - handles backspaces and corruption.
@@ -818,16 +1003,173 @@ def parse_mac_table_interface(raw):
     
     return entries
 
+
+
+def determine_switch_type(hostname, hardware_model=None):
+    """
+    Determine switch type based on hardware model and hostname.
+    
+    Priority:
+    1. Hardware model (most reliable)
+    2. Hostname pattern (fallback)
+    
+    Args:
+        hostname: Switch hostname
+        hardware_model: Hardware model string (optional)
+    
+    Returns:
+        str: "AGGREGATE", "EDGE", "SERVER", or "OTHER"
+    """
+    if not hostname:
+        return "OTHER"
+    
+    # METHOD 1: Check hardware model first (most reliable)
+    if hardware_model:
+        hardware_upper = hardware_model.upper()
+        
+        for pattern, switch_type in HARDWARE_MODEL_MAPPING.items():
+            if pattern.upper() in hardware_upper:
+                # Special case: 9300 can be either EDGE or SERVER
+                if "9300" in pattern:
+                    if "SMSSRV" in hostname.upper() or "SRV" in hostname.upper():
+                        logger.debug(f"Hardware {hardware_model} + hostname {hostname} -> SERVER")
+                        return "SERVER"
+                    else:
+                        logger.debug(f"Hardware {hardware_model} -> EDGE")
+                        return "EDGE"
+                
+                logger.debug(f"Hardware {hardware_model} matches '{pattern}' -> {switch_type}")
+                return switch_type
+    
+    # METHOD 2: Fallback to hostname-based detection
+    upper = hostname.upper()
+    
+    # Aggregate switches
+    if "SMSAGG" in upper:
+        return "AGGREGATE"
+    
+    # Server switches
+    if "SMSSRV" in upper:
+        return "SERVER"
+    
+    # Edge/Access switches
+    if any(x in upper for x in ["SMSACC", "SMSIE", "SMS"]):
+        return "EDGE"
+    
+    return "OTHER"
+
+
+def get_switch_hardware_model(shell):
+    """
+    Get the hardware model of the current switch.
+    
+    Returns:
+        str: Hardware model (e.g., "WS-C3850-24P", "C9300-48U", "IE-3300-8T2S")
+             or None if unable to determine
+    """
+    try:
+        # Try "show version"
+        version_out = send_cmd(shell, "show version", timeout=10, silent=True)
+        
+        # Look for Model number line
+        patterns = [
+            r"Model [Nn]umber\s*:\s*(\S+)",
+            r"cisco\s+(\S+)\s+\(",
+            r"Cisco IOS Software,\s*([A-Z0-9\-]+)\s+Software",
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, version_out, re.IGNORECASE)
+            if match:
+                model = match.group(1)
+                logger.debug(f"Detected hardware model: {model}")
+                return model
+        
+        # Try "show inventory"
+        inv_out = send_cmd(shell, "show inventory", timeout=10, silent=True)
+        pid_match = re.search(r"PID:\s*(\S+)", inv_out)
+        if pid_match:
+            model = pid_match.group(1)
+            logger.debug(f"Detected hardware model from inventory: {model}")
+            return model
+        
+        logger.debug("Could not determine hardware model")
+        return None
+        
+    except Exception as e:
+        logger.warning(f"Error getting hardware model: {e}")
+        return None
+
+
 def normalize_interface_name(intf):
+    """
+    Normalize interface names to a standard format.
+    
+    FIXED: Now handles all common Cisco interface abbreviations including:
+    - Te, Ten, TenGig, TenGigabitEthernet
+    - Gi, Gig, GigabitEthernet
+    - Fa, Fas, FastEthernet
+    - Et, Eth, Ethernet
+    - Po, Port-channel
+    - Vl, Vlan
+    - Fo, For, FortyGig, FortyGigabitEthernet
+    - Tw, Twe, TwentyFiveGig
+    """
     if not intf:
         return ""
-    replacements = {'Te': 'TenGigabitEthernet', 'Gi': 'GigabitEthernet', 'Fa': 'FastEthernet', 'Et': 'Ethernet', 'Po': 'Port-channel', 'Vl': 'Vlan'}
+    
     intf = intf.strip()
-    for short, full in replacements.items():
-        if intf.startswith(short) and len(intf) > len(short):
-            next_char = intf[len(short)]
-            if next_char.isdigit() or next_char == '/':
-                return intf.replace(short, full, 1)
+    
+    # Comprehensive replacement mappings
+    # Order matters - check longer patterns first!
+    replacements = [
+        ('TenGigabitEthernet', 'tengigabitethernet'),
+        ('TenGig', 'tengigabitethernet'),
+        ('Ten', 'tengigabitethernet'),
+        ('Te', 'tengigabitethernet'),
+        
+        ('GigabitEthernet', 'gigabitethernet'),
+        ('Gig', 'gigabitethernet'),
+        ('Gi', 'gigabitethernet'),
+        
+        ('FastEthernet', 'fastethernet'),
+        ('Fas', 'fastethernet'),
+        ('Fa', 'fastethernet'),
+        
+        ('FortyGigabitEthernet', 'fortygigabitethernet'),
+        ('FortyGig', 'fortygigabitethernet'),
+        ('For', 'fortygigabitethernet'),
+        ('Fo', 'fortygigabitethernet'),
+        
+        ('TwentyFiveGig', 'twentyfivegig'),
+        ('Twe', 'twentyfivegig'),
+        ('Tw', 'twentyfivegig'),
+        
+        ('Ethernet', 'ethernet'),
+        ('Eth', 'ethernet'),
+        ('Et', 'ethernet'),
+        
+        ('Port-channel', 'port-channel'),
+        ('Po', 'port-channel'),
+        
+        ('Vlan', 'vlan'),
+        ('Vl', 'vlan'),
+    ]
+    
+    # Check each pattern
+    for short, full in replacements:
+        if intf.startswith(short):
+            # Make sure it's followed by a digit or slash (not part of a longer word)
+            if len(intf) > len(short):
+                next_char = intf[len(short)]
+                if next_char.isdigit() or next_char in ['/', ' ']:
+                    # Replace and lowercase everything
+                    normalized = full + intf[len(short):]
+                    # Remove any spaces
+                    normalized = normalized.replace(' ', '')
+                    return normalized.lower()
+    
+    # If no match, just lowercase it
     return intf.lower()
 
 def is_same_interface(intf1, intf2):
@@ -851,80 +1193,6 @@ def is_same_interface(intf1, intf2):
         return short_type1 == short_type2 and num1_clean == num2_clean
     return False
 
-def get_uplink_ports_from_neighbors(shell, current_switch_type="UNKNOWN"):
-    """
-    Discover uplink ports using CDP and LLDP.
-    
-    Logic:
-    - Mark ALL switch neighbors as uplinks (aggregate, edge, server, other)
-    - This prevents scanning ANY port that connects to another switch
-    """
-    logger.info("Discovering uplink ports using CDP and LLDP...")
-    uplink_ports = []
-    uplink_ports_normalized = set()
-    all_neighbors_by_hostname = {}
-    logger.info("Checking CDP neighbors...")
-    cdp_output = send_cmd(shell, "show cdp neighbors detail", timeout=CDP_LLDP_TIMEOUT, silent=True)
-    if "CDP is not enabled" not in cdp_output and "Invalid input" not in cdp_output:
-        cdp_neighbors = parse_cdp_neighbors(cdp_output)
-        if cdp_neighbors:
-            logger.info(f"Found {len(cdp_neighbors)} CDP neighbors")
-            for nbr in cdp_neighbors:
-                if nbr["hostname"] and nbr["mgmt_ip"]:
-                    hostname_to_ip.setdefault(nbr["hostname"], nbr["mgmt_ip"])
-                    all_neighbors_by_hostname.setdefault(nbr["hostname"], []).append(nbr)
-    else:
-        logger.info("CDP not enabled")
-    logger.info("Checking LLDP neighbors...")
-    lldp_output = send_cmd(shell, "show lldp neighbors detail", timeout=CDP_LLDP_TIMEOUT, silent=True)
-    if "LLDP is not enabled" not in lldp_output and "Invalid input" not in lldp_output:
-        lldp_neighbors = parse_lldp_neighbors(lldp_output)
-        if lldp_neighbors:
-            logger.info(f"Found {len(lldp_neighbors)} LLDP neighbors")
-            for nbr in lldp_neighbors:
-                if nbr["hostname"] and nbr["mgmt_ip"]:
-                    if nbr["hostname"] in hostname_to_ip:
-                        authoritative_ip = hostname_to_ip[nbr["hostname"]]
-                        if authoritative_ip != nbr["mgmt_ip"]:
-                            nbr["mgmt_ip"] = authoritative_ip
-                    else:
-                        hostname_to_ip[nbr["hostname"]] = nbr["mgmt_ip"]
-                    is_dup = False
-                    if nbr["hostname"] in all_neighbors_by_hostname:
-                        lldp_intf_norm = normalize_interface_name(nbr["local_intf"])
-                        for existing in all_neighbors_by_hostname[nbr["hostname"]]:
-                            if (normalize_interface_name(existing.get("local_intf")) == lldp_intf_norm and existing.get("source") == "CDP"):
-                                is_dup = True
-                                break
-                    if not is_dup:
-                        all_neighbors_by_hostname.setdefault(nbr["hostname"], []).append(nbr)
-    else:
-        logger.info("LLDP not enabled")
-    
-    # Mark ALL switches as uplinks (don't scan ANY switch-connected ports)
-    for hostname, links in all_neighbors_by_hostname.items():
-        neighbor_type = determine_switch_type(hostname)
-        
-        # CHANGED: Mark ALL switch types as uplinks, not just aggregates
-        if neighbor_type in ["AGGREGATE", "EDGE", "SERVER", "OTHER"]:
-            for nbr in links:
-                uplink_port = nbr.get("local_intf")
-                if uplink_port:
-                    uplink_norm = normalize_interface_name(uplink_port)
-                    if uplink_norm not in uplink_ports_normalized:
-                        uplink_ports.append(uplink_port)
-                        uplink_ports_normalized.add(uplink_norm)
-                        logger.info(f"UPLINK DETECTED: {uplink_port} -> {hostname} ({neighbor_type} via {nbr.get('source','?')})")
-                    else:
-                        logger.debug(f"UPLINK DUPLICATE: {uplink_port}")
-                else:
-                    logger.warning(f"Could not determine uplink port for {hostname}")
-        else:
-            # Not a switch - log it but don't mark as uplink
-            logger.debug(f"Non-switch neighbor detected: {hostname} ({neighbor_type})")
-    
-    logger.info(f"Total uplinks identified: {len(uplink_ports)}")
-    return uplink_ports
 
 def select_camera_mac(entries, interface):
     """
@@ -1019,208 +1287,261 @@ def poll_port_for_mac(shell, interface, max_attempts=MAC_POLL_MAX_ATTEMPTS, inte
             time.sleep(interval)
             continue
 
-def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
+def get_uplink_ports_from_neighbors(shell, current_switch_type="UNKNOWN"):
     """
-    Enhanced camera discovery with infinite MAC polling for UP ports.
-    Tracks ALL unique MACs per port (not just one).
-    Also discovers downstream edge switches connected to this switch.
+    Discover ports with Cisco switch neighbors.
+    
+    NEW LOGIC (Option B):
+    - Only exclude Cisco neighbors that HAVE a management IP
+    - Scan ports with Cisco neighbors that have NO management IP
+      (might be misconfigured or might have cameras connected)
+    
+    Returns:
+        List of port names to exclude from scanning
     """
-    logger.info("="*80)
-    logger.info(f"Scanning {switch_type} switch: {switch_hostname}")
-    logger.info("="*80)
+    logger.info("Discovering ports with CDP/LLDP neighbors...")
+    excluded_ports = []
+    excluded_ports_normalized = set()
     
-    overall_start = time.time()
+    # ========================================================================
+    # CDP NEIGHBORS
+    # ========================================================================
+    logger.info("Checking CDP neighbors...")
+    cdp_detail = send_cmd(shell, "show cdp neighbors detail", timeout=CDP_LLDP_TIMEOUT, silent=True)
     
-    # FIRST: Discover downstream edge switches (before clearing MAC table)
-    downstream_switches = []
-    logger.info("Checking for downstream edge switches via CDP/LLDP...")
-    
-    # Get CDP neighbors
-    cdp_output = send_cmd(shell, "show cdp neighbors detail", timeout=CDP_LLDP_TIMEOUT, silent=True)
-    if "CDP is not enabled" not in cdp_output and "Invalid input" not in cdp_output:
-        cdp_neighbors = parse_cdp_neighbors(cdp_output)
-        for nbr in cdp_neighbors:
-            if nbr["hostname"] and nbr["mgmt_ip"]:
-                # CDP parser already filters for Cisco devices via platform field
-                hostname_to_ip.setdefault(nbr["hostname"], nbr["mgmt_ip"])
-                nbr_type = determine_switch_type(nbr["hostname"])
-                if nbr_type in ["EDGE", "SERVER"] and nbr["mgmt_ip"] not in visited_switches:
-                    downstream_switches.append({
-                        "hostname": nbr["hostname"],
-                        "ip": nbr["mgmt_ip"],
-                        "type": nbr_type,
-                        "local_port": nbr.get("local_intf")
-                    })
-                    logger.info(f"Found downstream {nbr_type} switch: {nbr['hostname']} ({nbr['mgmt_ip']}) on {nbr.get('local_intf')} [CDP/Cisco]")
-    
-    # Get LLDP neighbors
-    lldp_output = send_cmd(shell, "show lldp neighbors detail", timeout=CDP_LLDP_TIMEOUT, silent=True)
-    if "LLDP is not enabled" not in lldp_output and "Invalid input" not in lldp_output:
-        lldp_neighbors = parse_lldp_neighbors(lldp_output)
-        for nbr in lldp_neighbors:
-            if nbr["hostname"] and nbr["mgmt_ip"]:
-                # Verify it's a Cisco device (LLDP parser already does this, but double-check)
-                sys_descr = nbr.get("sys_descr", "").lower()
-                if not sys_descr or ("cisco ios" not in sys_descr and "cisco nx-os" not in sys_descr):
-                    logger.debug(f"Skipping non-Cisco LLDP neighbor: {nbr['hostname']}")
-                    continue
-                
-                if nbr["hostname"] in hostname_to_ip:
-                    authoritative_ip = hostname_to_ip[nbr["hostname"]]
-                    if authoritative_ip != nbr["mgmt_ip"]:
-                        nbr["mgmt_ip"] = authoritative_ip
-                else:
-                    hostname_to_ip[nbr["hostname"]] = nbr["mgmt_ip"]
-                
-                nbr_type = determine_switch_type(nbr["hostname"])
-                if nbr_type in ["EDGE", "SERVER"] and nbr["mgmt_ip"] not in visited_switches:
-                    # Check if already found via CDP
-                    already_found = any(ds["ip"] == nbr["mgmt_ip"] for ds in downstream_switches)
-                    if not already_found:
-                        downstream_switches.append({
-                            "hostname": nbr["hostname"],
-                            "ip": nbr["mgmt_ip"],
-                            "type": nbr_type,
-                            "local_port": nbr.get("local_intf")
-                        })
-                        logger.info(f"Found downstream {nbr_type} switch: {nbr['hostname']} ({nbr['mgmt_ip']}) on {nbr.get('local_intf')} [LLDP/Cisco]")
-    
-    if downstream_switches:
-        logger.info(f"Total downstream switches to process: {len(downstream_switches)}")
-    else:
-        logger.info("No downstream edge/server switches detected")
-    
-    logger.info("Clearing dynamic MAC address table...")
-    send_cmd(shell, "clear mac address-table dynamic", timeout=10)
-    
-    logger.info(f"Waiting {MAC_POLL_INITIAL_WAIT}s for initial MAC table repopulation...")
-    time.sleep(MAC_POLL_INITIAL_WAIT)
-    logger.info("Starting per-port MAC polling (will wait indefinitely for UP ports)...")
-    
-    uplink_ports = get_uplink_ports_from_neighbors(shell, switch_type)
-    if not uplink_ports:
-        logger.warning(f"No uplink ports detected on {switch_hostname}")
-    else:
-        logger.info(f"Uplink ports to exclude: {uplink_ports}")
-    
-    up_interfaces = get_interface_status(shell)
-    logger.info(f"Found {len(up_interfaces)} UP interfaces total")
-    
-    camera_count = 0
-    scanned_count = 0
-    no_mac_count = 0
-    uplink_skip_count = 0
-    downstream_skip_count = 0
-    
-    # Build list of downstream switch ports to exclude from camera scanning
-    downstream_ports_normalized = set()
-    for ds in downstream_switches:
-        if ds["local_port"]:
-            downstream_ports_normalized.add(normalize_interface_name(ds["local_port"]))
-    
-    ports_to_scan = []
-    for intf in up_interfaces:
-        intf_norm = normalize_interface_name(intf)
+    if "CDP is not enabled" not in cdp_detail and "Invalid input" not in cdp_detail:
+        cdp_neighbors = parse_cdp_neighbors_for_port_exclusion(cdp_detail)
         
-        # Check if it's an uplink
-        is_uplink = False
-        for upl in uplink_ports:
-            if is_same_interface(intf, upl):
-                is_uplink = True
-                logger.debug(f"SKIP: {intf} - UPLINK PORT")
-                uplink_skip_count += 1
+        if cdp_neighbors:
+            logger.info(f"Found {len(cdp_neighbors)} CDP neighbors")
+            for nbr in cdp_neighbors:
+                if nbr.get("local_intf"):
+                    local_port = nbr["local_intf"]
+                    port_norm = normalize_interface_name(local_port)
+                    
+                    # CHANGED: Only exclude if neighbor has a management IP
+                    if nbr.get("mgmt_ip"):
+                        if port_norm not in excluded_ports_normalized:
+                            excluded_ports.append(local_port)
+                            excluded_ports_normalized.add(port_norm)
+                            logger.info(f"NEIGHBOR DETECTED: {local_port} -> {nbr.get('hostname', 'Unknown')} ({nbr['mgmt_ip']}) (Cisco via CDP) - EXCLUDED")
+                    else:
+                        logger.info(f"NEIGHBOR NO IP: {local_port} -> {nbr.get('hostname', 'Unknown')} (Cisco via CDP, no mgmt IP) - WILL SCAN")
+    else:
+        logger.info("CDP not enabled")
+    
+    # ========================================================================
+    # LLDP NEIGHBORS
+    # ========================================================================
+    logger.info("Checking LLDP neighbors...")
+    lldp_output = send_cmd(shell, "show lldp neighbors detail", timeout=CDP_LLDP_TIMEOUT, silent=True)
+    
+    if "LLDP is not enabled" not in lldp_output and "Invalid input" not in lldp_output:
+        lldp_neighbors = parse_lldp_neighbors_for_port_exclusion(lldp_output)
+        
+        if lldp_neighbors:
+            logger.info(f"Found {len(lldp_neighbors)} LLDP neighbors")
+            for nbr in lldp_neighbors:
+                if nbr.get("local_intf"):
+                    lldp_intf_norm = normalize_interface_name(nbr["local_intf"])
+                    
+                    # Don't duplicate if already found via CDP
+                    if lldp_intf_norm in excluded_ports_normalized:
+                        logger.debug(f"Port {nbr['local_intf']} already excluded via CDP")
+                        continue
+                    
+                    # CHANGED: Only exclude if neighbor has a management IP
+                    if nbr.get("mgmt_ip"):
+                        excluded_ports.append(nbr["local_intf"])
+                        excluded_ports_normalized.add(lldp_intf_norm)
+                        logger.info(f"NEIGHBOR DETECTED: {nbr['local_intf']} -> {nbr.get('hostname', 'Unknown')} ({nbr['mgmt_ip']}) (Cisco via LLDP) - EXCLUDED")
+                    else:
+                        logger.info(f"NEIGHBOR NO IP: {nbr['local_intf']} -> {nbr.get('hostname', 'Unknown')} (Cisco via LLDP, no mgmt IP) - WILL SCAN")
+    else:
+        logger.info("LLDP not enabled")
+    
+    logger.info(f"Total ports with Cisco switch neighbors (with IPs): {len(excluded_ports)}")
+    return excluded_ports
+
+def parse_lldp_neighbors_for_port_exclusion(output):
+    """
+    Simplified LLDP parser specifically for port exclusion.
+    
+    CHANGED BEHAVIOR:
+    - Only excludes Cisco devices that HAVE a management IP
+    - If no IP is found, the port will be scanned (might have cameras)
+    
+    Returns:
+        List of neighbors with: hostname, local_intf, sys_descr, mgmt_ip
+    """
+    neighbors = []
+    blocks = re.split(r'[-]{40,}', output)
+    
+    for block in blocks:
+        if not block.strip():
+            continue
+        
+        # Only process blocks that contain neighbor data
+        if "Local Intf:" not in block:
+            continue
+        
+        # Skip capability code headers
+        if "Capability codes:" in block and "Local Intf:" not in block:
+            continue
+        
+        neighbor = {
+            "hostname": None,
+            "local_intf": None,
+            "sys_descr": "",
+            "mgmt_ip": None,
+            "source": "LLDP"
+        }
+        
+        # Extract local interface
+        if m := re.search(r'^Local Intf:\s*(\S+)', block, re.M):
+            neighbor["local_intf"] = m.group(1)
+        
+        # Extract hostname
+        if m := re.search(r'^System Name:\s*(.+?)$', block, re.M):
+            hostname = m.group(1).strip().strip('"').strip("'")
+            neighbor["hostname"] = hostname
+        
+        # Extract System Description (CRITICAL for Cisco detection)
+        if m := re.search(r'^System Description:\s*\n([\s\S]+?)(?=^Time remaining:|^System Capabilities:|^Management Addresses:|$)', block, re.M):
+            neighbor["sys_descr"] = m.group(1).strip()
+        
+        # Extract management IP (CRITICAL for exclusion decision)
+        if m := re.search(r'^Management Addresses:\s*\n\s*IP:\s*(\d+\.\d+\.\d+\.\d+)', block, re.M):
+            neighbor["mgmt_ip"] = m.group(1)
+        
+        if not neighbor["mgmt_ip"]:
+            if m := re.search(r'Management Address.*?:\s*(\d+\.\d+\.\d+\.\d+)', block, re.I):
+                neighbor["mgmt_ip"] = m.group(1)
+        
+        if not neighbor["mgmt_ip"]:
+            if m := re.search(r'IPv4:\s*(\d+\.\d+\.\d+\.\d+)', block, re.I):
+                neighbor["mgmt_ip"] = m.group(1)
+        
+        # Validate it's a Cisco device
+        if neighbor["sys_descr"]:
+            sys_desc_lower = neighbor["sys_descr"].lower()
+            if "cisco ios" in sys_desc_lower or "cisco nx-os" in sys_desc_lower:
+                # It's a Cisco device!
+                if neighbor["local_intf"]:
+                    neighbors.append(neighbor)
+                    logger.debug(f"  OK Cisco LLDP neighbor: {neighbor.get('hostname', 'Unknown')} via {neighbor['local_intf']}")
+                else:
+                    logger.warning(f"LLDP Cisco neighbor {neighbor.get('hostname', 'Unknown')} has no local interface")
+            else:
+                logger.debug(f"  X Skipping non-Cisco LLDP device: {neighbor.get('hostname', 'Unknown')}")
+        else:
+            logger.debug(f"  X Skipping LLDP device without System Description: {neighbor.get('hostname', 'Unknown')}")
+    
+    return neighbors
+
+
+def parse_cdp_neighbors_for_port_exclusion(output):
+    """
+    Simplified CDP parser specifically for port exclusion.
+    
+    CHANGED BEHAVIOR:
+    - Only excludes Cisco devices that HAVE a management IP
+    - If no IP is found, the port will be scanned (might have cameras)
+    
+    Returns:
+        List of neighbors with: hostname, local_intf, platform, mgmt_ip
+    """
+    neighbors = []
+    blocks = re.split(r"(?=^Device ID:\s*)", output, flags=re.M)
+    
+    for block in blocks:
+        if "Device ID:" not in block:
+            continue
+        
+        neighbor = {
+            "hostname": None,
+            "local_intf": None,
+            "platform": None,
+            "mgmt_ip": None
+        }
+        
+        # Extract Device ID (hostname)
+        if m := re.search(r"Device ID:\s*(\S+(?:\.\S+)*)", block):
+            neighbor["hostname"] = m.group(1)
+        
+        # Extract local interface
+        if m := re.search(r"Interface:\s*(\S+)", block):
+            neighbor["local_intf"] = m.group(1).rstrip(',')
+        
+        # Extract platform
+        if m := re.search(r"Platform:\s*([^,\n]+)", block):
+            neighbor["platform"] = m.group(1).strip()
+        
+        # Extract management IP (CRITICAL for exclusion decision)
+        cdp_ip_patterns = (
+            r"IPv4 [Aa]ddress:\s*(\d+\.\d+\.\d+\.\d+)",
+            r"IP [Aa]ddress:\s*(\d+\.\d+\.\d+\.\d+)",
+            r"Management [Aa]ddress(?:es)?:.*?IP(?:v4)?:\s*(\d+\.\d+\.\d+\.\d+)",
+            r"Entry address\(es\):[\s\S]*?IP address:\s*(\d+\.\d+\.\d+\.\d+)",
+        )
+        for pat in cdp_ip_patterns:
+            m = re.search(pat, block, flags=re.I | re.S)
+            if m:
+                neighbor["mgmt_ip"] = m.group(1)
                 break
         
-        if is_uplink:
+        # Check if it's a Cisco device with a valid local interface
+        if neighbor["platform"] and "cisco" in neighbor["platform"].lower():
+            if neighbor["local_intf"]:
+                neighbors.append(neighbor)
+            else:
+                logger.warning(f"CDP neighbor {neighbor.get('hostname', 'Unknown')} has no local interface - skipping")
+    
+    return neighbors
+
+def parse_cdp_neighbors_for_port_exclusion(output):
+    """
+    Simplified CDP parser specifically for port exclusion.
+    
+    ONLY cares about:
+    1. Is it a Cisco device? (check platform)
+    2. What's the local interface? (for exclusion)
+    
+    Does NOT require IP address.
+    """
+    neighbors = []
+    blocks = re.split(r"(?=^Device ID:\s*)", output, flags=re.M)
+    
+    for block in blocks:
+        if "Device ID:" not in block:
             continue
         
-        # Check if it's a downstream switch port
-        if intf_norm in downstream_ports_normalized:
-            logger.debug(f"SKIP: {intf} - DOWNSTREAM SWITCH PORT")
-            downstream_skip_count += 1
-            continue
+        neighbor = {
+            "hostname": None,
+            "local_intf": None,
+            "platform": None
+        }
         
-        ports_to_scan.append(intf)
+        # Extract Device ID (hostname)
+        if m := re.search(r"Device ID:\s*(\S+(?:\.\S+)*)", block):
+            neighbor["hostname"] = m.group(1)
+        
+        # Extract local interface
+        if m := re.search(r"Interface:\s*(\S+)", block):
+            neighbor["local_intf"] = m.group(1).rstrip(',')
+        
+        # Extract platform
+        if m := re.search(r"Platform:\s*([^,\n]+)", block):
+            neighbor["platform"] = m.group(1).strip()
+        
+        # Check if it's a Cisco device with a valid local interface
+        if neighbor["platform"] and "cisco" in neighbor["platform"].lower():
+            if neighbor["local_intf"]:
+                neighbors.append(neighbor)
+            else:
+                logger.warning(f"CDP neighbor {neighbor.get('hostname', 'Unknown')} has no local interface - skipping")
     
-    logger.info(f"Ports to scan for cameras: {len(ports_to_scan)}")
-    if downstream_skip_count > 0:
-        logger.info(f"Downstream switch ports excluded: {downstream_skip_count}")
-    logger.info("")
-    
-    for batch_start in range(0, len(ports_to_scan), MAC_POLL_BATCH_SIZE):
-        batch = ports_to_scan[batch_start:batch_start + MAC_POLL_BATCH_SIZE]
-        batch_num = (batch_start // MAC_POLL_BATCH_SIZE) + 1
-        total_batches = (len(ports_to_scan) + MAC_POLL_BATCH_SIZE - 1) // MAC_POLL_BATCH_SIZE
-        
-        batch_start_time = time.time()
-        logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} ports)...")
-        
-        for idx, intf in enumerate(batch, 1):
-            scanned_count += 1
-            logger.info(f"  Port {batch_start + idx}/{len(ports_to_scan)}: {intf}")
-            
-            mac_entries = poll_port_for_mac(shell, intf)  # Returns LIST of MAC entries
-            
-            if mac_entries:
-                for mac_entry in mac_entries:  # Loop through ALL MACs found on port
-                    # Check if this is an UNKNOWN MAC (timeout case)
-                    if mac_entry["mac_address"] == "UNKNOWN":
-                        camera_info = {
-                            "switch_name": switch_hostname,
-                            "switch_type": switch_type,
-                            "port": mac_entry["port"],
-                            "mac_address": "UNKNOWN",
-                            "vlan": "UNKNOWN",
-                            "mac_count": 1,
-                            "status": "TIMEOUT - No MAC learned after 10 minutes"
-                        }
-                        camera_data.append(camera_info)
-                        no_mac_count += 1
-                        logger.warning(f"  [!] UNKNOWN MAC on {mac_entry['port']} - Port UP but no MAC learned (TIMEOUT)")
-                    else:
-                        # Normal camera with valid MAC
-                        mac_formatted = convert_mac_format(mac_entry["mac_address"])
-                        camera_info = {
-                            "switch_name": switch_hostname,
-                            "switch_type": switch_type,
-                            "port": mac_entry["port"],
-                            "mac_address": mac_formatted,
-                            "vlan": mac_entry["vlan"],
-                            "mac_count": len(mac_entries),  # Track how many total MACs on this port
-                            "status": "OK"
-                        }
-                        camera_data.append(camera_info)
-                        camera_count += 1
-                        discovery_stats["total_cameras_found"] += 1
-                        
-                        # Enhanced logging for multiple MACs
-                        if len(mac_entries) > 1:
-                            logger.info(f"  [+] MAC {mac_entries.index(mac_entry)+1}/{len(mac_entries)}: {mac_formatted} on {mac_entry['port']} (VLAN {mac_entry['vlan']})")
-                        else:
-                            logger.info(f"  [+] Camera: {mac_formatted} on {mac_entry['port']} (VLAN {mac_entry['vlan']})")
-        
-        batch_elapsed = time.time() - batch_start_time
-        logger.info(f"  Batch {batch_num} complete: {len(batch)} ports in {batch_elapsed:.1f}s")
-        
-        if batch_start + MAC_POLL_BATCH_SIZE < len(ports_to_scan):
-            logger.info(f"  Pausing {MAC_POLL_BATCH_PAUSE}s before next batch...")
-            time.sleep(MAC_POLL_BATCH_PAUSE)
-    
-    overall_elapsed = time.time() - overall_start
-    logger.info("")
-    logger.info(f"Summary for {switch_hostname}:")
-    logger.info(f"  - Total UP interfaces: {len(up_interfaces)}")
-    logger.info(f"  - Uplink ports excluded: {uplink_skip_count}")
-    if downstream_skip_count > 0:
-        logger.info(f"  - Downstream switch ports excluded: {downstream_skip_count}")
-    logger.info(f"  - Ports scanned: {scanned_count}")
-    logger.info(f"  - Cameras found: {camera_count}")
-    logger.info(f"  - Ports with UNKNOWN MAC (timeouts): {no_mac_count}")
-    logger.info(f"  - Total time: {overall_elapsed:.1f}s")
-    logger.info("="*80)
-    
-    # Return list of downstream switches to be processed
-    return downstream_switches
+    return neighbors
 
 def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=False):
     """
@@ -1484,17 +1805,33 @@ Replace the entire function in your camera_discovery.py (starting around line 17
 """
 
 def scan_aggregate_switch(shell, agg_ip, aggregates_to_process=None, seed_ips=None, resume_mode=False):
+    """
+    Scan an aggregate switch - discover neighbors AND scan for cameras.
+    
+    CHANGED: Now scans for cameras on aggregates (excluding neighbor ports).
+    """
     if not resume_mode and agg_ip in visited_switches:
         logger.info(f"Aggregate {agg_ip} already visited")
         return []
+    
     if not resume_mode:
         visited_switches.add(agg_ip)
         discovered_aggregates.add(agg_ip)
+    
     hostname = get_hostname(shell)
     aggregate_hostnames[agg_ip] = hostname
+    
+    hardware_model = get_switch_hardware_model(shell)
+    if hardware_model:
+        logger.info(f"Hardware model: {hardware_model}")
+        detected_type = determine_switch_type(hostname, hardware_model)
+        if detected_type != "AGGREGATE":
+            logger.warning(f"WARNING: Expected AGGREGATE but hardware indicates {detected_type}")
+    
     if not resume_mode:
         discovery_stats["switches_attempted"] += 1
         discovery_stats["switches_by_type"]["AGGREGATE"]["attempted"] += 1
+    
     logger.info("")
     logger.info("#"*80)
     if resume_mode:
@@ -1502,7 +1839,7 @@ def scan_aggregate_switch(shell, agg_ip, aggregates_to_process=None, seed_ips=No
     else:
         logger.info(f"Scanning AGGREGATE: {hostname} ({agg_ip})")
     logger.info("#"*80)
-    logger.info(">>> Skipping camera scan on aggregate switch")
+    
     new_aggregates = []
     if not resume_mode:
         new_aggregates = discover_aggregate_neighbors(shell, hostname)
@@ -1521,8 +1858,21 @@ def scan_aggregate_switch(shell, agg_ip, aggregates_to_process=None, seed_ips=No
                     logger.debug(f"Aggregate {agg['hostname']} already in queue")
     else:
         logger.info(">>> Resume mode: skipping aggregate discovery")
-    logger.info(">>> Discovering downstream switches...")
+    
+    # CHANGED: Now scan for cameras on aggregate (excluding neighbor ports)
+    logger.info(">>> Scanning for cameras (excluding ports with neighbors)...")
+    try:
+        downstream_switches = discover_cameras_from_switch(shell, hostname, "AGGREGATE")
+        # downstream_switches will be empty now since discover_cameras_from_switch 
+        # no longer discovers them
+    except Exception as e:
+        logger.error(f"Error scanning aggregate for cameras: {e}")
+        downstream_switches = []
+    
+    # Still discover downstream switches via CDP/LLDP for topology mapping
+    logger.info(">>> Discovering downstream switches for topology...")
     all_neighbors_by_hostname = {}
+    
     cdp_output = send_cmd(shell, "show cdp neighbors detail", timeout=CDP_LLDP_TIMEOUT, silent=True)
     if "CDP is not enabled" not in cdp_output and "Invalid input" not in cdp_output:
         cdp_neighbors = parse_cdp_neighbors(cdp_output)
@@ -1531,6 +1881,7 @@ def scan_aggregate_switch(shell, agg_ip, aggregates_to_process=None, seed_ips=No
                 if nbr["hostname"] and nbr["mgmt_ip"]:
                     hostname_to_ip[nbr["hostname"]] = nbr["mgmt_ip"]
                     all_neighbors_by_hostname.setdefault(nbr["hostname"], []).append(nbr)
+    
     lldp_output = send_cmd(shell, "show lldp neighbors detail", timeout=CDP_LLDP_TIMEOUT, silent=True)
     if "LLDP is not enabled" not in lldp_output and "Invalid input" not in lldp_output:
         lldp_neighbors = parse_lldp_neighbors(lldp_output)
@@ -1552,19 +1903,26 @@ def scan_aggregate_switch(shell, agg_ip, aggregates_to_process=None, seed_ips=No
                                 break
                     if not is_dup:
                         all_neighbors_by_hostname.setdefault(nbr["hostname"], []).append(nbr)
+    
     logger.info(f"Found {len(all_neighbors_by_hostname)} total neighbors")
+    
+    # Process downstream switches
     switch_counts = {"EDGE": 0, "AGGREGATE": 0, "SERVER": 0, "OTHER": 0}
     for nhost, links in all_neighbors_by_hostname.items():
         switch_type = determine_switch_type(nhost)
         mgmt_ip = hostname_to_ip.get(nhost)
+        
         if switch_type == "AGGREGATE":
             logger.debug(f"Skipping aggregate: {nhost}")
             continue
+        
         if mgmt_ip in visited_switches:
             logger.info(f"Skipping {switch_type} {nhost} - already processed")
             continue
+        
         switch_counts[switch_type] += 1
         logger.info(f"{switch_type} switch detected: {nhost} - {mgmt_ip}")
+        
         for link in links:
             neighbor_info = {
                 "remote_name": nhost,
@@ -1578,12 +1936,16 @@ def scan_aggregate_switch(shell, agg_ip, aggregates_to_process=None, seed_ips=No
                     logger.error(f"Lost aggregate connection")
                     raise
             break
+    
     if not resume_mode:
         discovery_stats["switches_successfully_scanned"] += 1
         discovery_stats["switches_by_type"]["AGGREGATE"]["successful"] += 1
+    
     logger.info(f"Summary for {hostname}:")
     logger.info(f"  - Edge: {switch_counts['EDGE']}, Server: {switch_counts['SERVER']}, Other: {switch_counts['OTHER']}")
+    
     return new_aggregates
+
 
 def retry_failed_switches_from_seed():
     """
@@ -1706,6 +2068,7 @@ def main():
     logger.info(f"Seed switch: {SEED_SWITCH_IP}")
     logger.info(f"MAC polling: Infinite (up to {MAC_POLL_HARD_TIMEOUT}s hard timeout per port)")
     logger.info("="*80)
+    
     try:
         connect_to_seed()
     except NetworkConnectionError as e:
@@ -1727,26 +2090,26 @@ def main():
     
     try:
         aggregates_to_process = deque()
+        
         logger.info("="*80)
         logger.info("PHASE 1: DISCOVERING AGGREGATE SWITCHES")
         logger.info("="*80)
+        
         reconnect_attempts = 0
         max_reconnects = AGG_MAX_RETRIES
         seed_scan_complete = False
+        
         while reconnect_attempts < max_reconnects and not seed_scan_complete:
             try:
                 if SEED_SWITCH_IP in discovered_aggregates:
                     logger.info("Seed scan interrupted - resuming...")
-                    # UPDATED: Pass aggregates_to_process and seed_ips parameters
                     new_aggregates = scan_aggregate_switch(agg_shell, SEED_SWITCH_IP, aggregates_to_process, seed_ips, resume_mode=True)
                     seed_scan_complete = True
                 else:
-                    # UPDATED: Pass aggregates_to_process and seed_ips parameters
                     new_aggregates = scan_aggregate_switch(agg_shell, SEED_SWITCH_IP, aggregates_to_process, seed_ips, resume_mode=False)
                 
-                # NOTE: The old queue-adding code below will never execute because
-                # aggregates are already added inside scan_aggregate_switch().
-                # We keep this code for safety/backwards compatibility.
+                # NOTE: Aggregates are already added to queue inside scan_aggregate_switch()
+                # This code is kept for backwards compatibility
                 for agg in new_aggregates:
                     if agg["mgmt_ip"] in seed_ips:
                         logger.info(f"Skipping {agg['hostname']} ({agg['mgmt_ip']}) - same as seed switch")
@@ -1760,6 +2123,7 @@ def main():
                 
                 seed_scan_complete = True
                 break
+                
             except NetworkConnectionError as e:
                 if getattr(e, 'reconnect_needed', False) or not verify_aggregate_connection():
                     reconnect_attempts += 1
@@ -1781,6 +2145,7 @@ def main():
         logger.info("="*80)
         logger.info(f"PHASE 2: PROCESSING {len(aggregates_to_process)} ADDITIONAL AGGREGATES")
         logger.info("="*80)
+        
         while aggregates_to_process:
             agg_ip = aggregates_to_process.popleft()
             
@@ -1795,14 +2160,16 @@ def main():
             logger.info("*"*80)
             logger.info(f"PROCESSING AGGREGATE: {agg_ip}")
             logger.info("*"*80)
+            
             aggregate_reconnect_attempts = 0
             aggregate_processed = False
+            
             while aggregate_reconnect_attempts < max_reconnects and not aggregate_processed:
                 try:
                     if not verify_aggregate_connection():
                         raise NetworkConnectionError("Seed lost", reconnect_needed=True)
-                    logger.info("Hopping to aggregate...")
                     
+                    logger.info("Hopping to aggregate...")
                     parent_hostname = get_hostname(agg_shell)
                     
                     hop_success = ssh_to_device(
@@ -1815,12 +2182,10 @@ def main():
                         logger.error(f"Failed to connect to {agg_ip} after {SSH_HOP_RETRY_ATTEMPTS} attempts")
                         break
                     
-                    # UPDATED: Pass aggregates_to_process and seed_ips parameters
                     new_aggregates = scan_aggregate_switch(agg_shell, agg_ip, aggregates_to_process, seed_ips)
                     
-                    # NOTE: The old queue-adding code below will never execute because
-                    # aggregates are already added inside scan_aggregate_switch().
-                    # We keep this code for safety/backwards compatibility.
+                    # NOTE: Aggregates are already added to queue inside scan_aggregate_switch()
+                    # This code is kept for backwards compatibility
                     for agg in new_aggregates:
                         if agg["mgmt_ip"] in seed_ips:
                             logger.info(f"Skipping {agg['hostname']} ({agg['mgmt_ip']}) - same as seed switch")
@@ -1835,21 +2200,24 @@ def main():
                     logger.info("Returning to seed...")
                     exit_device()
                     time.sleep(1)
+                    
                     if not verify_aggregate_connection():
                         raise NetworkConnectionError("Lost seed connection", reconnect_needed=True)
+                    
                     logger.info("Returned to seed")
                     aggregate_processed = True
+                    
                 except NetworkConnectionError as e:
                     if getattr(e, 'reconnect_needed', False) or not verify_aggregate_connection():
                         aggregate_reconnect_attempts += 1
                         logger.error(f"Connection lost processing {agg_ip}")
                         discovery_stats["aggregates_reconnections"] += 1
+                        
                         if aggregate_reconnect_attempts < max_reconnects:
                             logger.info(f"Reconnecting (attempt {aggregate_reconnect_attempts + 1}/{max_reconnects})...")
                             try:
                                 reconnect_to_aggregate(f"Aggregate {agg_ip}")
                                 logger.info("Reconnected - will continue with remaining aggregates")
-                                # Mark this aggregate as processed and move to next
                                 aggregate_processed = True
                             except NetworkConnectionError:
                                 if aggregate_reconnect_attempts >= max_reconnects - 1:
@@ -1862,7 +2230,6 @@ def main():
                         logger.error(f"Error processing {agg_ip}: {e}")
                         aggregate_processed = True
             
-            # Log remaining queue size to monitor progress
             if aggregates_to_process:
                 logger.info(f">>> {len(aggregates_to_process)} aggregate(s) remaining in queue")
         
@@ -1908,7 +2275,6 @@ def main():
     logger.info(f"Aggregate reconnections: {discovery_stats['aggregates_reconnections']}")
     logger.info(f"Switches retried from seed: {discovery_stats['switches_retried_from_seed']}")
     
-    # Enhanced camera statistics
     cameras_with_mac = sum(1 for cam in camera_data if cam.get("mac_address") != "UNKNOWN")
     cameras_without_mac = sum(1 for cam in camera_data if cam.get("mac_address") == "UNKNOWN")
     
@@ -1940,7 +2306,6 @@ def main():
     if camera_data:
         csv_file = f"camera_inventory_{len(camera_data)}devices_{timestamp}.csv"
         with open(csv_file, "w", newline="", encoding='utf-8') as f:
-            # Updated fieldnames to include mac_count
             writer = csv.DictWriter(f, fieldnames=["switch_name", "switch_type", "port", "mac_address", "vlan", "mac_count", "status"])
             writer.writeheader()
             
@@ -1949,11 +2314,11 @@ def main():
                     row["status"] = "OK"
                 if "mac_count" not in row:
                     row["mac_count"] = 1
-                # Create a copy without timeout_seconds
                 csv_row = {k: v for k, v in row.items() if k != "timeout_seconds"}
                 writer.writerow(csv_row)
         logger.info(f"Saved: {csv_file}")
     logger.info(f"Log file: {log_filename}")
+
 
 if __name__ == "__main__":
     main()
