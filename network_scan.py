@@ -10,6 +10,8 @@ Smart Network Topology Discovery Tool (Cisco-CLI Nested SSH, Depth-Safe)
 - Handles hostnames with special characters (including # in the name)
 - Hardware-based device role recognition (C3850=aggregate, IE=field, etc.)
 - Tracks visited devices by hostname only (simpler, more reliable)
+- Records neighbors without management IPs with notes (including MAC addresses)
+- Recognizes IE switches and other Cisco devices without standard IOS descriptions
 - Exports: network_topology.json + discovery_metadata.txt
 """
 import paramiko
@@ -25,9 +27,8 @@ AGGREGATE_ENTRY_IP = ""  # First hop from the server
 # Ordered credential sets to try (add more as needed)
 # "enable": "" means "reuse the login password as enable"
 CREDENTIAL_SETS = [
-       {"username": "",  "password": "",  "enable": ""} ,
-       {"username": "",  "password": "",  "enable": ""}
-
+    {"username": "",  "password": "",  "enable": ""} ,
+    {"username": "",  "password": "",  "enable": ""}
 ]
 
 # Optional: pre-known aggregate SVI mgmt IPs (besides seed)
@@ -407,6 +408,34 @@ class NetworkDiscovery:
         
         return hostname
     
+    # ── MAC address formatting ────────────────────────────────────────────
+    def format_mac_address(self, mac_string):
+        """
+        Format MAC address from various formats to standard colon-separated format.
+        
+        Examples:
+            "5C FF 76 34 FF FF 00" -> "5C:FF:76:34:FF:FF:00"
+            "5ce1.7634.ae80" -> "5C:E1:76:34:AE:80"
+            "5ce17634ae80" -> "5C:E1:76:34:AE:80"
+        """
+        if not mac_string:
+            return None
+        
+        # Remove all non-alphanumeric characters
+        mac_clean = re.sub(r'[^0-9A-Fa-f]', '', mac_string)
+        
+        # Check if we have a valid MAC length (12 hex digits)
+        if len(mac_clean) < 12:
+            return mac_string  # Return original if can't parse
+        
+        # Take first 12 characters and format as MAC
+        mac_clean = mac_clean[:12].upper()
+        
+        # Format as XX:XX:XX:XX:XX:XX
+        mac_formatted = ':'.join(mac_clean[i:i+2] for i in range(0, 12, 2))
+        
+        return mac_formatted
+    
     # ── Device role determination (hardware + hostname based) ────────────
     def determine_device_role(self, hostname, switch_model=None):
         """
@@ -661,6 +690,10 @@ class NetworkDiscovery:
         return interface
     
     def parse_cdp_neighbors(self, output):
+        """
+        Parse CDP neighbors and include devices without management IPs with notes.
+        Extracts MAC addresses when no IP is available.
+        """
         neighbors = []
         blocks = re.split(r"(?=^Device ID:\s*)", output, flags=re.M)
         
@@ -681,6 +714,7 @@ class NetworkDiscovery:
             if m:
                 nbr["hostname"] = self.normalize_hostname(m.group(1))
             
+            # Try to find IP address
             for pat in CDP_IP_PATTERNS:
                 m = re.search(pat, block, flags=re.I | re.S)
                 if m:
@@ -701,8 +735,31 @@ class NetworkDiscovery:
                 if nbr["mgmt_ip"]:
                     self._neighbor_platform_cache[nbr["mgmt_ip"]] = nbr["platform"]
             
-            if nbr["hostname"] and nbr["mgmt_ip"]:
+            # Only add if we have a hostname
+            if nbr["hostname"]:
+                # Check if it's a Cisco device (or at least has a platform)
                 if not nbr["platform"] or "cisco" in nbr["platform"].lower():
+                    # Handle missing management IP
+                    if not nbr["mgmt_ip"]:
+                        # Try to extract MAC address from various CDP fields
+                        mac_addr = None
+                        
+                        # Pattern 1: Look for "Management address(es):" section with MAC
+                        mac_match = re.search(r"Management address\(es\):.*?([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})", block, re.DOTALL | re.I)
+                        if not mac_match:
+                            # Pattern 2: Look for chassis ID or device ID with MAC format
+                            mac_match = re.search(r"(?:Chassis|Device) ID.*?([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})", block, re.I)
+                        
+                        if mac_match:
+                            mac_addr = self.format_mac_address(mac_match.group(1))
+                        
+                        if mac_addr:
+                            self.log(f"  [CDP] Warning: {nbr['hostname']} has MAC only (no IP): {mac_addr}", "WARN")
+                            nbr["note"] = f"No management IP in CDP (MAC: {mac_addr})"
+                        else:
+                            self.log(f"  [CDP] Warning: No management IP found for {nbr['hostname']}", "WARN")
+                            nbr["note"] = "No management IP in CDP"
+                    
                     neighbors.append(nbr)
         
         return neighbors
@@ -711,6 +768,8 @@ class NetworkDiscovery:
         """
         Parse 'show lldp neighbors detail' output and extract neighbor information.
         Filters out non-Cisco devices based on hostname patterns and system description.
+        Includes devices without management IPs with notes (including MAC addresses).
+        Recognizes IE switches and other Cisco devices without standard IOS descriptions.
         
         Returns: list of dicts with keys: hostname, mgmt_ip, local_intf, remote_intf
         """
@@ -718,10 +777,22 @@ class NetworkDiscovery:
         NON_CISCO_PATTERNS = [
             r'^axis-',           # Axis cameras
             r'^SEP[A-F0-9]{12}', # Cisco IP phones
-            r'^AP[A-F0-9]+',     # Standalone access points
+            r'^AP[A-F0-9]+',     # Standalone access points (when not managed)
             r'^printer-',
             r'^camera-',
             r'^phone-',
+        ]
+        
+        # Cisco device identifiers in System Description
+        CISCO_DEVICE_PATTERNS = [
+            r'Cisco IOS',
+            r'Cisco NX-OS',
+            r'IOS-XE',
+            r'IOS XE',
+            r'IE\d{4}',                    # IE1000, IE2000, IE3000, IE4000, etc.
+            r'Industrial Ethernet Switch', # IE switches
+            r'Catalyst',
+            r'Nexus',
         ]
         
         neighbors = []
@@ -762,11 +833,9 @@ class NetworkDiscovery:
                     self.log(f"  ⊗ Skipping non-Cisco device (pattern match): {hostname}", "DEBUG")
                     continue
                 
-                # FILTER 2: Check System Description for Cisco IOS/NX-OS
-                has_cisco_desc = ("Cisco IOS" in block or 
-                                "Cisco NX-OS" in block or
-                                "IOS-XE" in block or
-                                "IOS XE" in block)
+                # FILTER 2: Check System Description for Cisco device patterns
+                has_cisco_desc = any(re.search(pattern, block, re.IGNORECASE) 
+                                   for pattern in CISCO_DEVICE_PATTERNS)
                 
                 if not has_cisco_desc:
                     # Extract a snippet of the description for logging
@@ -800,13 +869,13 @@ class NetworkDiscovery:
                 
                 # Pattern 3: IPv4 prefix
                 if not mgmt_ip:
-                    ip_match3 = re.search(r"Management.*?IPv4:\s*(\d+\.\d+\.\d+\.\d+)", block)
+                    ip_match3 = re.search(r"Management.*?IPv4:\s*(\d+\.\d+\.\d+\.\d+)", block, re.DOTALL)
                     if ip_match3:
                         mgmt_ip = ip_match3.group(1)
                 
                 # Pattern 4: Direct IP pattern anywhere in Management section
                 if not mgmt_ip:
-                    mgmt_section = re.search(r"Management.*?(?=\n[A-Z]|\n\n|$)", block, re.DOTALL)
+                    mgmt_section = re.search(r"Management Addresses:.*?(?=\n[A-Z]|\n\n|$)", block, re.DOTALL)
                     if mgmt_section:
                         ip_match4 = re.search(r"(\d+\.\d+\.\d+\.\d+)", mgmt_section.group(0))
                         if ip_match4:
@@ -815,10 +884,28 @@ class NetworkDiscovery:
                 if mgmt_ip:
                     neighbor["mgmt_ip"] = mgmt_ip
                 else:
-                    self.log(f"  Warning: No management IP found for {hostname} on {neighbor['local_intf']}", "WARN")
-                    # Still add the neighbor but mark it as inaccessible
+                    # No IP found - try to extract MAC address or Chassis ID
+                    mac_addr = None
+                    
+                    # Pattern 1: Management Addresses with "Other:" MAC format
+                    mac_match1 = re.search(r"Management Addresses:\s*\n\s*Other:\s*([0-9A-Fa-f\s]+)", block)
+                    if mac_match1:
+                        mac_addr = self.format_mac_address(mac_match1.group(1))
+                    
+                    # Pattern 2: Chassis ID (often MAC address)
+                    if not mac_addr:
+                        chassis_match = re.search(r"Chassis id:\s*([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})", block)
+                        if chassis_match:
+                            mac_addr = self.format_mac_address(chassis_match.group(1))
+                    
+                    if mac_addr:
+                        self.log(f"  [LLDP] Warning: {hostname} on {neighbor['local_intf']} has MAC only (no IP): {mac_addr}", "WARN")
+                        neighbor["note"] = f"No management IP in LLDP (MAC: {mac_addr})"
+                    else:
+                        self.log(f"  [LLDP] Warning: No management IP found for {hostname} on {neighbor['local_intf']}", "WARN")
+                        neighbor["note"] = "No management IP in LLDP"
+                    
                     neighbor["mgmt_ip"] = None
-                    neighbor["note"] = "No management IP in LLDP"
                 
                 # Add discovery method marker
                 neighbor["discovered_via"] = "LLDP"
@@ -826,10 +913,12 @@ class NetworkDiscovery:
                 # Only add if we have the minimum required fields
                 if neighbor.get("hostname") and neighbor.get("local_intf"):
                     neighbors.append(neighbor)
+                    ip_display = neighbor.get('mgmt_ip', 'No-IP')
+                    note_str = f" (NOTE: {neighbor.get('note')})" if neighbor.get('note') else ""
                     self.log(f"  ✓ Parsed LLDP neighbor: {neighbor['hostname']} "
-                            f"({neighbor.get('mgmt_ip', 'No-IP')}) via "
-                            f"{neighbor['local_intf']} ↔ {neighbor['remote_intf']}", "DEBUG")
-                
+                            f"({ip_display}) via "
+                            f"{neighbor['local_intf']} ↔ {neighbor['remote_intf']}{note_str}", "DEBUG")
+            
             except Exception as e:
                 self.log(f"  Error parsing LLDP block: {e}", "ERROR")
                 self.log(f"  Block content: {block[:200]}...", "DEBUG")
@@ -1285,11 +1374,17 @@ class NetworkDiscovery:
                 discovery_method = nbr.get("discovered_via", "Unknown")
                 link_note = nbr.get("link_note", "")
                 neighbor_hostname = nbr['hostname']
-                neighbor_ip = nbr['mgmt_ip']
+                neighbor_ip = nbr.get('mgmt_ip')  # Changed to use .get() to handle None
                 
-                self.log(f"  → Neighbor: {neighbor_hostname} ({neighbor_ip}) "
-                         f"via {nbr['local_intf']} ↔ {nbr['remote_intf']} [{discovery_method}]"
-                         f"{' ['+link_note+']' if link_note else ''}")
+                # Handle devices without management IPs
+                if not neighbor_ip:
+                    self.log(f"  → Neighbor: {neighbor_hostname} (No Management IP) "
+                             f"via {nbr['local_intf']} ↔ {nbr['remote_intf']} [{discovery_method}] "
+                             f"[NOTE: {nbr.get('note', 'No IP')}]")
+                else:
+                    self.log(f"  → Neighbor: {neighbor_hostname} ({neighbor_ip}) "
+                             f"via {nbr['local_intf']} ↔ {nbr['remote_intf']} [{discovery_method}]"
+                             f"{' ['+link_note+']' if link_note else ''}")
                 
                 neighbor_entry = {
                     "neighbor_hostname": neighbor_hostname,
@@ -1298,15 +1393,22 @@ class NetworkDiscovery:
                     "remote_interface": nbr["remote_intf"],
                     "discovered_via": discovery_method
                 }
+                
+                # Add note if present (for devices without management IPs)
+                if nbr.get("note"):
+                    neighbor_entry["note"] = nbr["note"]
+                
                 if link_note:
                     neighbor_entry["link_note"] = link_note
                 
                 device_info["neighbors"].append(neighbor_entry)
                 
-                # Check if we should visit this neighbor
-                if self.should_visit_device(neighbor_ip, neighbor_hostname):
+                # Only queue for discovery if we have an IP
+                if neighbor_ip and self.should_visit_device(neighbor_ip, neighbor_hostname):
                     self.to_visit.append((neighbor_ip, neighbor_hostname))
                     self.log(f"    Added {self.get_device_identifier(neighbor_ip, neighbor_hostname)} to discovery queue")
+                elif not neighbor_ip:
+                    self.log(f"    Cannot visit {neighbor_hostname} - no management IP available")
             
             if mgmt_ip != AGGREGATE_ENTRY_IP:
                 ok = self.exit_device()
@@ -1370,11 +1472,17 @@ class NetworkDiscovery:
                 discovery_method = nbr.get("discovered_via", "Unknown")
                 link_note = nbr.get("link_note", "")
                 neighbor_hostname = nbr['hostname']
-                neighbor_ip = nbr['mgmt_ip']
+                neighbor_ip = nbr.get('mgmt_ip')  # Changed to use .get() to handle None
                 
-                self.log(f"  → Neighbor: {neighbor_hostname} ({neighbor_ip}) "
-                         f"via {nbr['local_intf']} ↔ {nbr['remote_intf']} [{discovery_method}]"
-                         f"{' ['+link_note+']' if link_note else ''}")
+                # Handle devices without management IPs
+                if not neighbor_ip:
+                    self.log(f"  → Neighbor: {neighbor_hostname} (No Management IP) "
+                             f"via {nbr['local_intf']} ↔ {nbr['remote_intf']} [{discovery_method}] "
+                             f"[NOTE: {nbr.get('note', 'No IP')}]")
+                else:
+                    self.log(f"  → Neighbor: {neighbor_hostname} ({neighbor_ip}) "
+                             f"via {nbr['local_intf']} ↔ {nbr['remote_intf']} [{discovery_method}]"
+                             f"{' ['+link_note+']' if link_note else ''}")
                 
                 entry = {
                     "neighbor_hostname": neighbor_hostname,
@@ -1383,15 +1491,22 @@ class NetworkDiscovery:
                     "remote_interface": nbr["remote_intf"],
                     "discovered_via": discovery_method
                 }
+                
+                # Add note if present
+                if nbr.get("note"):
+                    entry["note"] = nbr["note"]
+                
                 if link_note:
                     entry["link_note"] = link_note
                 
                 seed_info["neighbors"].append(entry)
                 
-                # Check if we should visit this neighbor
-                if self.should_visit_device(neighbor_ip, neighbor_hostname):
+                # Only queue for discovery if we have an IP
+                if neighbor_ip and self.should_visit_device(neighbor_ip, neighbor_hostname):
                     self.to_visit.append((neighbor_ip, neighbor_hostname))
                     self.log(f"    Added {self.get_device_identifier(neighbor_ip, neighbor_hostname)} to discovery queue")
+                elif not neighbor_ip:
+                    self.log(f"    Cannot visit {neighbor_hostname} - no management IP available")
             
             self.devices[hostname] = seed_info  # Store by hostname
             self.mark_device_visited(hostname)
@@ -1472,6 +1587,16 @@ class NetworkDiscovery:
         for role, count in sorted(role_counts.items()):
             self.log(f"  {role}: {count}")
         
+        # Count neighbors without IPs
+        neighbors_without_ip = 0
+        for d in devices_list:
+            for nbr in d.get("neighbors", []):
+                if not nbr.get("neighbor_mgmt_ip"):
+                    neighbors_without_ip += 1
+        
+        if neighbors_without_ip > 0:
+            self.log(f"\nNeighbors without management IP: {neighbors_without_ip}")
+        
         self.log("="*60)
         for d in devices_list:
             notes_str = f" [{d['notes']}]" if d.get('notes') else ""
@@ -1483,9 +1608,12 @@ class NetworkDiscovery:
             for nbr in d["neighbors"]:
                 discovered = nbr.get("discovered_via", "Unknown")
                 link_note = nbr.get("link_note", "")
+                nbr_note = nbr.get("note", "")
                 link_str = f" - {link_note}" if link_note else ""
-                self.log(f"    • {nbr['neighbor_hostname']} via "
-                         f"{nbr['local_interface']} ↔ {nbr['remote_interface']} [{discovered}]{link_str}")
+                note_str = f" - {nbr_note}" if nbr_note else ""
+                ip_display = nbr.get('neighbor_mgmt_ip') or 'No IP'
+                self.log(f"    • {nbr['neighbor_hostname']} ({ip_display}) via "
+                         f"{nbr['local_interface']} ↔ {nbr['remote_interface']} [{discovered}]{link_str}{note_str}")
     
     def write_metadata(self, filename="discovery_metadata.txt"):
         duration = (datetime.now() - self.start_time).total_seconds()
@@ -1537,6 +1665,16 @@ class NetworkDiscovery:
             
             total_neighbors = sum(len(d["neighbors"]) for d in self.devices.values())
             f.write(f"Total neighbor relationships: {total_neighbors}\n")
+            
+            # Count neighbors without management IPs
+            neighbors_without_ip = 0
+            for d in self.devices.values():
+                for nbr in d.get("neighbors", []):
+                    if not nbr.get("neighbor_mgmt_ip"):
+                        neighbors_without_ip += 1
+            
+            if neighbors_without_ip > 0:
+                f.write(f"Neighbors without management IP: {neighbors_without_ip}\n")
             
             inaccessible = sum(1 for d in self.devices.values() if d.get("notes") and "Inaccessible via SSH" in d["notes"])
             if inaccessible > 0:
