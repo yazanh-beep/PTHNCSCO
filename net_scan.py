@@ -13,6 +13,8 @@ Smart Network Topology Discovery Tool (Cisco-CLI Nested SSH, Depth-Safe)
 - Records neighbors without management IPs with notes (including MAC addresses)
 - Recognizes IE switches and other Cisco devices without standard IOS descriptions
 - Exports: network_topology.json + discovery_metadata.txt
+
+FIXED: Password prompt detection to prevent false "local IP" identification
 """
 import paramiko
 import time
@@ -27,7 +29,7 @@ AGGREGATE_ENTRY_IP = ""  # First hop from the server
 # Ordered credential sets to try (add more as needed)
 # "enable": "" means "reuse the login password as enable"
 CREDENTIAL_SETS = [
-    {"username": "",  "password": "",  "enable": ""} ,
+    {"username": "",  "password": "",  "enable": ""},
     {"username": "",  "password": "",  "enable": ""}
 ]
 
@@ -177,18 +179,17 @@ class NetworkDiscovery:
         """
         Check if text ends with a Cisco prompt.
         Handles hostnames with special characters like # in them.
-        
-        Examples:
-            "P-035_#1_VSW30>" -> True
-            "VSWC1#" -> True
-            "Switch-ABC#123>" -> True
-            "Password: " -> False
+        Strips ANSI escape codes before checking.
         """
         if not text:
             return False
         
+        # Strip ANSI escape codes
+        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        clean_text = ansi_escape.sub('', text)
+        
         # Get last non-empty line
-        lines = [l for l in text.strip().split('\n') if l.strip()]
+        lines = [l for l in clean_text.strip().split('\n') if l.strip()]
         if not lines:
             return False
         
@@ -203,7 +204,6 @@ class NetworkDiscovery:
             return False
         
         # Should have at least one alphanumeric character before the prompt symbol
-        # This handles hostnames like "P-035_#1_VSW30>"
         prompt_char = last_line[-1]
         hostname_part = last_line[:-1].strip()
         
@@ -215,7 +215,8 @@ class NetworkDiscovery:
             return False
         
         return True
-    
+
+
     # ── Shell helpers ─────────────────────────────────────────────────────
     def _drain(self, shell):
         time.sleep(0.05)
@@ -775,7 +776,7 @@ class NetworkDiscovery:
         """
         # Patterns to identify non-Cisco devices
         NON_CISCO_PATTERNS = [
-            r'^axis-',           # Axis cameras
+            r'^axis-',            # Axis cameras
             r'^SEP[A-F0-9]{12}', # Cisco IP phones
             r'^AP[A-F0-9]+',     # Standalone access points (when not managed)
             r'^printer-',
@@ -789,7 +790,7 @@ class NetworkDiscovery:
             r'Cisco NX-OS',
             r'IOS-XE',
             r'IOS XE',
-            r'IE\d{4}',                    # IE1000, IE2000, IE3000, IE4000, etc.
+            r'IE\d{4}',                     # IE1000, IE2000, IE3000, IE4000, etc.
             r'Industrial Ethernet Switch', # IE switches
             r'Catalyst',
             r'Nexus',
@@ -916,8 +917,8 @@ class NetworkDiscovery:
                     ip_display = neighbor.get('mgmt_ip', 'No-IP')
                     note_str = f" (NOTE: {neighbor.get('note')})" if neighbor.get('note') else ""
                     self.log(f"  ✓ Parsed LLDP neighbor: {neighbor['hostname']} "
-                            f"({ip_display}) via "
-                            f"{neighbor['local_intf']} ↔ {neighbor['remote_intf']}{note_str}", "DEBUG")
+                             f"({ip_display}) via "
+                             f"{neighbor['local_intf']} ↔ {neighbor['remote_intf']}{note_str}", "DEBUG")
             
             except Exception as e:
                 self.log(f"  Error parsing LLDP block: {e}", "ERROR")
@@ -992,7 +993,7 @@ class NetworkDiscovery:
         all_neighbors = []
         for h, links in all_by_host.items():
             if len(links) > 1:
-                self.log(f"   Multiple links detected to {h}: {len(links)} links")
+                self.log(f"    Multiple links detected to {h}: {len(links)} links")
                 for idx, nbr in enumerate(links, 1):
                     nbr["link_note"] = f"Multiple links to same device ({len(links)} total) - Link {idx}"
                     all_neighbors.append(nbr)
@@ -1020,11 +1021,20 @@ class NetworkDiscovery:
         return out or [""]
     
     def _interactive_hop(self, shell, ip, username, password, enable_password, overall_timeout=120):
-        """Drive IOS 'ssh' interactively until we reach a privileged prompt or timeout."""
+        """
+        Drive IOS 'ssh' interactively until we reach a privileged prompt or timeout.
+        
+        FIXED: Better prompt detection and enable handling.
+        
+        Returns:
+            tuple: (success: bool, output: str, got_password_prompt: bool)
+        """
         start = time.time()
         buf = ""
         enable_sent = False
         password_sent = False
+        got_password_prompt = False
+        last_enable_attempt = 0
         
         def feed(s):
             try:
@@ -1032,6 +1042,18 @@ class NetworkDiscovery:
             except Exception:
                 pass
         
+        def strip_ansi(text):
+            """Remove ANSI escape codes from text."""
+            ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+            return ansi_escape.sub('', text)
+        
+        def get_last_line(text):
+            """Get the last non-empty line from text."""
+            clean = strip_ansi(text)
+            lines = [l.strip() for l in clean.split('\n') if l.strip()]
+            return lines[-1] if lines else ""
+        
+        # FIXED INDENTATION STARTING HERE
         while time.time() - start < overall_timeout:
             time.sleep(0.15)
             if shell.recv_ready():
@@ -1042,18 +1064,24 @@ class NetworkDiscovery:
                 if chunk:
                     buf += chunk
             
+            last_line = get_last_line(buf)
+            
             # Check for privileged prompt (success)
-            if self._looks_like_prompt(buf) and buf.strip().endswith("#"):
-                self.log(f"[HOP] Got privileged prompt", "DEBUG")
-                return True, buf
+            if self._looks_like_prompt(buf) and last_line.endswith("#"):
+                self.log(f"[HOP] Got privileged prompt: {last_line}", "DEBUG")
+                return True, buf, got_password_prompt
             
             # Check for user mode prompt - need to enable
-            if self._looks_like_prompt(buf) and buf.strip().endswith(">") and not enable_sent:
-                self.log(f"[HOP] At user mode, sending 'enable'", "DEBUG")
-                feed("enable\n")
-                enable_sent = True
-                time.sleep(0.3)
-                continue
+            if self._looks_like_prompt(buf) and last_line.endswith(">"):
+                current_time = time.time()
+                # Send enable if we haven't sent it, or if it's been 5+ seconds since last attempt
+                if not enable_sent or (current_time - last_enable_attempt > 5):
+                    self.log(f"[HOP] At user mode ({last_line}), sending 'enable'", "DEBUG")
+                    feed("enable\n")
+                    enable_sent = True
+                    last_enable_attempt = current_time
+                    time.sleep(0.5)
+                    continue
             
             low = buf.lower()
             
@@ -1073,6 +1101,7 @@ class NetworkDiscovery:
             
             # Password prompt (login or enable)
             if "password:" in low:
+                got_password_prompt = True
                 if enable_sent:
                     self.log(f"[HOP] Sending enable password", "DEBUG")
                     feed(enable_password + "\n")
@@ -1081,6 +1110,8 @@ class NetworkDiscovery:
                     feed(password + "\n")
                     password_sent = True
                 time.sleep(0.5)
+                # Clear buffer after password to avoid re-detecting same prompt
+                buf = ""
                 continue
             
             # Failure detection
@@ -1093,15 +1124,17 @@ class NetworkDiscovery:
             )
             if any(k in low for k in fail_keys):
                 self.log(f"[HOP] Detected failure: {[k for k in fail_keys if k in low]}", "DEBUG")
-                return False, buf
+                return False, buf, got_password_prompt
             
-            # Send newline periodically to keep alive
-            if (time.time() - start) % 5 < 0.2:
+            # Send newline periodically to refresh prompt
+            if (time.time() - start) > 2 and (time.time() - start) % 3 < 0.2:
                 feed("\n")
         
         self.log(f"[HOP] Timeout after {overall_timeout}s", "WARN")
-        return False, buf
-    
+        self.log(f"[HOP] Last line was: {last_line}", "WARN")
+        self.log(f"[HOP] enable_sent={enable_sent}, got_password_prompt={got_password_prompt}", "WARN")
+        return False, buf, got_password_prompt
+
     def _connect_to_aggregate_internal(self):
         """Internal connect used by first connect and reconnect logic."""
         last_err = None
@@ -1170,7 +1203,11 @@ class NetworkDiscovery:
         raise NetworkConnectionError(f"Failed to connect to seed after {AGG_MAX_RETRIES} attempts: {last_err}")
     
     def ssh_to_device(self, target_ip, target_hostname=None, attempt=1):
-        """SSH hop from aggregate to target using IOS CLI."""
+        """
+        SSH hop from aggregate to target using IOS CLI.
+        
+        FIXED: Now properly distinguishes between connection failures and local IPs.
+        """
         if not self.agg_shell or self.agg_shell.closed:
             raise NetworkConnectionError("SSH shell to aggregation switch is closed", reconnect_needed=True)
         
@@ -1205,8 +1242,10 @@ class NetworkDiscovery:
                 self.log(f"[SSH] Trying: {cmd}", "DEBUG")
                 _ = self.send_cmd(self.agg_shell, cmd, timeout=3, silent=True)
                 
-                # Pass enable password to interactive hop
-                ok, out = self._interactive_hop(self.agg_shell, target_ip, user, pwd, enable, overall_timeout=120)
+                # 🔥 CHANGED: Receive password prompt flag
+                ok, out, got_password_prompt = self._interactive_hop(
+                    self.agg_shell, target_ip, user, pwd, enable, overall_timeout=120
+                )
                 
                 if not ok:
                     self.log(f"SSH (syntax '{cmd}') failed to {target_ip} with {user}", "WARN")
@@ -1222,14 +1261,23 @@ class NetworkDiscovery:
                     self.log(f"[SSH] Could not get post-hop hostname: {e}", "WARN")
                     post_host = ""
                 
+                # 🔥 FIXED: Check password prompt flag to distinguish cases
                 if post_host.strip() == pre_host.strip():
-                    self.log(f"[SSH] Hop to {target_ip} did not change hostname (still '{pre_host}').", "WARN")
-                    self.log(f"[SSH] This means {target_ip} is another IP on the seed device - skipping", "INFO")
-                    self.cleanup_failed_session()
-                    # Return False to mark as inaccessible (seed device)
-                    return False
+                    if got_password_prompt:
+                        # ✅ We got password prompt and stayed on same switch → Local IP
+                        self.log(f"[SSH] Hop to {target_ip} did not change hostname (still '{pre_host}').", "WARN")
+                        self.log(f"[SSH] This means {target_ip} is another IP on the seed device - skipping", "INFO")
+                        self.cleanup_failed_session()
+                        return False
+                    else:
+                        # ❌ Never got password prompt and still on parent → Connection failed
+                        self.log(f"[SSH] No password prompt received - connection likely failed/refused", "WARN")
+                        self.log(f"[SSH] This is NOT a local IP - will retry", "WARN")
+                        self.cleanup_failed_session()
+                        # Don't return False yet - continue to next credential/syntax
+                        continue
                 
-                # Success!
+                # Success - hostname changed!
                 self.session_depth += 1
                 self.send_cmd(self.agg_shell, "terminal length 0", timeout=5, silent=True)
                 self.log(f"Successfully connected to {target_ip} as {user} (host: {post_host})")
