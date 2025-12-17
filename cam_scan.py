@@ -70,11 +70,11 @@ logger = logging.getLogger(__name__)
 # USER CONFIG
 # ============================================================================
 
-SEED_SWITCH_IP = ""
+SEED_SWITCH_IP = "192.168.1.1"
 TIMEOUT = 150
 MAX_READ = 65535
 CREDENTIAL_SETS = [
-    {"username": "",  "password": "",  "enable": ""} ,
+    {"username": "admin",  "password": "cisco",  "enable": ""} ,
     {"username": "",  "password": "",  "enable": ""}
 ]
 AGG_MAX_RETRIES = 3
@@ -1105,15 +1105,8 @@ def normalize_interface_name(intf):
     """
     Normalize interface names to a standard format.
     
-    FIXED: Now handles all common Cisco interface abbreviations including:
-    - Te, Ten, TenGig, TenGigabitEthernet
-    - Gi, Gig, GigabitEthernet
-    - Fa, Fas, FastEthernet
-    - Et, Eth, Ethernet
-    - Po, Port-channel
-    - Vl, Vlan
-    - Fo, For, FortyGig, FortyGigabitEthernet
-    - Tw, Twe, TwentyFiveGig
+    CRITICAL FIX: Now handles *GigE patterns (TwentyFiveGigE, TenGigE, GigE, FortyGigE)
+    These are abbreviated forms that Cisco uses in "show ip interface brief"
     """
     if not intf:
         return ""
@@ -1123,35 +1116,47 @@ def normalize_interface_name(intf):
     # Comprehensive replacement mappings
     # Order matters - check longer patterns first!
     replacements = [
+        # TenGigabit variants
         ('TenGigabitEthernet', 'tengigabitethernet'),
+        ('TenGigE', 'tengigabitethernet'),           # CRITICAL: Handle show ip int brief format
         ('TenGig', 'tengigabitethernet'),
         ('Ten', 'tengigabitethernet'),
         ('Te', 'tengigabitethernet'),
         
+        # GigabitEthernet variants
         ('GigabitEthernet', 'gigabitethernet'),
+        ('GigE', 'gigabitethernet'),                 # CRITICAL: Handle show ip int brief format
         ('Gig', 'gigabitethernet'),
         ('Gi', 'gigabitethernet'),
         
+        # FastEthernet variants
         ('FastEthernet', 'fastethernet'),
         ('Fas', 'fastethernet'),
         ('Fa', 'fastethernet'),
         
+        # FortyGigabit variants
         ('FortyGigabitEthernet', 'fortygigabitethernet'),
+        ('FortyGigE', 'fortygigabitethernet'),       # CRITICAL: Handle show ip int brief format
         ('FortyGig', 'fortygigabitethernet'),
         ('For', 'fortygigabitethernet'),
         ('Fo', 'fortygigabitethernet'),
         
-        ('TwentyFiveGig', 'twentyfivegig'),
-        ('Twe', 'twentyfivegig'),
-        ('Tw', 'twentyfivegig'),
+        # TwentyFiveGig variants
+        ('TwentyFiveGigE', 'twentyfivegigabitethernet'),  # CRITICAL: Handle show ip int brief format
+        ('TwentyFiveGig', 'twentyfivegigabitethernet'),
+        ('Twe', 'twentyfivegigabitethernet'),
+        ('Tw', 'twentyfivegigabitethernet'),
         
+        # Basic Ethernet
         ('Ethernet', 'ethernet'),
         ('Eth', 'ethernet'),
         ('Et', 'ethernet'),
         
+        # Port-channel
         ('Port-channel', 'port-channel'),
         ('Po', 'port-channel'),
         
+        # VLAN
         ('Vlan', 'vlan'),
         ('Vl', 'vlan'),
     ]
