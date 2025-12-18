@@ -14,7 +14,7 @@ Smart Network Topology Discovery Tool (Cisco-CLI Nested SSH, Depth-Safe)
 - Recognizes IE switches and other Cisco devices without standard IOS descriptions
 - Exports: network_topology.json + discovery_metadata.txt
 
-FIXED: Password prompt detection to prevent false "local IP" identification
+FIXED: Retry logic and diagnostics added.
 """
 import paramiko
 import time
@@ -24,13 +24,13 @@ from datetime import datetime
 from collections import deque
 
 # ─── USER CONFIG ─────────────────────────────────────────────────────────────
-AGGREGATE_ENTRY_IP = ""  # First hop from the server
+AGGREGATE_ENTRY_IP = "192.168.1.26"  # First hop from the server
 
 # Ordered credential sets to try (add more as needed)
 # "enable": "" means "reuse the login password as enable"
 CREDENTIAL_SETS = [
-    {"username": "",  "password": "",  "enable": ""},
-    {"username": "",  "password": "",  "enable": ""}
+    {"username": "cisco",  "password": "cisco",  "enable": ""},
+    {"username": "admin",  "password": "cisco",  "enable": ""}
 ]
 
 # Optional: pre-known aggregate SVI mgmt IPs (besides seed)
@@ -43,6 +43,11 @@ TIMEOUT = 12
 MAX_READ = 65535
 SSH_RETRY_ATTEMPTS = 10
 SSH_RETRY_DELAY = 30
+# --- NEW CONSTANTS START ---
+CONNECTION_REFUSED_MAX_RETRIES = 10  # Don't retry too many times if device is down
+AUTH_FAILED_MAX_RETRIES = 1  # Don't retry if all credentials fail
+# --- NEW CONSTANTS END ---
+
 CDP_LLDP_TIMEOUT = 35
 
 # Aggregate (seed) reconnect policy
@@ -383,12 +388,6 @@ class NetworkDiscovery:
         """
         Normalize hostname by stripping domain suffixes only.
         Preserves unique device identifiers in the hostname.
-        
-        Examples:
-            "CL-SCL-CNO1A-SMSACC1.4-1-12.CAM.INT" -> "CL-SCL-CNO1A-SMSACC1.4-1-12"
-            "CL-SCL-CNO1A-SMSACC1.1K-1-17.CAM.INT" -> "CL-SCL-CNO1A-SMSACC1.1K-1-17"
-            "P-035_#1_VSW30.CAM.INT" -> "P-035_#1_VSW30"
-            "US-DFW-MDN1A-SMSACC-2-500-2.switch18.loc" -> "US-DFW-MDN1A-SMSACC-2-500-2"
         """
         if not hostname:
             return hostname
@@ -413,11 +412,6 @@ class NetworkDiscovery:
     def format_mac_address(self, mac_string):
         """
         Format MAC address from various formats to standard colon-separated format.
-        
-        Examples:
-            "5C FF 76 34 FF FF 00" -> "5C:FF:76:34:FF:FF:00"
-            "5ce1.7634.ae80" -> "5C:E1:76:34:AE:80"
-            "5ce17634ae80" -> "5C:E1:76:34:AE:80"
         """
         if not mac_string:
             return None
@@ -441,25 +435,6 @@ class NetworkDiscovery:
     def determine_device_role(self, hostname, switch_model=None):
         """
         Determine device role based on hardware model and hostname.
-        
-        Hardware-based rules (highest priority):
-        - C3850/WS-C3850 -> Always aggregate
-        - IE-* (Industrial Ethernet) -> Always field
-        - C9300/WS-C9300 -> Depends on hostname (server if SRV, else access)
-        
-        Hostname-based rules (fallback):
-        - SRV -> server
-        - AGG/CORE -> aggregate
-        - ACC -> access
-        - IE/FIELD -> field
-        - EDGE -> access
-        
-        Args:
-            hostname: Device hostname
-            switch_model: Hardware model string (e.g., "WS-C3850-24P", "IE-4000-4TC4G-E")
-        
-        Returns:
-            str: Device role (aggregate, server, access, field, unknown)
         """
         # Normalize inputs
         hostname_upper = (hostname or "").upper()
@@ -771,8 +746,6 @@ class NetworkDiscovery:
         Filters out non-Cisco devices based on hostname patterns and system description.
         Includes devices without management IPs with notes (including MAC addresses).
         Recognizes IE switches and other Cisco devices without standard IOS descriptions.
-        
-        Returns: list of dicts with keys: hostname, mgmt_ip, local_intf, remote_intf
         """
         # Patterns to identify non-Cisco devices
         NON_CISCO_PATTERNS = [
@@ -1020,21 +993,26 @@ class NetworkDiscovery:
                 seen.add(x)
         return out or [""]
     
+    # ═══════════════════════════════════════════════════════════════════════════
+    # FUNCTION: _interactive_hop (REPLACED)
+    # ═══════════════════════════════════════════════════════════════════════════
     def _interactive_hop(self, shell, ip, username, password, enable_password, overall_timeout=120):
         """
         Drive IOS 'ssh' interactively until we reach a privileged prompt or timeout.
         
-        FIXED: Better prompt detection and enable handling.
+        IMPROVED: Better state tracking and connection state detection.
         
         Returns:
-            tuple: (success: bool, output: str, got_password_prompt: bool)
+            tuple: (success: bool, output: str, connection_state: str)
+            connection_state can be: "success", "auth_failed", "connection_refused", "timeout"
         """
         start = time.time()
         buf = ""
         enable_sent = False
-        password_sent = False
-        got_password_prompt = False
+        password_attempts = 0
+        max_password_attempts = 3
         last_enable_attempt = 0
+        connection_state = "unknown"
         
         def feed(s):
             try:
@@ -1053,9 +1031,8 @@ class NetworkDiscovery:
             lines = [l.strip() for l in clean.split('\n') if l.strip()]
             return lines[-1] if lines else ""
         
-        # FIXED INDENTATION STARTING HERE
         while time.time() - start < overall_timeout:
-            time.sleep(0.15)
+            time.sleep(10)
             if shell.recv_ready():
                 try:
                     chunk = shell.recv(MAX_READ).decode("utf-8", "ignore")
@@ -1065,13 +1042,14 @@ class NetworkDiscovery:
                     buf += chunk
             
             last_line = get_last_line(buf)
+            low = buf.lower()
             
-            # Check for privileged prompt (success)
+            # ===== SUCCESS: Privileged prompt =====
             if self._looks_like_prompt(buf) and last_line.endswith("#"):
                 self.log(f"[HOP] Got privileged prompt: {last_line}", "DEBUG")
-                return True, buf, got_password_prompt
+                return True, buf, "success"
             
-            # Check for user mode prompt - need to enable
+            # ===== Need to enable =====
             if self._looks_like_prompt(buf) and last_line.endswith(">"):
                 current_time = time.time()
                 # Send enable if we haven't sent it, or if it's been 5+ seconds since last attempt
@@ -1080,41 +1058,47 @@ class NetworkDiscovery:
                     feed("enable\n")
                     enable_sent = True
                     last_enable_attempt = current_time
-                    time.sleep(0.5)
+                    time.sleep(10)
                     continue
             
-            low = buf.lower()
-            
-            # SSH key verification
+            # ===== SSH key verification =====
             if "(yes/no)" in low or "yes/no" in low:
                 self.log(f"[HOP] Accepting SSH key", "DEBUG")
                 feed("yes\n")
-                time.sleep(0.5)
+                time.sleep(10)
+                buf = ""  # Clear after yes/no to avoid re-detecting
                 continue
             
-            # Username prompt
-            if "username:" in low and not password_sent:
+            # ===== Username prompt =====
+            if "username:" in low and password_attempts == 0:
                 self.log(f"[HOP] Sending username", "DEBUG")
                 feed(username + "\n")
-                time.sleep(0.3)
+                time.sleep(10)
+                buf = ""  # Clear to wait for next prompt
                 continue
             
-            # Password prompt (login or enable)
+            # ===== Password prompt =====
             if "password:" in low:
-                got_password_prompt = True
+                password_attempts += 1
+                
+                if password_attempts > max_password_attempts:
+                    self.log(f"[HOP] Max password attempts ({max_password_attempts}) reached", "WARN")
+                    connection_state = "auth_failed"
+                    break
+                
                 if enable_sent:
-                    self.log(f"[HOP] Sending enable password", "DEBUG")
+                    self.log(f"[HOP] Sending enable password (attempt {password_attempts})", "DEBUG")
                     feed(enable_password + "\n")
                 else:
-                    self.log(f"[HOP] Sending login password", "DEBUG")
+                    self.log(f"[HOP] Sending login password (attempt {password_attempts})", "DEBUG")
                     feed(password + "\n")
-                    password_sent = True
-                time.sleep(0.5)
-                # Clear buffer after password to avoid re-detecting same prompt
-                buf = ""
+                
+                time.sleep(10)  # Wait for authentication response
+                
+                # DON'T clear buffer yet - we need to see if auth succeeds
                 continue
             
-            # Failure detection
+            # ===== Failure detection =====
             fail_keys = (
                 "connection refused", "unable to connect", "timed out",
                 "no route to host", "host is unreachable",
@@ -1122,18 +1106,30 @@ class NetworkDiscovery:
                 "authentication failed", "permission denied",
                 "% bad passwords", "% login invalid", "access denied"
             )
-            if any(k in low for k in fail_keys):
-                self.log(f"[HOP] Detected failure: {[k for k in fail_keys if k in low]}", "DEBUG")
-                return False, buf, got_password_prompt
             
-            # Send newline periodically to refresh prompt
+            for fail_key in fail_keys:
+                if fail_key in low:
+                    self.log(f"[HOP] Detected failure: {fail_key}", "DEBUG")
+                    
+                    # Determine connection state
+                    if fail_key in ("connection refused", "unable to connect", "no route to host", 
+                                   "host is unreachable", "closed by foreign host"):
+                        connection_state = "connection_refused"
+                    elif fail_key in ("authentication failed", "permission denied", 
+                                     "% bad passwords", "% login invalid", "access denied"):
+                        connection_state = "auth_failed"
+                    
+                    return False, buf, connection_state
+            
+            # Send periodic newline to refresh prompt
             if (time.time() - start) > 2 and (time.time() - start) % 3 < 0.2:
                 feed("\n")
         
+        # Timeout
         self.log(f"[HOP] Timeout after {overall_timeout}s", "WARN")
         self.log(f"[HOP] Last line was: {last_line}", "WARN")
-        self.log(f"[HOP] enable_sent={enable_sent}, got_password_prompt={got_password_prompt}", "WARN")
-        return False, buf, got_password_prompt
+        self.log(f"[HOP] enable_sent={enable_sent}, password_attempts={password_attempts}", "WARN")
+        return False, buf, "timeout"
 
     def _connect_to_aggregate_internal(self):
         """Internal connect used by first connect and reconnect logic."""
@@ -1202,11 +1198,14 @@ class NetworkDiscovery:
         
         raise NetworkConnectionError(f"Failed to connect to seed after {AGG_MAX_RETRIES} attempts: {last_err}")
     
+    # ═══════════════════════════════════════════════════════════════════════════
+    # FUNCTION: ssh_to_device (REPLACED)
+    # ═══════════════════════════════════════════════════════════════════════════
     def ssh_to_device(self, target_ip, target_hostname=None, attempt=1):
         """
         SSH hop from aggregate to target using IOS CLI.
         
-        FIXED: Now properly distinguishes between connection failures and local IPs.
+        IMPROVED: Better connection state detection and smart retry logic.
         """
         if not self.agg_shell or self.agg_shell.closed:
             raise NetworkConnectionError("SSH shell to aggregation switch is closed", reconnect_needed=True)
@@ -1228,7 +1227,12 @@ class NetworkDiscovery:
             if cs not in cred_order:
                 cred_order.append(cs)
         
-        for cred in cred_order:
+        connection_refused_count = 0
+        auth_failed_count = 0
+        timeout_count = 0
+        local_ip_detected = False
+        
+        for cred_idx, cred in enumerate(cred_order):
             user = cred["username"]
             pwd = cred["password"]
             enable = cred.get("enable") or cred["password"]
@@ -1238,20 +1242,34 @@ class NetworkDiscovery:
                 f"ssh {user}@{target_ip}",
             ]
             
-            for cmd in syntaxes:
-                self.log(f"[SSH] Trying: {cmd}", "DEBUG")
+            for syntax_idx, cmd in enumerate(syntaxes):
+                self.log(f"[SSH] Trying: {cmd} (cred {cred_idx+1}/{len(cred_order)}, syntax {syntax_idx+1}/{len(syntaxes)})", "DEBUG")
                 _ = self.send_cmd(self.agg_shell, cmd, timeout=3, silent=True)
                 
-                # 🔥 CHANGED: Receive password prompt flag
-                ok, out, got_password_prompt = self._interactive_hop(
+                ok, out, connection_state = self._interactive_hop(
                     self.agg_shell, target_ip, user, pwd, enable, overall_timeout=120
                 )
                 
                 if not ok:
-                    self.log(f"SSH (syntax '{cmd}') failed to {target_ip} with {user}", "WARN")
+                    self.log(f"SSH failed with state: {connection_state}", "WARN")
+                    
+                    # Track failure types
+                    if connection_state == "connection_refused":
+                        connection_refused_count += 1
+                    elif connection_state == "auth_failed":
+                        auth_failed_count += 1
+                    elif connection_state == "timeout":
+                        timeout_count += 1
+                    
                     self.cleanup_failed_session()
+                    
                     if not self.verify_aggregate_connection():
                         raise NetworkConnectionError("Connection to aggregation switch lost", reconnect_needed=True)
+                    
+                    # Don't retry other syntaxes if connection is refused (not a syntax issue)
+                    if connection_state == "connection_refused":
+                        break
+                    
                     continue
                 
                 # Verify hostname changed
@@ -1261,20 +1279,21 @@ class NetworkDiscovery:
                     self.log(f"[SSH] Could not get post-hop hostname: {e}", "WARN")
                     post_host = ""
                 
-                # 🔥 FIXED: Check password prompt flag to distinguish cases
+                # Check if we're still on the same switch
                 if post_host.strip() == pre_host.strip():
-                    if got_password_prompt:
-                        # ✅ We got password prompt and stayed on same switch → Local IP
-                        self.log(f"[SSH] Hop to {target_ip} did not change hostname (still '{pre_host}').", "WARN")
-                        self.log(f"[SSH] This means {target_ip} is another IP on the seed device - skipping", "INFO")
+                    self.log(f"[SSH] Hostname did not change (still '{pre_host}')", "WARN")
+                    
+                    # This could be a local IP (SVI on same switch)
+                    # Only mark as local IP if we successfully authenticated
+                    if connection_state == "success":
+                        self.log(f"[SSH] Authenticated but stayed on same switch - likely a local SVI IP", "INFO")
+                        local_ip_detected = True
                         self.cleanup_failed_session()
-                        return False
+                        break
                     else:
-                        # ❌ Never got password prompt and still on parent → Connection failed
-                        self.log(f"[SSH] No password prompt received - connection likely failed/refused", "WARN")
-                        self.log(f"[SSH] This is NOT a local IP - will retry", "WARN")
+                        # Connection issue, not local IP
+                        self.log(f"[SSH] Connection issue (not local IP) - will try next credential", "DEBUG")
                         self.cleanup_failed_session()
-                        # Don't return False yet - continue to next credential/syntax
                         continue
                 
                 # Success - hostname changed!
@@ -1283,17 +1302,66 @@ class NetworkDiscovery:
                 self.log(f"Successfully connected to {target_ip} as {user} (host: {post_host})")
                 self.device_creds[target_ip] = cred
                 return True
+            
+            # If local IP detected, stop trying other credentials
+            if local_ip_detected:
+                break
         
-        # All credentials failed
+        # ===== All attempts failed - decide what to do =====
+        
+        # If it's a local IP, return False immediately (don't retry)
+        if local_ip_detected:
+            self.log(f"[SSH] Confirmed local IP - skipping device", "INFO")
+            return False
+        
+        # If all connection attempts were refused, it might be down or unreachable
+        if connection_refused_count == len(cred_order) * len(syntaxes):
+            self.log(f"[SSH] All connection attempts refused - device may be down/unreachable", "WARN")
+            
+            # Still retry but with reduced attempts
+            if attempt < CONNECTION_REFUSED_MAX_RETRIES:
+                self.log(f"[RETRY] Waiting {SSH_RETRY_DELAY}s before retry (connection refused)...", "INFO")
+                time.sleep(SSH_RETRY_DELAY)
+                if not self.verify_aggregate_connection():
+                    raise NetworkConnectionError("Lost connection to aggregation switch during retry delay", reconnect_needed=True)
+                return self.ssh_to_device(target_ip, target_hostname, attempt + 1)
+            else:
+                raise NetworkConnectionError(
+                    f"SSH connection refused to {target_ip} after {attempt} attempts - device may be down",
+                    reconnect_needed=False, retry_allowed=False
+                )
+        
+        # If all auth attempts failed, bad credentials
+        if auth_failed_count > 0 and connection_refused_count == 0:
+            self.log(f"[SSH] Authentication failed with all credential sets", "ERROR")
+            # Don't retry for auth failures
+            raise NetworkConnectionError(
+                f"Authentication failed to {target_ip} - check credentials",
+                reconnect_needed=False, retry_allowed=False
+            )
+        
+        # Timeout issues - could be network congestion or slow device
+        if timeout_count > 0:
+            self.log(f"[SSH] Connection timeout(s) occurred", "WARN")
+            if attempt < SSH_RETRY_ATTEMPTS:
+                self.log(f"[RETRY] Waiting {SSH_RETRY_DELAY}s before retry (timeout)...", "INFO")
+                time.sleep(SSH_RETRY_DELAY)
+                if not self.verify_aggregate_connection():
+                    raise NetworkConnectionError("Lost connection to aggregation switch during retry delay", reconnect_needed=True)
+                return self.ssh_to_device(target_ip, target_hostname, attempt + 1)
+        
+        # General retry for other failures
         if attempt < SSH_RETRY_ATTEMPTS:
-            self.log(f"[RETRY] Waiting {SSH_RETRY_DELAY}s before retry...", "INFO")
+            self.log(f"[RETRY] Waiting {SSH_RETRY_DELAY}s before retry (general)...", "INFO")
             time.sleep(SSH_RETRY_DELAY)
             if not self.verify_aggregate_connection():
                 raise NetworkConnectionError("Lost connection to aggregation switch during retry delay", reconnect_needed=True)
             return self.ssh_to_device(target_ip, target_hostname, attempt + 1)
         
-        raise NetworkConnectionError(f"SSH to {target_ip} failed after {SSH_RETRY_ATTEMPTS} attempts",
-                                     reconnect_needed=False, retry_allowed=False)
+        raise NetworkConnectionError(
+            f"SSH to {target_ip} failed after {SSH_RETRY_ATTEMPTS} attempts",
+            reconnect_needed=False, retry_allowed=False
+        )
     
     def exit_device(self):
         """Exit from current nested SSH session with session-depth guard."""
@@ -1317,6 +1385,54 @@ class NetworkDiscovery:
             self.log(f"[EXIT] Exception during exit: {e}", "WARN")
             return False
     
+    # ═══════════════════════════════════════════════════════════════════════════
+    # FUNCTION: diagnose_connection (NEW)
+    # ═══════════════════════════════════════════════════════════════════════════
+    def diagnose_connection(self, target_ip):
+        """
+        Run diagnostic commands to understand why SSH might be failing.
+        Returns: "local_ip", "device_down", "reachable", or "unknown"
+        """
+        self.log(f"[DIAG] Running diagnostics for {target_ip}", "INFO")
+        
+        try:
+            # Check if it's a local interface FIRST (fastest check)
+            show_ip = self.send_cmd(self.agg_shell, "show ip interface brief | include " + target_ip, timeout=5, silent=True)
+            if target_ip in show_ip and ("up" in show_ip.lower() or "administratively" in show_ip.lower()):
+                self.log(f"[DIAG] ✓ Found {target_ip} in local interface list - this IS a local IP", "INFO")
+                return "local_ip"
+            
+            # Test IP reachability
+            ping_out = self.send_cmd(self.agg_shell, f"ping {target_ip} repeat 3", timeout=10, silent=True)
+            if "Success rate is 100" in ping_out or "!!!" in ping_out:
+                self.log(f"[DIAG] ✓ IP {target_ip} is reachable via ping", "INFO")
+                ping_success = True
+            else:
+                self.log(f"[DIAG] ✗ IP {target_ip} ping failed - may be down or blocked", "WARN")
+                ping_success = False
+            
+            # Check ARP table
+            arp_out = self.send_cmd(self.agg_shell, f"show ip arp {target_ip}", timeout=5, silent=True)
+            if "Incomplete" in arp_out:
+                self.log(f"[DIAG] ✗ ARP entry incomplete - device may be down", "WARN")
+                return "device_down"
+            elif target_ip in arp_out:
+                self.log(f"[DIAG] ✓ ARP entry found for {target_ip}", "INFO")
+                if ping_success:
+                    return "reachable"
+                else:
+                    return "reachable_no_ping"  # Has ARP but ping failed (ICMP blocked?)
+            
+            # No ARP entry
+            if not ping_success:
+                return "device_down"
+            
+            return "reachable"
+            
+        except Exception as e:
+            self.log(f"[DIAG] Diagnostic error: {e}", "WARN")
+            return "unknown"
+
     # ── Core collection ───────────────────────────────────────────────────
     def collect_device_info(self, mgmt_ip, hostname=None, skip_discovery=False):
         self.log("\n" + "="*60)
@@ -1346,7 +1462,17 @@ class NetworkDiscovery:
                     ssh_accessible = False
             
             if not ssh_accessible:
-                self.log(f" Cannot SSH to {mgmt_ip} - marking as inaccessible", "WARN")
+                self.log(f" Cannot SSH to {mgmt_ip} - running diagnostics", "WARN")
+                
+                # Run diagnostics to determine why
+                diag_result = self.diagnose_connection(mgmt_ip)
+                
+                if diag_result == "local_ip":
+                    self.log(f"Diagnostics confirm {mgmt_ip} is a local IP on seed - skipping", "INFO")
+                    return None  # Don't create a record for local IPs
+                
+                # Continue marking as inaccessible
+                self.log(f"Diagnostics result: {diag_result} - marking as inaccessible", "INFO")
                 
                 # Use the hostname from the queue if available
                 if not hostname:
@@ -1370,7 +1496,11 @@ class NetworkDiscovery:
                 # Use hardware-based role determination with platform info
                 device_role = self.determine_device_role(hostname, platform)
                 
-                note_parts = ["Inaccessible via SSH"]
+                note_parts = [f"Inaccessible via SSH"]
+                if diag_result == "device_down":
+                    note_parts.append("appears to be powered off or unreachable")
+                elif diag_result == "reachable_no_ping":
+                    note_parts.append("has ARP entry but ICMP blocked")
                 
                 return {
                     "hostname": hostname,
