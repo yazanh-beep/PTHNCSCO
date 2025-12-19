@@ -70,12 +70,12 @@ logger = logging.getLogger(__name__)
 # USER CONFIG
 # ============================================================================
 
-SEED_SWITCH_IP = ""
+SEED_SWITCH_IP = "192.168.100.13"
 TIMEOUT = 150
 MAX_READ = 65535
 CREDENTIAL_SETS = [
-    {"username": "",  "password": "",  "enable": ""} ,
-    {"username": "",  "password": "",  "enable": ""}
+    {"username": "admin",  "password": "cisco",  "enable": ""} ,
+    {"username": "cisco",  "password": "cisco",  "enable": ""}
 ]
 AGG_MAX_RETRIES = 3
 AGG_RETRY_DELAY = 5
@@ -1116,13 +1116,14 @@ def discover_aggregate_neighbors(shell, current_agg_hostname):
 # INDIRECT DISCOVERY & PROCESSING LOGIC
 # ============================================================================
 
-def discover_devices_via_mac_table(shell, uplink_port, downstream_switch_name, downstream_switch_ip):
+def discover_devices_via_mac_table(shell, uplink_port, downstream_switch_name, downstream_switch_ip, downstream_switch_type="EDGE"):
     """Fallback: Discover devices behind an unreachable switch by scanning the MAC table on parent."""
     if not ENABLE_INDIRECT_DISCOVERY:
         return 0
     logger.info("="*80)
     logger.info(f"INDIRECT DISCOVERY: Scanning parent port {uplink_port}")
-    logger.info(f"Target (Unreachable): {downstream_switch_name} ({downstream_switch_ip})")
+    logger.info(f"  Target (Unreachable): {downstream_switch_name} ({downstream_switch_ip})")
+    logger.info(f"  Target Type: {downstream_switch_type}")
     logger.info("="*80)
     try:
         current_hostname = get_hostname(shell)
@@ -1143,16 +1144,26 @@ def discover_devices_via_mac_table(shell, uplink_port, downstream_switch_name, d
         devices_added = 0
         for entry in mac_entries:
             mac_formatted = convert_mac_format(entry["mac_address"])
+            
+            # CRITICAL FIX: Attribute to the DOWNSTREAM switch, not the parent
             camera_info = {
-                "switch_name": downstream_switch_name, "switch_type": "EDGE", "switch_ip": downstream_switch_ip,
-                "port": "UNKNOWN (Indirect)", "mac_address": mac_formatted, "vlan": entry.get("vlan", "UNKNOWN"),
-                "mac_count": 1, "status": "INDIRECT", "discovery_method": "MAC_TABLE_SCAN",
-                "parent_switch": current_hostname, "parent_port": uplink_port,
-                "notes": "Discovered via MAC table on parent switch (SSH failed)"
+                "switch_name": downstream_switch_name,      # Where the device physically is
+                "switch_type": downstream_switch_type,      # Type of that switch
+                "switch_ip": downstream_switch_ip,          # IP of that switch
+                "port": "UNKNOWN (Indirect)", 
+                "mac_address": mac_formatted, 
+                "vlan": entry.get("vlan", "UNKNOWN"),
+                "mac_count": 1, 
+                "status": "INDIRECT", 
+                "discovery_method": "MAC_TABLE_SCAN",
+                "parent_switch": current_hostname,          # Where we scanned FROM
+                "parent_port": uplink_port,
+                "notes": f"Discovered via MAC table on {current_hostname} port {uplink_port} (Switch {downstream_switch_name} Unreachable)"
             }
             camera_data.append(camera_info)
             devices_added += 1
-            logger.info(f"  [+] Indirect: {mac_formatted} (VLAN {entry.get('vlan')})")
+            logger.info(f"  [+] Indirect: {mac_formatted} (VLAN {entry.get('vlan')}) on {downstream_switch_name}")
+            
         discovery_stats["total_cameras_found"] += devices_added
         discovery_stats["indirect_discoveries"] += devices_added
         discovery_stats["switches_with_indirect_discovery"] += 1
@@ -1167,12 +1178,16 @@ def upgrade_indirect_to_direct_discovery(switch_name, switch_ip):
     logger.info(f"DEDUPLICATION: Checking for indirect discoveries on {switch_name}")
     logger.info("="*80)
     
+    # Find indirect entries attributed to THIS switch
     indirect_entries = [entry for entry in camera_data if entry.get("switch_name") == switch_name and entry.get("status") == "INDIRECT"]
+    
     if not indirect_entries:
         logger.info(f"No indirect discoveries found for {switch_name}")
         return (0, 0, 0)
     
     logger.info(f"Found {len(indirect_entries)} indirect discoveries to check")
+    
+    # Find new direct entries for THIS switch
     direct_entries = [entry for entry in camera_data if entry.get("switch_name") == switch_name and entry.get("status") != "INDIRECT" and entry.get("mac_address") != "UNKNOWN"]
     
     upgraded = []
@@ -1264,7 +1279,7 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
             logger.error(f"SSH failed to {switch_name}. Attempting Indirect Discovery...")
             devices_found = 0
             if ENABLE_INDIRECT_DISCOVERY and local_intf:
-                devices_found = discover_devices_via_mac_table(agg_shell, local_intf, switch_name, switch_ip)
+                devices_found = discover_devices_via_mac_table(agg_shell, local_intf, switch_name, switch_ip, switch_type)
             failure_info = {
                 "switch_name": switch_name, "switch_ip": switch_ip, "switch_type": switch_type,
                 "parent_ip": parent_ip, "parent_hostname": parent_hostname,
@@ -1293,7 +1308,7 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
                 discovery_stats["switches_recovered_on_retry"] += 1
                 logger.info(f"[RECOVERED] RETRY SUCCESS: {switch_name} recovered on retry from seed")
                 
-                # CRITICAL: DEDUPLICATION ON RETRY
+                # CRITICAL: DEDUPLICATION ON RETRY (Using correct switch hostname)
                 upgrade_indirect_to_direct_discovery(actual_hostname, switch_ip)
             
             if downstream_switches:
