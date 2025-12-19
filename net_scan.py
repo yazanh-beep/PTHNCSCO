@@ -14,7 +14,9 @@ Smart Network Topology Discovery Tool (Cisco-CLI Nested SSH, Depth-Safe)
 - Recognizes IE switches and other Cisco devices without standard IOS descriptions
 - Exports: network_topology.json + discovery_metadata.txt
 
-FIXED: Retry logic and diagnostics added.
+FIXED: 
+1. "Local IP" false positive logic removed. 
+2. If hostname doesn't change, it is treated as a failure and RETRIED.
 """
 import paramiko
 import time
@@ -24,12 +26,11 @@ from datetime import datetime
 from collections import deque
 
 # ─── USER CONFIG ─────────────────────────────────────────────────────────────
-AGGREGATE_ENTRY_IP = "192.168.1.26"  # First hop from the server
+AGGREGATE_ENTRY_IP = "192.168.100.13"  # First hop from the server
 
 # Ordered credential sets to try (add more as needed)
 # "enable": "" means "reuse the login password as enable"
 CREDENTIAL_SETS = [
-    {"username": "cisco",  "password": "cisco",  "enable": ""},
     {"username": "admin",  "password": "cisco",  "enable": ""}
 ]
 
@@ -41,13 +42,8 @@ AGGREGATE_MGMT_IPS = [
 # Timeouts/retries
 TIMEOUT = 12
 MAX_READ = 65535
-SSH_RETRY_ATTEMPTS = 10
-SSH_RETRY_DELAY = 30
-# --- NEW CONSTANTS START ---
-CONNECTION_REFUSED_MAX_RETRIES = 10  # Don't retry too many times if device is down
-AUTH_FAILED_MAX_RETRIES = 1  # Don't retry if all credentials fail
-# --- NEW CONSTANTS END ---
-
+SSH_RETRY_ATTEMPTS = 10  # Will retry connection refused/timeouts up to this many times
+SSH_RETRY_DELAY = 30     # Wait time between retries
 CDP_LLDP_TIMEOUT = 35
 
 # Aggregate (seed) reconnect policy
@@ -1032,7 +1028,7 @@ class NetworkDiscovery:
             return lines[-1] if lines else ""
         
         while time.time() - start < overall_timeout:
-            time.sleep(10)
+            time.sleep(0.15)
             if shell.recv_ready():
                 try:
                     chunk = shell.recv(MAX_READ).decode("utf-8", "ignore")
@@ -1058,14 +1054,14 @@ class NetworkDiscovery:
                     feed("enable\n")
                     enable_sent = True
                     last_enable_attempt = current_time
-                    time.sleep(10)
+                    time.sleep(0.5)
                     continue
             
             # ===== SSH key verification =====
             if "(yes/no)" in low or "yes/no" in low:
                 self.log(f"[HOP] Accepting SSH key", "DEBUG")
                 feed("yes\n")
-                time.sleep(10)
+                time.sleep(0.5)
                 buf = ""  # Clear after yes/no to avoid re-detecting
                 continue
             
@@ -1073,7 +1069,7 @@ class NetworkDiscovery:
             if "username:" in low and password_attempts == 0:
                 self.log(f"[HOP] Sending username", "DEBUG")
                 feed(username + "\n")
-                time.sleep(10)
+                time.sleep(0.3)
                 buf = ""  # Clear to wait for next prompt
                 continue
             
@@ -1093,7 +1089,7 @@ class NetworkDiscovery:
                     self.log(f"[HOP] Sending login password (attempt {password_attempts})", "DEBUG")
                     feed(password + "\n")
                 
-                time.sleep(10)  # Wait for authentication response
+                time.sleep(1.0)  # Wait for authentication response
                 
                 # DON'T clear buffer yet - we need to see if auth succeeds
                 continue
@@ -1199,17 +1195,23 @@ class NetworkDiscovery:
         raise NetworkConnectionError(f"Failed to connect to seed after {AGG_MAX_RETRIES} attempts: {last_err}")
     
     # ═══════════════════════════════════════════════════════════════════════════
-    # FUNCTION: ssh_to_device (REPLACED)
+    # FUNCTION: ssh_to_device (UPDATED - Aggressive Retry for Cisco Busy/Refused)
     # ═══════════════════════════════════════════════════════════════════════════
     def ssh_to_device(self, target_ip, target_hostname=None, attempt=1):
         """
         SSH hop from aggregate to target using IOS CLI.
         
-        IMPROVED: Better connection state detection and smart retry logic.
+        UPDATED: Treats 'Connection Refused/Timeout' as temporary errors and 
+                retries them up to the full SSH_RETRY_ATTEMPTS limit.
         """
         if not self.agg_shell or self.agg_shell.closed:
             raise NetworkConnectionError("SSH shell to aggregation switch is closed", reconnect_needed=True)
         
+        # Don't try to SSH to the seed IP itself (circular loop)
+        if target_ip == self.seed_aggregate_ip:
+            self.log(f"[SSH] Skipping SSH to seed IP {target_ip} to avoid loop", "DEBUG")
+            return False
+
         self.log(f"SSH hop to {self.get_device_identifier(target_ip, target_hostname)} (attempt {attempt}/{SSH_RETRY_ATTEMPTS})")
         
         try:
@@ -1229,8 +1231,6 @@ class NetworkDiscovery:
         
         connection_refused_count = 0
         auth_failed_count = 0
-        timeout_count = 0
-        local_ip_detected = False
         
         for cred_idx, cred in enumerate(cred_order):
             user = cred["username"]
@@ -1243,7 +1243,7 @@ class NetworkDiscovery:
             ]
             
             for syntax_idx, cmd in enumerate(syntaxes):
-                self.log(f"[SSH] Trying: {cmd} (cred {cred_idx+1}/{len(cred_order)}, syntax {syntax_idx+1}/{len(syntaxes)})", "DEBUG")
+                self.log(f"[SSH] Trying: {cmd} (cred {cred_idx+1}/{len(cred_order)})", "DEBUG")
                 _ = self.send_cmd(self.agg_shell, cmd, timeout=3, silent=True)
                 
                 ok, out, connection_state = self._interactive_hop(
@@ -1251,24 +1251,25 @@ class NetworkDiscovery:
                 )
                 
                 if not ok:
-                    self.log(f"SSH failed with state: {connection_state}", "WARN")
-                    
                     # Track failure types
                     if connection_state == "connection_refused":
+                        self.log(f"[SSH] Connection refused/timed out (common on busy Cisco VTY lines)", "WARN")
                         connection_refused_count += 1
                     elif connection_state == "auth_failed":
+                        self.log(f"[SSH] Authentication failed for {user}", "WARN")
                         auth_failed_count += 1
-                    elif connection_state == "timeout":
-                        timeout_count += 1
-                    
+                    else:
+                        self.log(f"[SSH] Failed with state: {connection_state}", "WARN")
+
                     self.cleanup_failed_session()
                     
                     if not self.verify_aggregate_connection():
                         raise NetworkConnectionError("Connection to aggregation switch lost", reconnect_needed=True)
                     
-                    # Don't retry other syntaxes if connection is refused (not a syntax issue)
+                    # If connection was refused, it's not a credential issue. 
+                    # Don't try other syntaxes/creds in THIS attempt loop; just fail this attempt so we can wait and retry.
                     if connection_state == "connection_refused":
-                        break
+                        break 
                     
                     continue
                 
@@ -1281,20 +1282,12 @@ class NetworkDiscovery:
                 
                 # Check if we're still on the same switch
                 if post_host.strip() == pre_host.strip():
-                    self.log(f"[SSH] Hostname did not change (still '{pre_host}')", "WARN")
+                    self.log(f"[SSH] Hostname did not change (still '{pre_host}'). Treating as FAILED connection.", "WARN")
                     
-                    # This could be a local IP (SVI on same switch)
-                    # Only mark as local IP if we successfully authenticated
-                    if connection_state == "success":
-                        self.log(f"[SSH] Authenticated but stayed on same switch - likely a local SVI IP", "INFO")
-                        local_ip_detected = True
-                        self.cleanup_failed_session()
-                        break
-                    else:
-                        # Connection issue, not local IP
-                        self.log(f"[SSH] Connection issue (not local IP) - will try next credential", "DEBUG")
-                        self.cleanup_failed_session()
-                        continue
+                    # It's a failure (silent or refused). Treat it as such to force a retry.
+                    connection_refused_count += 1
+                    self.cleanup_failed_session()
+                    break # Break syntax loop to force retry
                 
                 # Success - hostname changed!
                 self.session_depth += 1
@@ -1303,61 +1296,31 @@ class NetworkDiscovery:
                 self.device_creds[target_ip] = cred
                 return True
             
-            # If local IP detected, stop trying other credentials
-            if local_ip_detected:
+            # Break credential loop if connection refused (wait for retry delay)
+            if connection_refused_count > 0:
                 break
-        
-        # ===== All attempts failed - decide what to do =====
-        
-        # If it's a local IP, return False immediately (don't retry)
-        if local_ip_detected:
-            self.log(f"[SSH] Confirmed local IP - skipping device", "INFO")
-            return False
-        
-        # If all connection attempts were refused, it might be down or unreachable
-        if connection_refused_count == len(cred_order) * len(syntaxes):
-            self.log(f"[SSH] All connection attempts refused - device may be down/unreachable", "WARN")
-            
-            # Still retry but with reduced attempts
-            if attempt < CONNECTION_REFUSED_MAX_RETRIES:
-                self.log(f"[RETRY] Waiting {SSH_RETRY_DELAY}s before retry (connection refused)...", "INFO")
-                time.sleep(SSH_RETRY_DELAY)
-                if not self.verify_aggregate_connection():
-                    raise NetworkConnectionError("Lost connection to aggregation switch during retry delay", reconnect_needed=True)
-                return self.ssh_to_device(target_ip, target_hostname, attempt + 1)
-            else:
-                raise NetworkConnectionError(
-                    f"SSH connection refused to {target_ip} after {attempt} attempts - device may be down",
-                    reconnect_needed=False, retry_allowed=False
-                )
-        
-        # If all auth attempts failed, bad credentials
+
+        # ===== RETRY LOGIC =====
+
+        # If auth failed specifically, we generally don't retry unless mixed with connection issues
         if auth_failed_count > 0 and connection_refused_count == 0:
             self.log(f"[SSH] Authentication failed with all credential sets", "ERROR")
-            # Don't retry for auth failures
             raise NetworkConnectionError(
                 f"Authentication failed to {target_ip} - check credentials",
                 reconnect_needed=False, retry_allowed=False
             )
-        
-        # Timeout issues - could be network congestion or slow device
-        if timeout_count > 0:
-            self.log(f"[SSH] Connection timeout(s) occurred", "WARN")
-            if attempt < SSH_RETRY_ATTEMPTS:
-                self.log(f"[RETRY] Waiting {SSH_RETRY_DELAY}s before retry (timeout)...", "INFO")
-                time.sleep(SSH_RETRY_DELAY)
-                if not self.verify_aggregate_connection():
-                    raise NetworkConnectionError("Lost connection to aggregation switch during retry delay", reconnect_needed=True)
-                return self.ssh_to_device(target_ip, target_hostname, attempt + 1)
-        
-        # General retry for other failures
+
+        # For everything else (Refused, Timeout, Unknown, Silent Failure) -> RETRY aggressively
         if attempt < SSH_RETRY_ATTEMPTS:
-            self.log(f"[RETRY] Waiting {SSH_RETRY_DELAY}s before retry (general)...", "INFO")
+            self.log(f"[RETRY] Connection failed/refused. Waiting {SSH_RETRY_DELAY}s before retry {attempt+1}/{SSH_RETRY_ATTEMPTS}...", "INFO")
             time.sleep(SSH_RETRY_DELAY)
+            
             if not self.verify_aggregate_connection():
                 raise NetworkConnectionError("Lost connection to aggregation switch during retry delay", reconnect_needed=True)
+                
             return self.ssh_to_device(target_ip, target_hostname, attempt + 1)
         
+        # Final Give up
         raise NetworkConnectionError(
             f"SSH to {target_ip} failed after {SSH_RETRY_ATTEMPTS} attempts",
             reconnect_needed=False, retry_allowed=False
