@@ -262,13 +262,21 @@ def ssh_to_device(target_ip, expected_hostname=None, parent_hostname=None):
     global agg_shell, session_depth, device_creds, hostname_to_ip
     if not parent_hostname: parent_hostname = get_hostname(agg_shell)
     
-    # Check self-IP
+    # --- BUG FIX: EXACT IP MATCHING ---
     try:
         brief = send_cmd(agg_shell, "show ip interface brief", timeout=10, silent=True)
-        if any(target_ip in line and "up" in line.lower() for line in brief.splitlines()):
-            logger.info(f"Target IP {target_ip} is current switch")
-            return None
-    except: pass
+        for line in brief.splitlines():
+            # Typical line: Vlan1 192.168.1.100 YES manual up up
+            parts = line.split()
+            if len(parts) >= 2:
+                current_ip = parts[1] # The IP is usually the second column
+                # Exact string match check
+                if current_ip == target_ip and ("up" in line.lower()):
+                    logger.info(f"Target IP {target_ip} is current switch (Self-detection)")
+                    return None
+    except Exception as e: 
+        logger.debug(f"Self-IP check failed: {e}")
+    # ----------------------------------
     
     for attempt in range(1, SSH_HOP_RETRY_ATTEMPTS + 1):
         if attempt > 1: time.sleep(SSH_HOP_RETRY_BASE_DELAY)
