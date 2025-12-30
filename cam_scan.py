@@ -563,9 +563,9 @@ def upgrade_indirect_to_direct_discovery(switch_name, switch_ip):
 
 def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=False):
     """
-    Main recursive processing function.
+    Main recursive processing function with ROBUST ERROR RECOVERY.
     """
-    global failed_switches
+    global failed_switches, agg_shell
     switch_ip = neighbor_info.get("mgmt_ip") or neighbor_info.get("ip")
     switch_name = neighbor_info.get("remote_name") or neighbor_info.get("hostname")
     local_intf = neighbor_info.get("local_intf") or neighbor_info.get("local_port")
@@ -580,10 +580,16 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
         visited_switches.add(switch_ip)
         discovery_stats["switches_attempted"] += 1
 
+    # CAPTURE PARENT STATE BEFORE HOPPING
     try:
         parent_hostname = get_hostname(agg_shell)
-        if not verify_aggregate_connection(): raise NetworkConnectionError("Lost parent")
+        if not verify_aggregate_connection(): 
+            raise NetworkConnectionError("Lost parent before hop")
+    except Exception as e:
+        logger.error(f"Cannot determine parent state: {e}")
+        return False
 
+    try:
         # 1. SSH HOP
         ssh_success = ssh_to_device(switch_ip, switch_name, parent_hostname)
         
@@ -614,17 +620,48 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
                 logger.info(f"Daisy-Chain: Found {len(downstream_candidates)} downstream neighbors.")
                 for cand in downstream_candidates:
                     if cand.get("mgmt_ip") and cand["mgmt_ip"] not in visited_switches:
+                        # CHECK CONNECTION BEFORE RECURSION
+                        if not verify_aggregate_connection():
+                            logger.error("Lost connection during daisy-chain recursion. Aborting chain.")
+                            raise NetworkConnectionError("Lost connection in recursion")
+
                         logger.info(f" >> Descending to {cand['hostname']} ({cand['mgmt_ip']})")
                         process_switch(switch_ip, cand, determine_switch_type(cand["hostname"]), is_retry)
-        
+                        
+                        # VERIFY WE ARE BACK AT THIS SWITCH AFTER RECURSION
+                        current = get_hostname(agg_shell)
+                        if current != actual_hostname:
+                            logger.warning(f"Recursion drift! Expected {actual_hostname}, got {current}. Attempting fix.")
+                            cleanup_and_return_to_parent(actual_hostname)
+
         except Exception as e:
             logger.error(f"Error scanning {switch_name}: {e}")
+            # Don't re-raise, try to exit gracefully
         
-        exit_device()
+        # --- 4. EXIT (POP STACK) ---
+        logger.debug(f"Exiting {actual_hostname}...")
+        if not exit_device():
+            raise NetworkConnectionError("Failed to exit switch")
+            
+        # Verify return to parent
+        final_host = get_hostname(agg_shell)
+        if final_host != parent_hostname:
+             logger.error(f"Failed to return to parent! Expected {parent_hostname}, got {final_host}")
+             # Last ditch effort to fix depth
+             cleanup_and_return_to_parent(parent_hostname)
+             
         return True
 
     except Exception as e:
-        logger.error(f"Process error: {e}")
+        logger.error(f"Process error on {switch_name}: {e}")
+        # CRITICAL RECOVERY: If we lost our place, try to get back to the seed
+        try:
+            current = get_hostname(agg_shell)
+            if current != parent_hostname and current != "Unknown":
+                logger.warning(f"Attempting emergency return to {parent_hostname} from {current}")
+                cleanup_and_return_to_parent(parent_hostname)
+        except:
+            pass
         return False
 
 def check_for_duplicate_macs():
