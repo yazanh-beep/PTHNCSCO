@@ -15,8 +15,9 @@ Smart Network Topology Discovery Tool (Cisco-CLI Nested SSH, Depth-Safe)
 - Exports: network_topology.json + discovery_metadata.txt
 
 FIXED: 
-1. "Local IP" false positive logic removed. 
-2. If hostname doesn't change, it is treated as a failure and RETRIED.
+1. "Local IP" verification removed entirely.
+2. Silent Failure (hostname unchanged) now correctly triggers the next credential.
+3. Recursively tries ALL credentials for every attempt.
 """
 import paramiko
 import time
@@ -26,12 +27,15 @@ from datetime import datetime
 from collections import deque
 
 # ─── USER CONFIG ─────────────────────────────────────────────────────────────
-AGGREGATE_ENTRY_IP = "192.168.100.13"  # First hop from the server
+AGGREGATE_ENTRY_IP = ""  # First hop from the server
 
 # Ordered credential sets to try (add more as needed)
 # "enable": "" means "reuse the login password as enable"
 CREDENTIAL_SETS = [
-    {"username": "admin",  "password": "cisco",  "enable": ""}
+    {"username": "admin",  "password": "C1sco",  "enable": ""},
+    {"username": "admin",  "password": "cisco",  "enable": ""},
+    {"username": "cisco",  "password": "cisco",  "enable": ""},
+    {"username": "admin",  "password": "S1mplex",  "enable": ""}
 ]
 
 # Optional: pre-known aggregate SVI mgmt IPs (besides seed)
@@ -313,10 +317,15 @@ class NetworkDiscovery:
             
             self.log("[CLEANUP] Cleaning up failed SSH attempt", "DEBUG")
             
-            # Send Ctrl+C to interrupt
+            # Send Ctrl+C multiple times to kill any hung SSH process
+            # Also send a few newlines to clear the buffer
             try:
-                sh.send("\x03")
-                time.sleep(0.3)
+                sh.send("\x03") # Ctrl+C
+                time.sleep(0.2)
+                sh.send("\x03") # Ctrl+C again
+                time.sleep(0.2)
+                sh.send("\n")
+                time.sleep(0.5)
             except Exception:
                 pass
             
@@ -332,11 +341,11 @@ class NetworkDiscovery:
                 except Exception:
                     pass
             
-            # Multiple verification attempts
+            # Multiple verification attempts with explicit newlines
             for _ in range(3):
                 try:
                     sh.send("\n")
-                    time.sleep(0.3)
+                    time.sleep(0.5)
                     data = self._drain(sh)
                     if self._looks_like_prompt(data):
                         self.log("[CLEANUP] Successfully verified prompt", "DEBUG")
@@ -980,17 +989,13 @@ class NetworkDiscovery:
         return out or [""]
     
     # ═══════════════════════════════════════════════════════════════════════════
-    # FUNCTION: _interactive_hop (REPLACED)
+    # FUNCTION: _interactive_hop (FIXED - Returns correct state)
     # ═══════════════════════════════════════════════════════════════════════════
     def _interactive_hop(self, shell, ip, username, password, enable_password, overall_timeout=120):
         """
         Drive IOS 'ssh' interactively until we reach a privileged prompt or timeout.
         
-        IMPROVED: Better state tracking and connection state detection.
-        
-        Returns:
-            tuple: (success: bool, output: str, connection_state: str)
-            connection_state can be: "success", "auth_failed", "connection_refused", "timeout"
+        FIXED: Correctly returns 'auth_failed' instead of overwriting it with 'timeout'.
         """
         start = time.time()
         buf = ""
@@ -1038,7 +1043,6 @@ class NetworkDiscovery:
             # ===== Need to enable =====
             if self._looks_like_prompt(buf) and last_line.endswith(">"):
                 current_time = time.time()
-                # Send enable if we haven't sent it, or if it's been 5+ seconds since last attempt
                 if not enable_sent or (current_time - last_enable_attempt > 5):
                     self.log(f"[HOP] At user mode ({last_line}), sending 'enable'", "DEBUG")
                     feed("enable\n")
@@ -1052,7 +1056,7 @@ class NetworkDiscovery:
                 self.log(f"[HOP] Accepting SSH key", "DEBUG")
                 feed("yes\n")
                 time.sleep(0.5)
-                buf = ""  # Clear after yes/no to avoid re-detecting
+                buf = "" 
                 continue
             
             # ===== Username prompt =====
@@ -1060,7 +1064,7 @@ class NetworkDiscovery:
                 self.log(f"[HOP] Sending username", "DEBUG")
                 feed(username + "\n")
                 time.sleep(0.3)
-                buf = ""  # Clear to wait for next prompt
+                buf = "" 
                 continue
             
             # ===== Password prompt =====
@@ -1070,7 +1074,7 @@ class NetworkDiscovery:
                 if password_attempts > max_password_attempts:
                     self.log(f"[HOP] Max password attempts ({max_password_attempts}) reached", "WARN")
                     connection_state = "auth_failed"
-                    break
+                    break # Break loop, proceed to return below
                 
                 if enable_sent:
                     self.log(f"[HOP] Sending enable password (attempt {password_attempts})", "DEBUG")
@@ -1079,9 +1083,7 @@ class NetworkDiscovery:
                     self.log(f"[HOP] Sending login password (attempt {password_attempts})", "DEBUG")
                     feed(password + "\n")
                 
-                time.sleep(1.0)  # Wait for authentication response
-                
-                # DON'T clear buffer yet - we need to see if auth succeeds
+                time.sleep(1.0)
                 continue
             
             # ===== Failure detection =====
@@ -1096,25 +1098,26 @@ class NetworkDiscovery:
             for fail_key in fail_keys:
                 if fail_key in low:
                     self.log(f"[HOP] Detected failure: {fail_key}", "DEBUG")
-                    
-                    # Determine connection state
                     if fail_key in ("connection refused", "unable to connect", "no route to host", 
                                    "host is unreachable", "closed by foreign host"):
-                        connection_state = "connection_refused"
+                        return False, buf, "connection_refused"
                     elif fail_key in ("authentication failed", "permission denied", 
                                      "% bad passwords", "% login invalid", "access denied"):
-                        connection_state = "auth_failed"
-                    
-                    return False, buf, connection_state
+                        return False, buf, "auth_failed"
             
             # Send periodic newline to refresh prompt
             if (time.time() - start) > 2 and (time.time() - start) % 3 < 0.2:
                 feed("\n")
         
-        # Timeout
+        # Loop finished (timeout or break)
+        
+        # If we set a specific state (like auth_failed), return that.
+        if connection_state != "unknown":
+            return False, buf, connection_state
+
+        # Otherwise it's a genuine timeout
         self.log(f"[HOP] Timeout after {overall_timeout}s", "WARN")
         self.log(f"[HOP] Last line was: {last_line}", "WARN")
-        self.log(f"[HOP] enable_sent={enable_sent}, password_attempts={password_attempts}", "WARN")
         return False, buf, "timeout"
 
     def _connect_to_aggregate_internal(self):
@@ -1221,6 +1224,7 @@ class NetworkDiscovery:
         
         connection_refused_count = 0
         auth_failed_count = 0
+        local_ip_detected = False
         
         for cred_idx, cred in enumerate(cred_order):
             user = cred["username"]
@@ -1232,6 +1236,9 @@ class NetworkDiscovery:
                 f"ssh {user}@{target_ip}",
             ]
             
+            # Track if this specific credential succeeded
+            cred_success = False
+
             for syntax_idx, cmd in enumerate(syntaxes):
                 self.log(f"[SSH] Trying: {cmd} (cred {cred_idx+1}/{len(cred_order)})", "DEBUG")
                 _ = self.send_cmd(self.agg_shell, cmd, timeout=3, silent=True)
@@ -1256,8 +1263,8 @@ class NetworkDiscovery:
                     if not self.verify_aggregate_connection():
                         raise NetworkConnectionError("Connection to aggregation switch lost", reconnect_needed=True)
                     
-                    # If connection was refused, it's not a credential issue. 
-                    # Don't try other syntaxes/creds in THIS attempt loop; just fail this attempt so we can wait and retry.
+                    # If connection was REFUSED (network/port issue), trying other syntaxes won't help.
+                    # However, we DO NOT break the outer credential loop yet, unless ALL attempts fail.
                     if connection_state == "connection_refused":
                         break 
                     
@@ -1272,28 +1279,44 @@ class NetworkDiscovery:
                 
                 # Check if we're still on the same switch
                 if post_host.strip() == pre_host.strip():
-                    self.log(f"[SSH] Hostname did not change (still '{pre_host}'). Treating as FAILED connection.", "WARN")
-                    
-                    # It's a failure (silent or refused). Treat it as such to force a retry.
-                    connection_refused_count += 1
-                    self.cleanup_failed_session()
-                    break # Break syntax loop to force retry
+                    # Potential Local IP or Silent Failure
+                    if connection_state == "success":
+                        self.log(f"[SSH] ✗ Hostname did not change (still '{pre_host}'). Treating as FAILED connection.", "WARN")
+                        self.cleanup_failed_session()
+                        # Do NOT increment connection_refused_count here.
+                        # Instead, just continue to the next syntax/credential.
+                        continue 
+                    else:
+                        self.cleanup_failed_session()
+                        continue
                 
                 # Success - hostname changed!
                 self.session_depth += 1
                 self.send_cmd(self.agg_shell, "terminal length 0", timeout=5, silent=True)
                 self.log(f"Successfully connected to {target_ip} as {user} (host: {post_host})")
                 self.device_creds[target_ip] = cred
+                cred_success = True
+                break # Break syntax loop
+
+            if cred_success:
                 return True
-            
-            # Break credential loop if connection refused (wait for retry delay)
-            if connection_refused_count > 0:
+                
+            if local_ip_detected:
                 break
+                
+            # If we have refused connections, we might want to stop early, 
+            # BUT only if it's a true network/ACL issue, not just a flaky session.
+            # Ideally, we should try at least one other credential set to be sure it's not auth-related blocking.
+            # For now, we will allow the credential loop to continue even if one refused.
 
         # ===== RETRY LOGIC =====
 
-        # If auth failed specifically, we generally don't retry unless mixed with connection issues
+        if local_ip_detected:
+            return False
+
+        # Only give up on Auth Failure if we are absolutely sure it wasn't a connection issue
         if auth_failed_count > 0 and connection_refused_count == 0:
+            # If we tried all credentials and they all failed AUTH, then we stop.
             self.log(f"[SSH] Authentication failed with all credential sets", "ERROR")
             raise NetworkConnectionError(
                 f"Authentication failed to {target_ip} - check credentials",
