@@ -382,27 +382,17 @@ class NetworkDiscovery:
     # ── Hostname normalization ────────────────────────────────────────────
     def normalize_hostname(self, hostname):
         """
-        Normalize hostname by stripping domain suffixes only.
-        Preserves unique device identifiers in the hostname.
+        Normalize hostname by stripping ALL domain suffixes.
+        Returns just the short hostname (upper case).
         """
         if not hostname:
             return hostname
         
-        # List of known domain suffixes to remove
-        domain_suffixes = [
-            r'\.CAM\.INT$',
-            r'\.cam\.int$',
-            r'\.switch\d+\.loc(al)?$',  # .switch18.loc or .switch18.local
-            r'\.local$',
-            # Add more domain patterns here if needed
-            # r'\.example\.com$',
-        ]
-        
-        # Try to remove each known domain suffix
-        for suffix_pattern in domain_suffixes:
-            hostname = re.sub(suffix_pattern, '', hostname, flags=re.IGNORECASE)
-        
-        return hostname
+        # Remove everything after the first dot
+        if '.' in hostname:
+            hostname = hostname.split('.')[0]
+            
+        return hostname.upper().strip()
     
     # ── MAC address formatting ────────────────────────────────────────────
     def format_mac_address(self, mac_string):
