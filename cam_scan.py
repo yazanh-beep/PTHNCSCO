@@ -46,19 +46,19 @@ logger = logging.getLogger(__name__)
 # USER CONFIG
 # ============================================================================
 
-SEED_SWITCH_IP = "192.168.162.1" 
+SEED_SWITCH_IP = "192.168.1.100" 
 TIMEOUT = 150
 MAX_READ = 65535
 CREDENTIAL_SETS = [
     {"username": "cisco",  "password": "cisco",  "enable": ""} ,
-    {"username": "admin",  "password": "C1sco",  "enable": ""}
+    {"username": "admin",  "password": "cisco",  "enable": ""}
 ]
 AGG_MAX_RETRIES = 3
 AGG_RETRY_DELAY = 5
 CDP_LLDP_TIMEOUT = 35
 
 # --- RETRY CONFIGURATION ---
-SSH_HOP_RETRY_ATTEMPTS = 2          # Reduced for speed (Fail Fast)
+SSH_HOP_RETRY_ATTEMPTS = 2          
 SSH_HOP_RETRY_BASE_DELAY = 1        
 SSH_HOP_USE_EXPONENTIAL_BACKOFF = False
 SSH_HOP_VERIFY_ROUTE = False
@@ -69,11 +69,11 @@ MAC_POLL_MAX_ATTEMPTS = 999999
 MAC_POLL_INITIAL_WAIT = 15       
 MAC_POLL_BATCH_SIZE = 100        
 MAC_POLL_BATCH_PAUSE = 2         
-MAC_POLL_HARD_TIMEOUT = 5       # Reduced to 45s to skip empty ports faster
+MAC_POLL_HARD_TIMEOUT = 45       
 
 # --- INDIRECT DISCOVERY CONFIGURATION ---
 ENABLE_INDIRECT_DISCOVERY = True    
-INDIRECT_DISCOVERY_MIN_MACS = 1     # Catch single devices
+INDIRECT_DISCOVERY_MIN_MACS = 1     
 INDIRECT_DISCOVERY_MAX_MACS = 100   
 
 #--- SWITCH TYPE DETECTION BY HARDWARE MODEL ---
@@ -325,7 +325,6 @@ def ssh_to_device(target_ip, expected_hostname=None, parent_hostname=None):
             except Exception as e:
                 logger.debug(f"SSH attempt {idx} error: {e}")
 
-            # Fail fast cleanup (Ctrl+C to kill hanging SSH)
             agg_shell.send("\x03") 
             time.sleep(0.2)
             agg_shell.send("\x03") 
@@ -383,7 +382,7 @@ def is_aggregate_switch(hostname, hardware_model=None):
     return determine_switch_type(hostname, hardware_model) == "AGGREGATE"
 
 # ============================================================================
-# PARSING LOGIC (UPDATED WITH DEVICE FILTERS)
+# PARSING LOGIC (STRICT CISCO ONLY)
 # ============================================================================
 
 def parse_cdp_neighbors(output):
@@ -395,20 +394,19 @@ def parse_cdp_neighbors(output):
         nbr = {"hostname": None, "mgmt_ip": None, "local_intf": None}
         
         if m := re.search(r"Device ID:\s*(\S+)", block): nbr["hostname"] = m.group(1)
-        
-        # --- FIX 1: Filter out known non-switch devices by Hostname ---
-        if nbr["hostname"] and (nbr["hostname"].lower().startswith("axis") or "phone" in nbr["hostname"].lower()):
-             continue
-
         if m := re.search(r"Interface:\s*([^\s,]+)", block): nbr["local_intf"] = m.group(1).rstrip(',')
         
-        # --- FIX 2: Filter out known non-switch devices by Platform ---
+        # --- STRICT CISCO FILTER ---
         platform_match = re.search(r"Platform:\s*(.+?)(?:,|$)", block, re.I)
-        platform = platform_match.group(1) if platform_match else ""
-        if "Phone" in platform or "Camera" in platform or "AIR-" in platform:
+        platform = platform_match.group(1).lower() if platform_match else ""
+        
+        # Must be Cisco, and NOT a Phone/Camera
+        if "cisco" not in platform:
+            continue
+        if "phone" in platform or "camera" in platform or "air-" in platform:
             continue
 
-        # Robust IP Matching
+        # IP Matching
         if m := re.search(r"(?:Entry|Management|IP)\s+address(?:\(es\))?:.*?\s+(\d+\.\d+\.\d+\.\d+)", block, re.S | re.I): 
             nbr["mgmt_ip"] = m.group(1)
         elif m := re.findall(r"\d+\.\d+\.\d+\.\d+", block):
@@ -428,19 +426,19 @@ def parse_lldp_neighbors(output):
         
         if m := re.search(r'^System Name:\s*(.+?)$', block, re.M): 
             nbr["hostname"] = m.group(1).strip().strip('"')
-
-        # --- FIX 1: Filter out known non-switch devices by Hostname ---
-        if nbr["hostname"] and (nbr["hostname"].lower().startswith("axis") or "phone" in nbr["hostname"].lower()):
-             continue
         
         if m := re.search(r'^Local Intf:\s*(\S+)', block, re.M): nbr["local_intf"] = m.group(1)
         
-        # --- FIX 2: Filter out by System Description ---
+        # --- STRICT CISCO FILTER ---
         sys_desc = ""
         if m := re.search(r'^System Description:\s*\n([\s\S]+?)(?=^Time|^System)', block, re.M):
             sys_desc = m.group(1).strip().lower()
             
-        if "axis" in sys_desc or "phone" in sys_desc or "camera" in sys_desc:
+        # Must explicitly say "Cisco" or "IOS"
+        if "cisco" not in sys_desc and "ios" not in sys_desc:
+            continue
+        # Double check for phones/cameras just in case
+        if "phone" in sys_desc or "camera" in sys_desc or "axis" in sys_desc:
             continue
         
         if m := re.search(r'IP:\s*(\d+\.\d+\.\d+\.\d+)', block): nbr["mgmt_ip"] = m.group(1)
@@ -472,7 +470,6 @@ def poll_port_for_mac(shell, interface):
     logger.info(f"  [POLL] {interface} - waiting for MAC address...")
     start_time = time.time()
     
-    # Strictly respect Hard Timeout
     while (time.time() - start_time) < MAC_POLL_HARD_TIMEOUT:
         try:
             res = send_cmd(shell, f"show mac address-table interface {interface}", timeout=5, silent=True)
@@ -746,7 +743,7 @@ def retry_failed_switches_from_seed():
         process_switch(SEED_SWITCH_IP, nbr, item["switch_type"], is_retry=True)
 
 def main():
-    logger.info("STARTING DISCOVERY V10 (FINAL)")
+    logger.info("STARTING DISCOVERY V11 (FINAL)")
     connect_to_seed()
     
     aggs = deque([SEED_SWITCH_IP])
