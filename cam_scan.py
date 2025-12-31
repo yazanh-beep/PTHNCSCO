@@ -57,11 +57,11 @@ AGG_MAX_RETRIES = 3
 AGG_RETRY_DELAY = 5
 CDP_LLDP_TIMEOUT = 35
 
-# --- RETRY CONFIGURATION (UPDATED) ---
-SSH_HOP_RETRY_ATTEMPTS = 2          # Reduced to fail fast
-SSH_HOP_RETRY_BASE_DELAY = 1        # Reduced delay
-SSH_HOP_USE_EXPONENTIAL_BACKOFF = False
-SSH_HOP_VERIFY_ROUTE = False
+# --- RETRY CONFIGURATION ---
+SSH_HOP_RETRY_ATTEMPTS = 5
+SSH_HOP_RETRY_BASE_DELAY = 2
+SSH_HOP_USE_EXPONENTIAL_BACKOFF = True
+SSH_HOP_VERIFY_ROUTE = True
 
 # --- MAC TABLE POLLING CONFIGURATION ---
 MAC_POLL_INTERVAL = 5            
@@ -251,81 +251,64 @@ def verify_ip_reachable_quick(target_ip, shell, timeout=3):
 
 def cleanup_and_return_to_parent(expected_parent, max_attempts=3):
     global agg_shell, session_depth
+    # Check if we are already there before sending commands
+    current = get_hostname(agg_shell)
+    if current == expected_parent:
+        return True
+
     for _ in range(max_attempts):
-        if get_hostname(agg_shell) == expected_parent: return True
         agg_shell.send("exit\n")
         time.sleep(1)
         _drain(agg_shell)
         session_depth = max(0, session_depth - 1)
+        if get_hostname(agg_shell) == expected_parent: return True
     return False
 
 def ssh_to_device(target_ip, expected_hostname=None, parent_hostname=None):
-    global agg_shell, session_depth
+    global agg_shell, session_depth, device_creds, hostname_to_ip
     if not parent_hostname: parent_hostname = get_hostname(agg_shell)
-
-    # Self-IP Check
+    
+    # Check self-IP
     try:
-        brief = send_cmd(agg_shell, "show ip interface brief", timeout=5, silent=True)
+        brief = send_cmd(agg_shell, "show ip interface brief", timeout=10, silent=True)
         if any(target_ip in line and "up" in line.lower() for line in brief.splitlines()):
-            logger.info(f"Target IP {target_ip} is current switch (Self-detection)")
+            logger.info(f"Target IP {target_ip} is current switch")
             return None
     except: pass
     
     for attempt in range(1, SSH_HOP_RETRY_ATTEMPTS + 1):
-        if attempt > 1: 
-            logger.info(f"   ...retrying in {SSH_HOP_RETRY_BASE_DELAY}s")
-            time.sleep(SSH_HOP_RETRY_BASE_DELAY)
-            
+        if attempt > 1: time.sleep(SSH_HOP_RETRY_BASE_DELAY)
         logger.info(f"[RETRY] SSH hop {attempt}/{SSH_HOP_RETRY_ATTEMPTS} to {target_ip}")
         
-        if not verify_aggregate_connection(): 
-            raise NetworkConnectionError("Lost connection to parent switch", reconnect_needed=True)
-            
-        current_host = get_hostname(agg_shell)
-        if current_host != parent_hostname:
-            logger.warning(f"Drift detected (on {current_host}, expected {parent_hostname}). Correcting...")
-            cleanup_and_return_to_parent(parent_hostname)
-
-        for idx, cred in enumerate(CREDENTIAL_SETS, 1):
+        if not verify_aggregate_connection(): raise NetworkConnectionError("Lost parent", reconnect_needed=True)
+        if get_hostname(agg_shell) != parent_hostname: cleanup_and_return_to_parent(parent_hostname)
+        
+        # Attempt SSH
+        for cred in CREDENTIAL_SETS:
             try:
                 agg_shell.send(f"ssh -l {cred['username']} {target_ip}\n")
-                
-                # Fail Fast: Wait only 12s for password prompt
-                end_time = time.time() + 12 
+                time.sleep(2)
+                end_time = time.time() + 45
                 pw_sent = False
-                
                 while time.time() < end_time:
                     if agg_shell.recv_ready():
                         out = agg_shell.recv(MAX_READ).decode('utf-8', 'ignore')
-                        
                         if "assword:" in out and not pw_sent:
                             agg_shell.send(cred['password'] + "\n")
                             pw_sent = True
-                            end_time = time.time() + 10 # Login processing time
                         elif "(yes/no)" in out:
                             agg_shell.send("yes\n")
                         elif PROMPT_RE.search(out):
                             new_host = get_hostname(agg_shell)
                             if new_host != parent_hostname:
-                                logger.info(f"   Login successful: {new_host}")
                                 _ensure_enable(agg_shell, [cred.get('enable'), cred['password']])
                                 send_cmd(agg_shell, "terminal length 0", silent=True)
                                 session_depth += 1
                                 return True
-                            else:
-                                break
                     time.sleep(0.1)
-
-            except Exception as e:
-                logger.debug(f"SSH attempt {idx} error: {e}")
-
-            # Send multiple interrupts to kill hanging SSH client on switch
-            logger.debug("   Timeout/Fail. Aborting command...")
-            agg_shell.send("\x03") 
-            time.sleep(0.2)
-            agg_shell.send("\x03") 
-            time.sleep(0.5)
-            _drain(agg_shell)
+            except: pass
+            # Cleanup if failed
+            agg_shell.send("\x03"); time.sleep(0.5); _drain(agg_shell)
             
     return False
 
@@ -411,6 +394,7 @@ def parse_lldp_neighbors(output):
 def get_interface_status(shell):
     out = send_cmd(shell, "show ip interface brief", timeout=10)
     up_intfs = []
+    # Added Gi0/0 to exclude list
     excludes = ("Vlan", "Loopback", "Tunnel", "Null", "Po", "Ap", "Mgmt", "Gi0/0", "GigabitEthernet0/0")
     for line in out.splitlines():
         parts = line.split()
@@ -582,6 +566,7 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
 
         ssh_success = ssh_to_device(switch_ip, switch_name, parent_hostname)
         
+        # 2. FAILURE -> INDIRECT
         if not ssh_success and ssh_success is not None:
             logger.error(f"SSH Failed to {switch_name}. Attempting Indirect.")
             found = 0
@@ -608,14 +593,29 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
                         logger.info(f" >> Descending to {cand['hostname']} ({cand['mgmt_ip']})")
                         process_switch(switch_ip, cand, determine_switch_type(cand["hostname"]), is_retry)
                         
+                        # --- CRITICAL FIX START ---
                         current = get_hostname(agg_shell)
                         if current != actual_hostname:
-                            logger.warning(f"Recursion drift! Expected {actual_hostname}, got {current}. Fixing.")
-                            cleanup_and_return_to_parent(actual_hostname)
+                            logger.warning(f"Recursion drift detected! Expected {actual_hostname}, got {current}. Fixing.")
+                            if current == parent_hostname:
+                                logger.warning("Drifted back to parent. Aborting this chain to save socket.")
+                                break # Stop recursing on this branch, we are already back
+                            else:
+                                cleanup_and_return_to_parent(actual_hostname)
+                        # --- CRITICAL FIX END ---
         
         except Exception as e:
             logger.error(f"Error scanning {switch_name}: {e}")
         
+        logger.debug(f"Exiting {actual_hostname}...")
+        
+        # --- CRITICAL FIX 2 START ---
+        # If we drifted back to parent already, DON'T exit again!
+        if get_hostname(agg_shell) == parent_hostname:
+             logger.info(f"Already back at parent {parent_hostname}. Skipping exit.")
+             return True
+        # --- CRITICAL FIX 2 END ---
+
         exit_device()
         return True
 
