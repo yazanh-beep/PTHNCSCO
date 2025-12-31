@@ -46,21 +46,22 @@ logger = logging.getLogger(__name__)
 # USER CONFIG
 # ============================================================================
 
-SEED_SWITCH_IP = ""
+SEED_SWITCH_IP = "192.168.1.26"
 TIMEOUT = 150
 MAX_READ = 65535
 CREDENTIAL_SETS = [
-    {"username": "",  "password": "",  "enable": ""}
+    {"username": "cisco",  "password": "cisco",  "enable": ""} ,
+    {"username": "admin",  "password": "cisco",  "enable": ""}
 ]
 AGG_MAX_RETRIES = 3
 AGG_RETRY_DELAY = 5
 CDP_LLDP_TIMEOUT = 35
 
-# --- RETRY CONFIGURATION ---
-SSH_HOP_RETRY_ATTEMPTS = 5
-SSH_HOP_RETRY_BASE_DELAY = 2
-SSH_HOP_USE_EXPONENTIAL_BACKOFF = True
-SSH_HOP_VERIFY_ROUTE = True
+# --- RETRY CONFIGURATION (UPDATED) ---
+SSH_HOP_RETRY_ATTEMPTS = 2          # Reduced to fail fast
+SSH_HOP_RETRY_BASE_DELAY = 1        # Reduced delay
+SSH_HOP_USE_EXPONENTIAL_BACKOFF = False
+SSH_HOP_VERIFY_ROUTE = False
 
 # --- MAC TABLE POLLING CONFIGURATION ---
 MAC_POLL_INTERVAL = 5            
@@ -259,58 +260,72 @@ def cleanup_and_return_to_parent(expected_parent, max_attempts=3):
     return False
 
 def ssh_to_device(target_ip, expected_hostname=None, parent_hostname=None):
-    global agg_shell, session_depth, device_creds, hostname_to_ip
+    global agg_shell, session_depth
     if not parent_hostname: parent_hostname = get_hostname(agg_shell)
-    
-    # --- BUG FIX: EXACT IP MATCHING ---
+
+    # Self-IP Check
     try:
-        brief = send_cmd(agg_shell, "show ip interface brief", timeout=10, silent=True)
-        for line in brief.splitlines():
-            # Typical line: Vlan1 192.168.1.100 YES manual up up
-            parts = line.split()
-            if len(parts) >= 2:
-                current_ip = parts[1] # The IP is usually the second column
-                # Exact string match check
-                if current_ip == target_ip and ("up" in line.lower()):
-                    logger.info(f"Target IP {target_ip} is current switch (Self-detection)")
-                    return None
-    except Exception as e: 
-        logger.debug(f"Self-IP check failed: {e}")
-    # ----------------------------------
+        brief = send_cmd(agg_shell, "show ip interface brief", timeout=5, silent=True)
+        if any(target_ip in line and "up" in line.lower() for line in brief.splitlines()):
+            logger.info(f"Target IP {target_ip} is current switch (Self-detection)")
+            return None
+    except: pass
     
     for attempt in range(1, SSH_HOP_RETRY_ATTEMPTS + 1):
-        if attempt > 1: time.sleep(SSH_HOP_RETRY_BASE_DELAY)
+        if attempt > 1: 
+            logger.info(f"   ...retrying in {SSH_HOP_RETRY_BASE_DELAY}s")
+            time.sleep(SSH_HOP_RETRY_BASE_DELAY)
+            
         logger.info(f"[RETRY] SSH hop {attempt}/{SSH_HOP_RETRY_ATTEMPTS} to {target_ip}")
         
-        if not verify_aggregate_connection(): raise NetworkConnectionError("Lost parent", reconnect_needed=True)
-        if get_hostname(agg_shell) != parent_hostname: cleanup_and_return_to_parent(parent_hostname)
-        
-        # Attempt SSH
-        for cred in CREDENTIAL_SETS:
+        if not verify_aggregate_connection(): 
+            raise NetworkConnectionError("Lost connection to parent switch", reconnect_needed=True)
+            
+        current_host = get_hostname(agg_shell)
+        if current_host != parent_hostname:
+            logger.warning(f"Drift detected (on {current_host}, expected {parent_hostname}). Correcting...")
+            cleanup_and_return_to_parent(parent_hostname)
+
+        for idx, cred in enumerate(CREDENTIAL_SETS, 1):
             try:
                 agg_shell.send(f"ssh -l {cred['username']} {target_ip}\n")
-                time.sleep(2)
-                end_time = time.time() + 45
+                
+                # Fail Fast: Wait only 12s for password prompt
+                end_time = time.time() + 12 
                 pw_sent = False
+                
                 while time.time() < end_time:
                     if agg_shell.recv_ready():
                         out = agg_shell.recv(MAX_READ).decode('utf-8', 'ignore')
+                        
                         if "assword:" in out and not pw_sent:
                             agg_shell.send(cred['password'] + "\n")
                             pw_sent = True
+                            end_time = time.time() + 10 # Login processing time
                         elif "(yes/no)" in out:
                             agg_shell.send("yes\n")
                         elif PROMPT_RE.search(out):
                             new_host = get_hostname(agg_shell)
                             if new_host != parent_hostname:
+                                logger.info(f"   Login successful: {new_host}")
                                 _ensure_enable(agg_shell, [cred.get('enable'), cred['password']])
                                 send_cmd(agg_shell, "terminal length 0", silent=True)
                                 session_depth += 1
                                 return True
+                            else:
+                                break
                     time.sleep(0.1)
-            except: pass
-            # Cleanup if failed
-            agg_shell.send("\x03"); time.sleep(0.5); _drain(agg_shell)
+
+            except Exception as e:
+                logger.debug(f"SSH attempt {idx} error: {e}")
+
+            # Send multiple interrupts to kill hanging SSH client on switch
+            logger.debug("   Timeout/Fail. Aborting command...")
+            agg_shell.send("\x03") 
+            time.sleep(0.2)
+            agg_shell.send("\x03") 
+            time.sleep(0.5)
+            _drain(agg_shell)
             
     return False
 
@@ -396,7 +411,6 @@ def parse_lldp_neighbors(output):
 def get_interface_status(shell):
     out = send_cmd(shell, "show ip interface brief", timeout=10)
     up_intfs = []
-    # Added Gi0/0 to exclude list
     excludes = ("Vlan", "Loopback", "Tunnel", "Null", "Po", "Ap", "Mgmt", "Gi0/0", "GigabitEthernet0/0")
     for line in out.splitlines():
         parts = line.split()
@@ -415,7 +429,7 @@ def parse_mac_table_interface(raw):
 
 def poll_port_for_mac(shell, interface):
     logger.info(f"  [POLL] {interface} - waiting for MAC address...")
-    for attempt in range(1, 40): # Roughly 3 mins
+    for attempt in range(1, 40): 
         try:
             res = send_cmd(shell, f"show mac address-table interface {interface}", timeout=5, silent=True)
             entries = parse_mac_table_interface(res)
@@ -428,14 +442,7 @@ def poll_port_for_mac(shell, interface):
     discovery_stats["total_ports_no_mac"] += 1
     return [{"vlan": "UNKNOWN", "mac_address": "UNKNOWN", "port": interface}]
 
-# ============================================================================
-# NEW: RECURSIVE DISCOVERY LOGIC
-# ============================================================================
-
 def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
-    """
-    Scans a switch for cameras AND returns downstream neighbors for recursion.
-    """
     logger.info("="*80)
     logger.info(f"Scanning {switch_type} switch: {switch_hostname}")
     logger.info("="*80)
@@ -445,15 +452,12 @@ def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
         detected_type = determine_switch_type(switch_hostname, hardware_model)
         if detected_type != switch_type: switch_type = detected_type
 
-    # 1. Clear MAC Table
     send_cmd(shell, "clear mac address-table dynamic", timeout=10)
     time.sleep(MAC_POLL_INITIAL_WAIT)
 
-    # 2. Discover Neighbors (Exclusion + Daisy Chain Candidates)
     downstream_candidates = []
     neighbor_ports_normalized = set()
     
-    # Check CDP
     cdp_out = send_cmd(shell, "show cdp neighbors detail", timeout=CDP_LLDP_TIMEOUT, silent=True)
     if "CDP is not enabled" not in cdp_out:
         for nbr in parse_cdp_neighbors(cdp_out):
@@ -463,7 +467,6 @@ def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
                     downstream_candidates.append(nbr)
                     logger.info(f"NEIGHBOR (CDP): {nbr['local_intf']} -> {nbr['hostname']} ({nbr['mgmt_ip']})")
 
-    # Check LLDP
     lldp_out = send_cmd(shell, "show lldp neighbors detail", timeout=CDP_LLDP_TIMEOUT, silent=True)
     if "LLDP is not enabled" not in lldp_out:
         for nbr in parse_lldp_neighbors(lldp_out):
@@ -475,7 +478,6 @@ def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
                         downstream_candidates.append(nbr)
                         logger.info(f"NEIGHBOR (LLDP): {nbr['local_intf']} -> {nbr['hostname']} ({nbr['mgmt_ip']})")
 
-    # 3. Scan Ports
     up_interfaces = get_interface_status(shell)
     ports_to_scan = [p for p in up_interfaces if normalize_interface_name(p) not in neighbor_ports_normalized]
     
@@ -506,7 +508,6 @@ def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
     return downstream_candidates
 
 def discover_devices_via_mac_table(shell, uplink_port, downstream_switch_name, downstream_switch_ip, downstream_switch_type):
-    """Indirect discovery fallback."""
     if not ENABLE_INDIRECT_DISCOVERY: return 0
     logger.info(f"INDIRECT DISCOVERY: Scanning parent port {uplink_port} for {downstream_switch_name}")
     
@@ -542,12 +543,10 @@ def discover_devices_via_mac_table(shell, uplink_port, downstream_switch_name, d
         return 0
 
 def upgrade_indirect_to_direct_discovery(switch_name, switch_ip):
-    """Deduplicate entries when a switch comes back online."""
     indirect_entries = [e for e in camera_data if e.get("switch_name") == switch_name and e.get("status") == "INDIRECT"]
     if not indirect_entries: return
     
     direct_entries = [e for e in camera_data if e.get("switch_name") == switch_name and e.get("status") != "INDIRECT"]
-    
     duplicates = []
     for ind in indirect_entries:
         match = next((d for d in direct_entries if d["mac_address"] == ind["mac_address"]), None)
@@ -562,9 +561,6 @@ def upgrade_indirect_to_direct_discovery(switch_name, switch_ip):
     logger.info(f"Deduplicated {len(duplicates)} records for {switch_name}")
 
 def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=False):
-    """
-    Main recursive processing function with ROBUST ERROR RECOVERY.
-    """
     global failed_switches, agg_shell
     switch_ip = neighbor_info.get("mgmt_ip") or neighbor_info.get("ip")
     switch_name = neighbor_info.get("remote_name") or neighbor_info.get("hostname")
@@ -580,20 +576,12 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
         visited_switches.add(switch_ip)
         discovery_stats["switches_attempted"] += 1
 
-    # CAPTURE PARENT STATE BEFORE HOPPING
     try:
         parent_hostname = get_hostname(agg_shell)
-        if not verify_aggregate_connection(): 
-            raise NetworkConnectionError("Lost parent before hop")
-    except Exception as e:
-        logger.error(f"Cannot determine parent state: {e}")
-        return False
+        if not verify_aggregate_connection(): raise NetworkConnectionError("Lost parent")
 
-    try:
-        # 1. SSH HOP
         ssh_success = ssh_to_device(switch_ip, switch_name, parent_hostname)
         
-        # 2. FAILURE -> INDIRECT
         if not ssh_success and ssh_success is not None:
             logger.error(f"SSH Failed to {switch_name}. Attempting Indirect.")
             found = 0
@@ -608,60 +596,36 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
                 })
             return found > 0
 
-        # 3. SUCCESS -> SCAN & RECURSE
         actual_hostname = get_hostname(agg_shell)
         try:
-            # A. Scan cameras & get candidates
             downstream_candidates = discover_cameras_from_switch(agg_shell, actual_hostname, switch_type)
             discovery_stats["switches_successfully_scanned"] += 1
             
-            # B. Recurse!
             if downstream_candidates:
                 logger.info(f"Daisy-Chain: Found {len(downstream_candidates)} downstream neighbors.")
                 for cand in downstream_candidates:
                     if cand.get("mgmt_ip") and cand["mgmt_ip"] not in visited_switches:
-                        # CHECK CONNECTION BEFORE RECURSION
-                        if not verify_aggregate_connection():
-                            logger.error("Lost connection during daisy-chain recursion. Aborting chain.")
-                            raise NetworkConnectionError("Lost connection in recursion")
-
                         logger.info(f" >> Descending to {cand['hostname']} ({cand['mgmt_ip']})")
                         process_switch(switch_ip, cand, determine_switch_type(cand["hostname"]), is_retry)
                         
-                        # VERIFY WE ARE BACK AT THIS SWITCH AFTER RECURSION
                         current = get_hostname(agg_shell)
                         if current != actual_hostname:
-                            logger.warning(f"Recursion drift! Expected {actual_hostname}, got {current}. Attempting fix.")
+                            logger.warning(f"Recursion drift! Expected {actual_hostname}, got {current}. Fixing.")
                             cleanup_and_return_to_parent(actual_hostname)
-
+        
         except Exception as e:
             logger.error(f"Error scanning {switch_name}: {e}")
-            # Don't re-raise, try to exit gracefully
         
-        # --- 4. EXIT (POP STACK) ---
-        logger.debug(f"Exiting {actual_hostname}...")
-        if not exit_device():
-            raise NetworkConnectionError("Failed to exit switch")
-            
-        # Verify return to parent
-        final_host = get_hostname(agg_shell)
-        if final_host != parent_hostname:
-             logger.error(f"Failed to return to parent! Expected {parent_hostname}, got {final_host}")
-             # Last ditch effort to fix depth
-             cleanup_and_return_to_parent(parent_hostname)
-             
+        exit_device()
         return True
 
     except Exception as e:
-        logger.error(f"Process error on {switch_name}: {e}")
-        # CRITICAL RECOVERY: If we lost our place, try to get back to the seed
+        logger.error(f"Process error: {e}")
         try:
             current = get_hostname(agg_shell)
             if current != parent_hostname and current != "Unknown":
-                logger.warning(f"Attempting emergency return to {parent_hostname} from {current}")
                 cleanup_and_return_to_parent(parent_hostname)
-        except:
-            pass
+        except: pass
         return False
 
 def check_for_duplicate_macs():
@@ -673,7 +637,6 @@ def check_for_duplicate_macs():
     removed = 0
     for mac, entries in mac_map.items():
         if len(entries) > 1:
-            # Prefer Direct over Indirect
             keep = next((e for e in entries if e.get("status") != "INDIRECT"), entries[0])
             for e in entries:
                 if e != keep:
@@ -683,23 +646,19 @@ def check_for_duplicate_macs():
     logger.info(f"Removed {removed} duplicates.")
 
 def scan_aggregate_switch(shell, agg_ip, aggregates_to_process, seed_ips):
-    """Root level scan for aggregate switches."""
     if agg_ip in visited_switches: return
     visited_switches.add(agg_ip)
     hostname = get_hostname(shell)
     logger.info(f"Scanning ROOT AGGREGATE: {hostname}")
     
-    # 1. Topology discovery (Aggregates only)
     cdp_out = send_cmd(shell, "show cdp neighbors detail", silent=True)
     for nbr in parse_cdp_neighbors(cdp_out):
         if is_aggregate_switch(nbr["hostname"]) and nbr["mgmt_ip"] not in seed_ips:
             if nbr["mgmt_ip"] not in aggregates_to_process:
                 aggregates_to_process.append(nbr["mgmt_ip"])
     
-    # 2. Camera Scan (Aggregate itself) & Daisy Chain Trigger
     candidates = discover_cameras_from_switch(shell, hostname, "AGGREGATE")
     
-    # 3. Trigger recursion for connected edges
     for cand in candidates:
         if cand.get("mgmt_ip") and cand["mgmt_ip"] not in visited_switches:
             process_switch(agg_ip, cand, determine_switch_type(cand["hostname"]), is_retry=False)
@@ -715,7 +674,6 @@ def main():
     logger.info("STARTING DISCOVERY V5")
     connect_to_seed()
     
-    # Phase 1 & 2: Aggregates & Recursion
     aggs = deque([SEED_SWITCH_IP])
     seed_ips = {SEED_SWITCH_IP}
     
@@ -736,32 +694,20 @@ def main():
             logger.error(f"Aggregate error: {e}")
             reconnect_to_aggregate()
 
-    # Phase 3: Retry
     retry_failed_switches_from_seed()
-    
-    # Phase 4: Dedupe
     check_for_duplicate_macs()
     
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    
-    # 1. JSON REPORT (Restored)
-    json_file = f"camera_inventory_{len(camera_data)}devices_{timestamp}.json"
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    json_file = f"camera_inventory_{len(camera_data)}devices_{ts}.json"
     output_data = {
-        "discovery_metadata": {
-            "timestamp": timestamp,
-            "seed_switch": SEED_SWITCH_IP,
-            "total_devices": len(camera_data),
-            "total_aggregates": len(discovered_aggregates)
-        },
+        "discovery_metadata": {"timestamp": ts, "seed_switch": SEED_SWITCH_IP, "total_devices": len(camera_data), "total_aggregates": len(discovered_aggregates)},
         "discovery_statistics": discovery_stats,
         "cameras": camera_data
     }
-    with open(json_file, "w", encoding='utf-8') as f:
-        json.dump(output_data, f, indent=2)
+    with open(json_file, "w", encoding='utf-8') as f: json.dump(output_data, f, indent=2)
     logger.info(f"Saved JSON: {json_file}")
 
-    # 2. CSV REPORT
-    csv_file = f"camera_inventory_{len(camera_data)}devices_{timestamp}.csv"
+    csv_file = f"camera_inventory_{len(camera_data)}devices_{ts}.csv"
     with open(csv_file, "w", newline='', encoding='utf-8') as f:
         fieldnames = ["switch_name", "switch_type", "port", "mac_address", "vlan", "status", "parent_switch", "parent_port", "notes"]
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
