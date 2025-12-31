@@ -14,10 +14,10 @@ Smart Network Topology Discovery Tool (Cisco-CLI Nested SSH, Depth-Safe)
 - Recognizes IE switches and other Cisco devices without standard IOS descriptions
 - Exports: network_topology.json + discovery_metadata.txt
 
-FIXED: 
-1. "Local IP" verification removed entirely.
-2. Silent Failure (hostname unchanged) now correctly triggers the next credential.
-3. Recursively tries ALL credentials for every attempt.
+FIXED VERSION:
+1. Infinite Loop Fix: Hostname normalization now correctly strips domains without destroying complex hostnames.
+2. Credential Logic: Silent failures (same hostname) now try next credential.
+3. False Positives: "Local IP" check removed.
 """
 import paramiko
 import time
@@ -27,7 +27,7 @@ from datetime import datetime
 from collections import deque
 
 # ─── USER CONFIG ─────────────────────────────────────────────────────────────
-AGGREGATE_ENTRY_IP = ""  # First hop from the server
+AGGREGATE_ENTRY_IP = "192.168.162.1"  # First hop from the server
 
 # Ordered credential sets to try (add more as needed)
 # "enable": "" means "reuse the login password as enable"
@@ -391,15 +391,27 @@ class NetworkDiscovery:
     # ── Hostname normalization ────────────────────────────────────────────
     def normalize_hostname(self, hostname):
         """
-        Normalize hostname by stripping ALL domain suffixes.
-        Returns just the short hostname (upper case).
+        Normalize hostname by stripping known domain suffixes.
+        Does NOT split at the first dot, preserving complex hostnames like 'IDF_2.4#10'.
         """
         if not hostname:
             return hostname
         
-        # Remove everything after the first dot
-        if '.' in hostname:
-            hostname = hostname.split('.')[0]
+        # List of specific domain suffixes to remove (case-insensitive regex)
+        # Add any other domains you see in your network here
+        domain_suffixes = [
+            r"\.simplex\.net$",
+            r"\.CAM\.INT$",
+            r"\.JCI\.net$",
+            r"\.jci$",
+            r"\.corp\.google\.com$",
+            r"\.local$",
+            r"\.cisco\.com$"
+        ]
+        
+        # Remove known domains
+        for domain in domain_suffixes:
+            hostname = re.sub(domain, "", hostname, flags=re.IGNORECASE)
             
         return hostname.upper().strip()
     
