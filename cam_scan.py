@@ -63,6 +63,10 @@ SSH_HOP_RETRY_BASE_DELAY = 1
 SSH_HOP_USE_EXPONENTIAL_BACKOFF = False
 SSH_HOP_VERIFY_ROUTE = False        
 
+# --- SSH TIMING CONFIGURATION (NEW) ---
+# How long to wait for the SSH password prompt or error message to appear
+SSH_CONNECT_TIMEOUT = 30  
+
 # --- MAC TABLE POLLING CONFIGURATION ---
 MAC_POLL_INTERVAL = 5            
 MAC_POLL_MAX_ATTEMPTS = 999999   
@@ -280,11 +284,8 @@ def cleanup_and_return_to_parent(expected_parent, max_attempts=3):
     global agg_shell, session_depth, agg_hostname
     
     current = get_hostname(agg_shell)
+    if current == expected_parent: return True
     
-    if current == expected_parent:
-        return True
-        
-    # Safety Valve: If we drifted back to the SEED, stop exiting!
     if current == agg_hostname:
         logger.warning(f"Drifted back to SEED ({agg_hostname}). Cannot return to child {expected_parent}.")
         session_depth = 0
@@ -295,10 +296,8 @@ def cleanup_and_return_to_parent(expected_parent, max_attempts=3):
         time.sleep(1)
         _drain(agg_shell)
         session_depth = max(0, session_depth - 1)
-        
         current = get_hostname(agg_shell)
-        if current == expected_parent:
-            return True
+        if current == expected_parent: return True
         if current == agg_hostname:
             session_depth = 0
             return False
@@ -343,7 +342,9 @@ def ssh_to_device(target_ip, expected_hostname=None, parent_hostname=None):
         for idx, cred in enumerate(CREDENTIAL_SETS, 1):
             try:
                 agg_shell.send(f"ssh -l {cred['username']} {target_ip}\n")
-                end_time = time.time() + 20 
+                
+                # --- UPDATED TIMEOUT ---
+                end_time = time.time() + SSH_CONNECT_TIMEOUT 
                 pw_sent = False
                 
                 while time.time() < end_time:
@@ -384,7 +385,7 @@ def ssh_to_device(target_ip, expected_hostname=None, parent_hostname=None):
                 return False 
             else:
                 logger.warning(f"   Failed to recover prompt (On {check_host}, expected {parent_hostname})")
-                return False 
+                break 
             
     return False
 
@@ -456,9 +457,7 @@ def parse_cdp_neighbors(output):
         platform_match = re.search(r"Platform:\s*(.+?)(?:,|$)", block, re.I)
         platform = platform_match.group(1) if platform_match else ""
         
-        # Central Filter
-        if not is_device_a_switch(nbr["hostname"], platform):
-            continue
+        if not is_device_a_switch(nbr["hostname"], platform): continue
 
         if m := re.search(r"(?:Entry|Management|IP)\s+address(?:\(es\))?:.*?\s+(\d+\.\d+\.\d+\.\d+)", block, re.S | re.I): 
             nbr["mgmt_ip"] = m.group(1)
@@ -486,9 +485,7 @@ def parse_lldp_neighbors(output):
         if m := re.search(r'^System Description:\s*\n([\s\S]+?)(?=^Time|^System)', block, re.M):
             sys_desc = m.group(1).strip()
             
-        # Central Filter
-        if not is_device_a_switch(nbr["hostname"], sys_desc):
-            continue
+        if not is_device_a_switch(nbr["hostname"], sys_desc): continue
         
         if m := re.search(r'IP:\s*(\d+\.\d+\.\d+\.\d+)', block): nbr["mgmt_ip"] = m.group(1)
         if not nbr["mgmt_ip"] and (m := re.search(r'Address:\s*(\d+\.\d+\.\d+\.\d+)', block)): nbr["mgmt_ip"] = m.group(1)
@@ -663,7 +660,6 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
     switch_name = neighbor_info.get("remote_name") or neighbor_info.get("hostname")
     local_intf = neighbor_info.get("local_intf") or neighbor_info.get("local_port")
 
-    # FIX: Don't check visited for None IPs
     if switch_ip and switch_ip in visited_switches and not is_retry: return True
     
     logger.info("*"*80)
@@ -679,7 +675,6 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
 
         ssh_success = False
         
-        # --- FIX: Direct Path to Indirect if IP is missing ---
         if switch_ip:
             ssh_success = ssh_to_device(switch_ip, switch_name, parent_hostname)
         else:
@@ -709,8 +704,8 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
             if downstream_candidates:
                 logger.info(f"Daisy-Chain: Found {len(downstream_candidates)} downstream neighbors.")
                 for cand in downstream_candidates:
+                    logger.debug(f"Checking candidate: {cand.get('hostname')} ({cand.get('mgmt_ip')})")
                     cand_ip = cand.get("mgmt_ip")
-                    # FIX: Pass if IP is None OR if IP is new
                     if (not cand_ip) or (cand_ip and cand_ip not in visited_switches):
                         logger.info(f" >> Descending to {cand['hostname']} ({cand_ip if cand_ip else 'NO IP'})")
                         process_switch(switch_ip, cand, determine_switch_type(cand["hostname"]), is_retry)
@@ -780,13 +775,13 @@ def scan_aggregate_switch(shell, agg_ip, aggregates_to_process, seed_ips):
     candidates = discover_cameras_from_switch(shell, hostname, "AGGREGATE")
     
     for cand in candidates:
+        logger.debug(f"Checking candidate: {cand.get('hostname')} ({cand.get('mgmt_ip')})")
         cand_ip = cand.get("mgmt_ip")
         if (not cand_ip) or (cand_ip and cand_ip not in visited_switches):
             process_switch(agg_ip, cand, determine_switch_type(cand["hostname"]), is_retry=False)
 
 def retry_failed_switches_from_seed():
     if not failed_switches: return
-    # --- FIX: Reconnect to seed before retrying to ensure clean state ---
     logger.info("PHASE 3: Ensuring clean connection to Seed before retries...")
     reconnect_to_aggregate("Clean Start for Retries")
     
@@ -796,7 +791,7 @@ def retry_failed_switches_from_seed():
         process_switch(SEED_SWITCH_IP, nbr, item["switch_type"], is_retry=True)
 
 def main():
-    logger.info("STARTING DISCOVERY V20 (FINAL)")
+    logger.info("STARTING DISCOVERY V21 (FINAL)")
     connect_to_seed()
     
     aggs = deque([SEED_SWITCH_IP])
