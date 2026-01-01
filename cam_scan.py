@@ -63,8 +63,7 @@ SSH_HOP_RETRY_BASE_DELAY = 1
 SSH_HOP_USE_EXPONENTIAL_BACKOFF = False
 SSH_HOP_VERIFY_ROUTE = False        
 
-# --- SSH TIMING CONFIGURATION (NEW) ---
-# How long to wait for the SSH password prompt or error message to appear
+# --- SSH TIMING CONFIGURATION ---
 SSH_CONNECT_TIMEOUT = 30  
 
 # --- MAC TABLE POLLING CONFIGURATION ---
@@ -296,6 +295,7 @@ def cleanup_and_return_to_parent(expected_parent, max_attempts=3):
         time.sleep(1)
         _drain(agg_shell)
         session_depth = max(0, session_depth - 1)
+        
         current = get_hostname(agg_shell)
         if current == expected_parent: return True
         if current == agg_hostname:
@@ -304,6 +304,7 @@ def cleanup_and_return_to_parent(expected_parent, max_attempts=3):
             
     return False
 
+# --- UPDATED: Loop through all credentials even if one fails ---
 def ssh_to_device(target_ip, expected_hostname=None, parent_hostname=None):
     global agg_shell, session_depth, device_creds, hostname_to_ip
     if not parent_hostname: parent_hostname = get_hostname(agg_shell)
@@ -343,9 +344,9 @@ def ssh_to_device(target_ip, expected_hostname=None, parent_hostname=None):
             try:
                 agg_shell.send(f"ssh -l {cred['username']} {target_ip}\n")
                 
-                # --- UPDATED TIMEOUT ---
                 end_time = time.time() + SSH_CONNECT_TIMEOUT 
                 pw_sent = False
+                success = False
                 
                 while time.time() < end_time:
                     if agg_shell.recv_ready():
@@ -365,13 +366,15 @@ def ssh_to_device(target_ip, expected_hostname=None, parent_hostname=None):
                                 session_depth += 1
                                 return True
                             else:
+                                # Sometimes prompt reappears if login fails/timeouts quickly
                                 break
                     time.sleep(0.1)
 
             except Exception as e:
                 logger.debug(f"SSH attempt {idx} error: {e}")
 
-            logger.debug("   SSH timed out. Sending Interrupts...")
+            # --- FAIL-SAFE: Abort hanging connection ---
+            logger.debug(f"   Cred {idx} failed/timeout. Sending Interrupts...")
             agg_shell.send("\x03") 
             time.sleep(1.0)
             agg_shell.send("\x1a")
@@ -379,13 +382,17 @@ def ssh_to_device(target_ip, expected_hostname=None, parent_hostname=None):
             agg_shell.send("\n")   
             _drain(agg_shell)
             
+            # Check prompt status
             check_host = get_hostname(agg_shell)
+            
             if check_host == parent_hostname:
-                logger.info("   Aborted SSH. Marking target as Unreachable (Indirect Mode).")
-                return False 
+                # Prompt recovered. Try next credential.
+                logger.warning(f"   Credential {idx} failed. Prompt recovered. Trying next...")
+                continue 
             else:
-                logger.warning(f"   Failed to recover prompt (On {check_host}, expected {parent_hostname})")
-                break 
+                # Prompt lost. This is fatal for this session.
+                logger.warning(f"   Failed to recover prompt (On {check_host}, expected {parent_hostname}). Aborting device.")
+                return False 
             
     return False
 
@@ -452,13 +459,13 @@ def parse_cdp_neighbors(output):
         nbr = {"hostname": None, "mgmt_ip": None, "local_intf": None}
         
         if m := re.search(r"Device ID:\s*(\S+)", block): nbr["hostname"] = m.group(1)
-        if m := re.search(r"Interface:\s*([^\s,]+)", block): nbr["local_intf"] = m.group(1).rstrip(',')
         
+        # Central Filter
         platform_match = re.search(r"Platform:\s*(.+?)(?:,|$)", block, re.I)
         platform = platform_match.group(1) if platform_match else ""
-        
         if not is_device_a_switch(nbr["hostname"], platform): continue
 
+        if m := re.search(r"Interface:\s*([^\s,]+)", block): nbr["local_intf"] = m.group(1).rstrip(',')
         if m := re.search(r"(?:Entry|Management|IP)\s+address(?:\(es\))?:.*?\s+(\d+\.\d+\.\d+\.\d+)", block, re.S | re.I): 
             nbr["mgmt_ip"] = m.group(1)
         elif m := re.findall(r"\d+\.\d+\.\d+\.\d+", block):
@@ -485,6 +492,7 @@ def parse_lldp_neighbors(output):
         if m := re.search(r'^System Description:\s*\n([\s\S]+?)(?=^Time|^System)', block, re.M):
             sys_desc = m.group(1).strip()
             
+        # Central Filter
         if not is_device_a_switch(nbr["hostname"], sys_desc): continue
         
         if m := re.search(r'IP:\s*(\d+\.\d+\.\d+\.\d+)', block): nbr["mgmt_ip"] = m.group(1)
@@ -704,7 +712,6 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
             if downstream_candidates:
                 logger.info(f"Daisy-Chain: Found {len(downstream_candidates)} downstream neighbors.")
                 for cand in downstream_candidates:
-                    logger.debug(f"Checking candidate: {cand.get('hostname')} ({cand.get('mgmt_ip')})")
                     cand_ip = cand.get("mgmt_ip")
                     if (not cand_ip) or (cand_ip and cand_ip not in visited_switches):
                         logger.info(f" >> Descending to {cand['hostname']} ({cand_ip if cand_ip else 'NO IP'})")
@@ -775,7 +782,6 @@ def scan_aggregate_switch(shell, agg_ip, aggregates_to_process, seed_ips):
     candidates = discover_cameras_from_switch(shell, hostname, "AGGREGATE")
     
     for cand in candidates:
-        logger.debug(f"Checking candidate: {cand.get('hostname')} ({cand.get('mgmt_ip')})")
         cand_ip = cand.get("mgmt_ip")
         if (not cand_ip) or (cand_ip and cand_ip not in visited_switches):
             process_switch(agg_ip, cand, determine_switch_type(cand["hostname"]), is_retry=False)
@@ -791,7 +797,7 @@ def retry_failed_switches_from_seed():
         process_switch(SEED_SWITCH_IP, nbr, item["switch_type"], is_retry=True)
 
 def main():
-    logger.info("STARTING DISCOVERY V21 (FINAL)")
+    logger.info("STARTING DISCOVERY V22 (FINAL)")
     connect_to_seed()
     
     aggs = deque([SEED_SWITCH_IP])
