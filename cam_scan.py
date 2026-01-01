@@ -123,32 +123,27 @@ device_creds = {}
 hostname_to_ip = {}
 
 # ============================================================================
-# FILTERING LOGIC (UPDATED: Allow SRV/SERVER)
+# FILTERING LOGIC
 # ============================================================================
 
 def is_device_a_switch(hostname, platform_desc):
-    """
-    Returns True if the device looks like a Cisco switch.
-    Returns False if it looks like a Camera, Phone, or End-Host.
-    """
     h_lower = hostname.lower() if hostname else ""
     p_lower = platform_desc.lower() if platform_desc else ""
     
-    # 1. EXPANDED BLACKLIST (Specific Endpoint Types)
-    # Removed "srv" and "server" to allow switches named "access-srv-01" etc.
+    # 1. EXPANDED BLACKLIST
     blacklist = [
         "axis", "camera", "cam-", "cloudcam", "mic", "audio", "video", 
         "phone", "polycom", "mitel", "yealink", "snom", "audiocodes",
         "printer", "workstation", "laptop", "linux", "ubuntu", 
         "windows", "vmware", "apc", "ups", "pdu",
-        "air-", "airon" # Access Points
+        "air-", "airon" 
     ]
     
     for term in blacklist:
         if term in h_lower: return False
         if term in p_lower: return False
 
-    # 2. RELAXED WHITELIST (Must match one of these to be scanned)
+    # 2. RELAXED WHITELIST
     whitelist = [
         "cisco", "catalyst", "nexus", "ios", "ws-", "c9", "ie-", "n5k", "n7k", "sf", "sg", "me-"
     ]
@@ -156,7 +151,6 @@ def is_device_a_switch(hostname, platform_desc):
     for term in whitelist:
         if term in p_lower: return True
         
-    # Fallback: If description has "switch" or "bridge", allow it
     if "switch" in p_lower or "bridge" in p_lower: return True
     
     return False
@@ -283,17 +277,32 @@ def reconnect_to_aggregate(reason=""):
     return _connect_to_aggregate_internal()
 
 def cleanup_and_return_to_parent(expected_parent, max_attempts=3):
-    global agg_shell, session_depth
+    global agg_shell, session_depth, agg_hostname
+    
     current = get_hostname(agg_shell)
+    
     if current == expected_parent:
         return True
+        
+    # Safety Valve: If we drifted back to the SEED, stop exiting!
+    if current == agg_hostname:
+        logger.warning(f"Drifted back to SEED ({agg_hostname}). Cannot return to child {expected_parent}.")
+        session_depth = 0
+        return False
 
     for _ in range(max_attempts):
         agg_shell.send("exit\n")
         time.sleep(1)
         _drain(agg_shell)
         session_depth = max(0, session_depth - 1)
-        if get_hostname(agg_shell) == expected_parent: return True
+        
+        current = get_hostname(agg_shell)
+        if current == expected_parent:
+            return True
+        if current == agg_hostname:
+            session_depth = 0
+            return False
+            
     return False
 
 def ssh_to_device(target_ip, expected_hostname=None, parent_hostname=None):
@@ -447,7 +456,7 @@ def parse_cdp_neighbors(output):
         platform_match = re.search(r"Platform:\s*(.+?)(?:,|$)", block, re.I)
         platform = platform_match.group(1) if platform_match else ""
         
-        # --- CENTRAL FILTER CALL ---
+        # Central Filter
         if not is_device_a_switch(nbr["hostname"], platform):
             continue
 
@@ -477,7 +486,7 @@ def parse_lldp_neighbors(output):
         if m := re.search(r'^System Description:\s*\n([\s\S]+?)(?=^Time|^System)', block, re.M):
             sys_desc = m.group(1).strip()
             
-        # --- CENTRAL FILTER CALL ---
+        # Central Filter
         if not is_device_a_switch(nbr["hostname"], sys_desc):
             continue
         
@@ -654,8 +663,8 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
     switch_name = neighbor_info.get("remote_name") or neighbor_info.get("hostname")
     local_intf = neighbor_info.get("local_intf") or neighbor_info.get("local_port")
 
-    if not switch_ip: return True
-    if switch_ip in visited_switches and not is_retry: return True
+    # FIX: Don't check visited for None IPs
+    if switch_ip and switch_ip in visited_switches and not is_retry: return True
     
     logger.info("*"*80)
     logger.info(f"Processing: {switch_name} ({switch_ip if switch_ip else 'NO IP'})")
@@ -669,13 +678,15 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
         if not verify_aggregate_connection(): raise NetworkConnectionError("Lost parent")
 
         ssh_success = False
+        
+        # --- FIX: Direct Path to Indirect if IP is missing ---
         if switch_ip:
             ssh_success = ssh_to_device(switch_ip, switch_name, parent_hostname)
+        else:
+            logger.info("No IP address. Skipping SSH and trying Indirect Discovery directly.")
         
         if not ssh_success:
-            if not switch_ip:
-                logger.warning(f"Neighbor {switch_name} has NO IP. Forcing Indirect Discovery.")
-            else:
+            if switch_ip:
                 logger.error(f"SSH Failed to {switch_name}. Attempting Indirect.")
             
             found = 0
@@ -699,6 +710,7 @@ def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=Fal
                 logger.info(f"Daisy-Chain: Found {len(downstream_candidates)} downstream neighbors.")
                 for cand in downstream_candidates:
                     cand_ip = cand.get("mgmt_ip")
+                    # FIX: Pass if IP is None OR if IP is new
                     if (not cand_ip) or (cand_ip and cand_ip not in visited_switches):
                         logger.info(f" >> Descending to {cand['hostname']} ({cand_ip if cand_ip else 'NO IP'})")
                         process_switch(switch_ip, cand, determine_switch_type(cand["hostname"]), is_retry)
@@ -774,13 +786,17 @@ def scan_aggregate_switch(shell, agg_ip, aggregates_to_process, seed_ips):
 
 def retry_failed_switches_from_seed():
     if not failed_switches: return
+    # --- FIX: Reconnect to seed before retrying to ensure clean state ---
+    logger.info("PHASE 3: Ensuring clean connection to Seed before retries...")
+    reconnect_to_aggregate("Clean Start for Retries")
+    
     logger.info(f"PHASE 3: RETRYING {len(failed_switches)} SWITCHES")
     for item in failed_switches:
         nbr = {"mgmt_ip": item["switch_ip"], "remote_name": item["switch_name"], "local_intf": item["local_intf"]}
         process_switch(SEED_SWITCH_IP, nbr, item["switch_type"], is_retry=True)
 
 def main():
-    logger.info("STARTING DISCOVERY V18 (FINAL)")
+    logger.info("STARTING DISCOVERY V20 (FINAL)")
     connect_to_seed()
     
     aggs = deque([SEED_SWITCH_IP])
