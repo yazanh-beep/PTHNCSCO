@@ -123,6 +123,45 @@ device_creds = {}
 hostname_to_ip = {}
 
 # ============================================================================
+# FILTERING LOGIC (UPDATED: Allow SRV/SERVER)
+# ============================================================================
+
+def is_device_a_switch(hostname, platform_desc):
+    """
+    Returns True if the device looks like a Cisco switch.
+    Returns False if it looks like a Camera, Phone, or End-Host.
+    """
+    h_lower = hostname.lower() if hostname else ""
+    p_lower = platform_desc.lower() if platform_desc else ""
+    
+    # 1. EXPANDED BLACKLIST (Specific Endpoint Types)
+    # Removed "srv" and "server" to allow switches named "access-srv-01" etc.
+    blacklist = [
+        "axis", "camera", "cam-", "cloudcam", "mic", "audio", "video", 
+        "phone", "polycom", "mitel", "yealink", "snom", "audiocodes",
+        "printer", "workstation", "laptop", "linux", "ubuntu", 
+        "windows", "vmware", "apc", "ups", "pdu",
+        "air-", "airon" # Access Points
+    ]
+    
+    for term in blacklist:
+        if term in h_lower: return False
+        if term in p_lower: return False
+
+    # 2. RELAXED WHITELIST (Must match one of these to be scanned)
+    whitelist = [
+        "cisco", "catalyst", "nexus", "ios", "ws-", "c9", "ie-", "n5k", "n7k", "sf", "sg", "me-"
+    ]
+    
+    for term in whitelist:
+        if term in p_lower: return True
+        
+    # Fallback: If description has "switch" or "bridge", allow it
+    if "switch" in p_lower or "bridge" in p_lower: return True
+    
+    return False
+
+# ============================================================================
 # HELPER CLASSES AND FUNCTIONS
 # ============================================================================
 
@@ -257,7 +296,6 @@ def cleanup_and_return_to_parent(expected_parent, max_attempts=3):
         if get_hostname(agg_shell) == expected_parent: return True
     return False
 
-# --- UPDATED SSH_HOP LOGIC (20s Timeout) ---
 def ssh_to_device(target_ip, expected_hostname=None, parent_hostname=None):
     global agg_shell, session_depth, device_creds, hostname_to_ip
     if not parent_hostname: parent_hostname = get_hostname(agg_shell)
@@ -296,8 +334,6 @@ def ssh_to_device(target_ip, expected_hostname=None, parent_hostname=None):
         for idx, cred in enumerate(CREDENTIAL_SETS, 1):
             try:
                 agg_shell.send(f"ssh -l {cred['username']} {target_ip}\n")
-                
-                # --- CHANGE: Increased to 20 seconds ---
                 end_time = time.time() + 20 
                 pw_sent = False
                 
@@ -339,7 +375,7 @@ def ssh_to_device(target_ip, expected_hostname=None, parent_hostname=None):
                 return False 
             else:
                 logger.warning(f"   Failed to recover prompt (On {check_host}, expected {parent_hostname})")
-                break 
+                return False 
             
     return False
 
@@ -406,14 +442,15 @@ def parse_cdp_neighbors(output):
         nbr = {"hostname": None, "mgmt_ip": None, "local_intf": None}
         
         if m := re.search(r"Device ID:\s*(\S+)", block): nbr["hostname"] = m.group(1)
+        if m := re.search(r"Interface:\s*([^\s,]+)", block): nbr["local_intf"] = m.group(1).rstrip(',')
         
-        # Filter Non-Cisco
-        if nbr["hostname"] and (nbr["hostname"].lower().startswith("axis") or "phone" in nbr["hostname"].lower()): continue
         platform_match = re.search(r"Platform:\s*(.+?)(?:,|$)", block, re.I)
         platform = platform_match.group(1) if platform_match else ""
-        if "Phone" in platform or "Camera" in platform or "AIR-" in platform: continue
+        
+        # --- CENTRAL FILTER CALL ---
+        if not is_device_a_switch(nbr["hostname"], platform):
+            continue
 
-        if m := re.search(r"Interface:\s*([^\s,]+)", block): nbr["local_intf"] = m.group(1).rstrip(',')
         if m := re.search(r"(?:Entry|Management|IP)\s+address(?:\(es\))?:.*?\s+(\d+\.\d+\.\d+\.\d+)", block, re.S | re.I): 
             nbr["mgmt_ip"] = m.group(1)
         elif m := re.findall(r"\d+\.\d+\.\d+\.\d+", block):
@@ -433,14 +470,16 @@ def parse_lldp_neighbors(output):
         
         if m := re.search(r'^System Name:\s*(.+?)$', block, re.M): 
             nbr["hostname"] = m.group(1).strip().strip('"')
-        if nbr["hostname"] and (nbr["hostname"].lower().startswith("axis") or "phone" in nbr["hostname"].lower()): continue
         
         if m := re.search(r'^Local Intf:\s*(\S+)', block, re.M): nbr["local_intf"] = m.group(1)
         
         sys_desc = ""
         if m := re.search(r'^System Description:\s*\n([\s\S]+?)(?=^Time|^System)', block, re.M):
-            sys_desc = m.group(1).strip().lower()
-        if "axis" in sys_desc or "phone" in sys_desc or "camera" in sys_desc: continue
+            sys_desc = m.group(1).strip()
+            
+        # --- CENTRAL FILTER CALL ---
+        if not is_device_a_switch(nbr["hostname"], sys_desc):
+            continue
         
         if m := re.search(r'IP:\s*(\d+\.\d+\.\d+\.\d+)', block): nbr["mgmt_ip"] = m.group(1)
         if not nbr["mgmt_ip"] and (m := re.search(r'Address:\s*(\d+\.\d+\.\d+\.\d+)', block)): nbr["mgmt_ip"] = m.group(1)
@@ -741,7 +780,7 @@ def retry_failed_switches_from_seed():
         process_switch(SEED_SWITCH_IP, nbr, item["switch_type"], is_retry=True)
 
 def main():
-    logger.info("STARTING DISCOVERY V16 (FINAL)")
+    logger.info("STARTING DISCOVERY V18 (FINAL)")
     connect_to_seed()
     
     aggs = deque([SEED_SWITCH_IP])
