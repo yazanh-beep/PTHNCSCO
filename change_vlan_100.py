@@ -6,7 +6,7 @@ import logging
 import re
 import getpass
 import pandas as pd
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Dict
 
 # ========================= USER CONFIG =========================
 AGG_IP = input("Aggregation Switch IP: ") if not "" else ""
@@ -20,7 +20,7 @@ VLAN_ID = 100
 # Retry configuration
 AGG_MAX_RETRIES = 3
 AGG_RETRY_DELAY = 5
-TARGET_MAX_RETRIES = 2
+TARGET_MAX_RETRIES = 3
 TARGET_RETRY_DELAY = 5
 TARGET_SSH_TIMEOUT = 30
 # ===============================================================
@@ -28,9 +28,11 @@ TARGET_SSH_TIMEOUT = 30
 # ========================= LOGGING SETUP =======================
 class LiveFormatter(logging.Formatter):
     COLORS = {
-        'DEBUG': '\033[36m', 'INFO': '\033[32m',
-        'WARNING': '\033[33m', 'ERROR': '\033[31m',
-        'CRITICAL': '\033[35m',
+        'DEBUG': '\033[36m',    # Cyan
+        'INFO': '\033[32m',     # Green
+        'WARNING': '\033[33m',  # Yellow
+        'ERROR': '\033[31m',    # Red
+        'CRITICAL': '\033[35m', # Magenta
     }
     RESET = '\033[0m'
 
@@ -51,7 +53,7 @@ file_handler.setLevel(logging.DEBUG)
 file_handler.setFormatter(file_formatter)
 
 console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
+console_handler.setLevel(logging.DEBUG)
 console_handler.setFormatter(console_formatter)
 
 logger = logging.getLogger(__name__)
@@ -87,42 +89,28 @@ def send_cmd(shell, cmd, patterns=("#", ">"), timeout=TIMEOUT, log_cmd=True):
 IFACE_RE = re.compile(r'^(Po\d+|Gi\d+(?:/\d+){1,2}|Te\d+(?:/\d+){1,2}|Fo\d+(?:/\d+){1,2})\b')
 
 def get_hostname(shell) -> str:
-    """
-    Robust hostname detection that ignores command echo.
-    """
     try:
-        # We look for the configuration line "hostname <name>"
-        # We explicitly exclude lines that look like the command itself
         out = send_cmd(shell, "show run | include ^hostname", patterns=("#", ">"), timeout=8, log_cmd=False)
-        
         for line in out.splitlines():
             line = line.strip()
-            # Ignore the command echo (which contains 'show' or '|')
-            if "show" in line or "|" in line:
-                continue
-            
-            # Look for strict "hostname <name>" pattern
+            if "show" in line or "|" in line: continue
             if line.startswith("hostname ") and len(line.split()) >= 2:
                 name = line.split()[1]
-                return name.strip('"') # Strip quotes if present
+                return name.strip('"')
     except Exception as e:
         logger.debug(f"Hostname detection error: {e}")
         pass
     
-    # Fallback: Try to guess from the prompt (e.g., "Switch#")
     try:
         shell.send("\n")
         time.sleep(1)
         if shell.recv_ready():
             out = shell.recv(MAX_READ).decode("utf-8", "ignore")
             last_line = out.strip().splitlines()[-1]
-            if "#" in last_line:
-                return last_line.split("#")[0].strip()
-            if ">" in last_line:
-                return last_line.split(">")[0].strip()
+            if "#" in last_line: return last_line.split("#")[0].strip()
+            if ">" in last_line: return last_line.split(">")[0].strip()
     except:
         pass
-
     return "UNKNOWN_HOST"
 
 # ========================= CORE CONNECT ========================
@@ -136,7 +124,6 @@ def connect_to_agg(retry=0):
         shell = client.invoke_shell()
         expect_prompt(shell, ("#", ">"), timeout=15)
         
-        # Enable Mode
         out = send_cmd(shell, "enable", patterns=("assword:", "#"), timeout=8, log_cmd=False)
         if "assword:" in out:
             out = send_cmd(shell, PASSWORD, patterns=("#",), timeout=8, log_cmd=False)
@@ -157,13 +144,11 @@ def connect_to_agg(retry=0):
 def apply_config(shell, target_ip, new_ip, new_mask, is_seed_switch=False):
     logger.info(f"[CONFIG] {target_ip}: Applying VLAN {VLAN_ID} IP {new_ip} {new_mask}")
     
-    # 1. Backup
     out = send_cmd(shell, "show running-config", patterns=("#",), timeout=30)
     fname = f"backup_{target_ip}_{int(time.time())}.cfg"
     with open(fname, "w", encoding="utf-8", errors="ignore") as f:
         f.write(out)
     
-    # 2. SVI Config
     try:
         send_cmd(shell, "configure terminal", patterns=("(config)#",), timeout=10)
         send_cmd(shell, f"vlan {VLAN_ID}", patterns=("(config-vlan)#", "(config)#"), timeout=5)
@@ -180,7 +165,6 @@ def apply_config(shell, target_ip, new_ip, new_mask, is_seed_switch=False):
             send_cmd(shell, "no shutdown", patterns=("(config-if)#",), timeout=5)
             send_cmd(shell, "exit", patterns=("(config)#",), timeout=5)
     
-        # 3. Trunks
         send_cmd(shell, "end", patterns=("#",), timeout=5)
         out = send_cmd(shell, "show interfaces trunk", patterns=("#",), timeout=10)
         trunks = []
@@ -210,20 +194,15 @@ def apply_config(shell, target_ip, new_ip, new_mask, is_seed_switch=False):
 def process_hop(shell, agg_hostname, target_ip, new_ip, new_mask):
     logger.info(f"\n--- Hop Attempt: {target_ip} ---")
     
-    # Explicitly clear buffer
     if shell.recv_ready():
         shell.recv(MAX_READ)
 
     cmd = f"ssh -l {USERNAME} {target_ip}"
     shell.send(cmd + "\n")
-    
-    # Wait longer for initial connection info to appear
     time.sleep(1.0)
     
     out = expect_prompt(shell, patterns=("Destination", "(yes/no)?", "yes/no", "assword:", "#", ">", "refused", "timed out", "unreachable", "Unknown host"), timeout=TARGET_SSH_TIMEOUT)
-    
-    # Log what happened during the hop attempt for debugging
-    logger.debug(f"[HOP LOG] Output from {target_ip} SSH attempt:\n{out}")
+    logger.debug(f"[HOP LOG] {target_ip}:\n{out}")
 
     if any(x in out for x in ["refused", "timed out", "unreachable", "Unknown host"]):
         logger.warning(f"[FAIL] SSH refused or timed out to {target_ip}")
@@ -236,19 +215,15 @@ def process_hop(shell, agg_hostname, target_ip, new_ip, new_mask):
         out = send_cmd(shell, PASSWORD, patterns=("#", ">", "assword:"), timeout=15)
         if "assword:" in out: return 'failed_connection'
 
-    # Handle enable mode on target
     if ">" in out and "#" not in out:
         out = send_cmd(shell, "enable", patterns=("assword:", "#"), timeout=8)
         if "assword:" in out: send_cmd(shell, PASSWORD, patterns=("#",), timeout=8)
 
-    # SAFETY CHECK
     send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5, log_cmd=False)
     current_hostname = get_hostname(shell)
     
     if current_hostname == agg_hostname:
         logger.critical(f"[SAFETY] Hop failed! Still on Seed Switch ({agg_hostname}). Aborting.")
-        # Try to diagnose WHY we are still here.
-        # It's possible the SSH command failed silently or we missed the error message.
         return 'failed_connection'
     
     logger.info(f"[CONNECTED] On target: {current_hostname}")
@@ -261,6 +236,55 @@ def process_hop(shell, agg_hostname, target_ip, new_ip, new_mask):
         try: send_cmd(shell, "exit", patterns=("#", ">"), timeout=5)
         except: pass
         return 'failed_config'
+
+def process_batch(client, shell, agg_hostname, items: List[Dict]) -> Tuple[List[str], List[Dict]]:
+    success_list = []
+    failed_items = []
+
+    for item in items:
+        target = item['target']
+        is_seed = (target == AGG_IP)
+        status = 'failed'
+        
+        if is_seed:
+            logger.info(f"\n--- Processing SEED SWITCH: {target} ---")
+            curr = get_hostname(shell)
+            if curr != agg_hostname:
+                logger.critical("Hostname mismatch on Seed update. Aborting.")
+            else:
+                if apply_config(shell, target, item['vip'], item['mask'], is_seed_switch=True):
+                    status = 'success'
+        else:
+            for attempt in range(TARGET_MAX_RETRIES):
+                if attempt > 0:
+                    logger.info(f"Retry {attempt+1}/{TARGET_MAX_RETRIES} for {target}...")
+                
+                if getattr(shell, "closed", False) or not shell.get_transport().is_active():
+                    try: 
+                        client, shell, agg_hostname = connect_to_agg()
+                    except: 
+                        sys.exit("Fatal: Aggregation switch died.")
+
+                res = process_hop(shell, agg_hostname, target, item['vip'], item['mask'])
+                
+                if res == 'success':
+                    status = 'success'
+                    break
+                elif res == 'failed_connection':
+                    time.sleep(TARGET_RETRY_DELAY)
+                elif res == 'failed_config':
+                    time.sleep(TARGET_RETRY_DELAY)
+        
+        if status == 'success':
+            success_list.append(target)
+            if is_seed:
+                logger.info("Seed switch updated. Terminating.")
+                sys.exit(0)
+        else:
+            logger.error(f"Failed to configure {target} after retries.")
+            failed_items.append(item)
+            
+    return success_list, failed_items
 
 # ========================= MAIN ================================
 def main():
@@ -277,7 +301,6 @@ def main():
         else:
             logger.info("Detected Excel file.")
             df = pd.read_excel(file_path, header=None)
-            
         df = df.dropna(how='all')
     except Exception as e:
         logger.error(f"Error reading file: {e}")
@@ -292,21 +315,15 @@ def main():
             target = str(row[0]).strip()
             vip = str(row[1]).strip()
             mask = str(row[2]).strip()
-            
-            if "ip" in target.lower() or "address" in target.lower():
-                continue
-
+            if "ip" in target.lower() or "address" in target.lower(): continue
             item = {'target': target, 'vip': vip, 'mask': mask}
             
-            if target == AGG_IP:
-                plan_seed.append(item)
-            else:
-                plan_normal.append(item)
-        except Exception:
-            continue
+            if target == AGG_IP: plan_seed.append(item)
+            else: plan_normal.append(item)
+        except Exception: continue
 
     full_plan = plan_normal + plan_seed
-    logger.info(f"Loaded {len(full_plan)} devices ({len(plan_seed)} Seed Switch).")
+    logger.info(f"Loaded {len(full_plan)} devices.")
 
     # Connect
     try:
@@ -314,49 +331,40 @@ def main():
     except Exception:
         sys.exit(1)
 
-    results = {'success': [], 'failed': []}
+    # --- PHASE 1: Main Run ---
+    logger.info("=== STARTING PHASE 1 ===")
+    success_1, failed_1 = process_batch(client, shell, agg_hostname, full_plan)
 
-    # Execute
-    for item in full_plan:
-        target = item['target']
-        is_seed = (target == AGG_IP)
-        status = 'failed'
+    # --- PHASE 2: Retry Failed ---
+    final_success = success_1
+    final_failed_items = failed_1 # Default if no retry happens
+
+    if failed_1:
+        logger.info("\n" + "="*40)
+        logger.info(f"PHASE 1 COMPLETE. {len(failed_1)} FAILED.")
+        logger.info("WAITING 10 SECONDS BEFORE RETRYING FAILURES...")
+        logger.info("="*40 + "\n")
+        time.sleep(10)
         
-        if is_seed:
-            logger.info(f"\n--- Processing SEED SWITCH: {target} ---")
-            curr = get_hostname(shell)
-            if curr != agg_hostname:
-                logger.critical("Hostname mismatch on Seed update. Aborting.")
-            else:
-                if apply_config(shell, target, item['vip'], item['mask'], is_seed_switch=True):
-                    status = 'success'
-        else:
-            for attempt in range(TARGET_MAX_RETRIES):
-                if getattr(shell, "closed", False):
-                    try: client, shell, agg_hostname = connect_to_agg()
-                    except: sys.exit("Fatal: Aggregation switch died.")
+        try:
+            client.close()
+            client, shell, agg_hostname = connect_to_agg()
+        except:
+            pass
 
-                res = process_hop(shell, agg_hostname, target, item['vip'], item['mask'])
-                
-                if res == 'success':
-                    status = 'success'
-                    break
-                elif res == 'failed_connection':
-                    time.sleep(TARGET_RETRY_DELAY)
+        success_2, failed_2 = process_batch(client, shell, agg_hostname, failed_1)
         
-        if status == 'success':
-            results['success'].append(target)
-        else:
-            results['failed'].append(target)
-            logger.error(f"Failed to configure {target}")
+        final_success.extend(success_2)
+        final_failed_items = failed_2 # Update final list with remaining failures
 
-        if is_seed and status == 'success':
-            logger.info("Seed switch updated. Terminating.")
-            break
+    logger.info("\n=== FINAL SUMMARY ===")
+    logger.info(f"Successful: {len(final_success)}")
+    logger.info(f"Failed:     {len(final_failed_items)}")
 
-    logger.info("\n=== SUMMARY ===")
-    logger.info(f"Successful: {len(results['success'])}")
-    logger.info(f"Failed:     {len(results['failed'])}")
+    if final_failed_items:
+        logger.info("\n=== LIST OF FAILED DEVICES ===")
+        for f in final_failed_items:
+            logger.error(f" - {f['target']}")
 
 if __name__ == "__main__":
     main()
