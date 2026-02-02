@@ -1,3 +1,20 @@
+""
+
+
+
+The Structure
+The script expects the following layout without any headers:
+
+Column A: The management IP of the device you want to configure (Target IP).
+
+Column B: The new IP address you want to assign to VLAN 100.
+
+Column C: The Subnet Mask for that new IP.
+
+
+
+""
+
 #!/usr/bin/env python3
 import paramiko
 import time
