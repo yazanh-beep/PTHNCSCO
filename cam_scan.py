@@ -51,7 +51,6 @@ TIMEOUT = 150
 MAX_READ = 65535
 CREDENTIAL_SETS = [
     {"username": "admin",  "password": "C1sco",  "enable": ""},
-    {"username": "admin",  "password": "cisco",  "enable": ""},
     {"username": "cisco",  "password": "cisco",  "enable": ""},
     {"username": "admin",  "password": "S1mplex",  "enable": ""}
 ]
