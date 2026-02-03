@@ -3,697 +3,212 @@ import paramiko
 import time
 import sys
 import logging
-from typing import Tuple, List, Optional
+import re
+import getpass
+from typing import Tuple, List
 
-# USER CONFIG
+# ========================= USER CONFIG =========================
 AGG_IP = ""
 USERNAME = ""
 PASSWORD = ""
+
 TIMEOUT = 10
 MAX_READ = 65535
 
-# Retry configuration for aggregation switch connection
+# Retry configuration
 AGG_MAX_RETRIES = 3
 AGG_RETRY_DELAY = 5
-
-# Retry configuration for target device connections
-TARGET_MAX_RETRIES = 1  # Don't retry if device is unreachable - just skip
+TARGET_MAX_RETRIES = 3
 TARGET_RETRY_DELAY = 5
-TARGET_SSH_TIMEOUT = 60  # How long Python waits for SSH response (max useful value ~60s)
-TARGET_TCP_TIMEOUT = 30  # Cisco device TCP connection timeout in seconds (practical max 300s)
+TARGET_SSH_TIMEOUT = 30 
+# ===============================================================
 
-# Setup logging with live output
+# ========================= LOGGING SETUP =======================
 class LiveFormatter(logging.Formatter):
-    """Custom formatter for colored, live output"""
     COLORS = {
         'DEBUG': '\033[36m',    # Cyan
         'INFO': '\033[32m',     # Green
         'WARNING': '\033[33m',  # Yellow
         'ERROR': '\033[31m',    # Red
-        'CRITICAL': '\033[35m', # Magenta
+        'CRITICAL': '\033[41m', # Red Background
     }
     RESET = '\033[0m'
-    
+
     def format(self, record):
-        if sys.stdout.isatty():
-            log_color = self.COLORS.get(record.levelname, self.RESET)
-            record.levelname = f"{log_color}{record.levelname}{self.RESET}"
+        try:
+            if sys.stdout.isatty():
+                color = self.COLORS.get(record.levelname, self.RESET)
+                record.levelname = f"{color}{record.levelname}{self.RESET}"
+        except Exception: pass
         return super().format(record)
 
-# Create formatters
-file_formatter = logging.Formatter(
-    '%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-console_formatter = LiveFormatter(
-    '%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%H:%M:%S'
-)
-
-# File handler with buffering disabled for live writing
-file_handler = logging.FileHandler('network_config.log', mode='a')
-file_handler.setLevel(logging.DEBUG)
-file_handler.setFormatter(file_formatter)
-file_handler.stream.reconfigure(line_buffering=True)  # Force flush on newline
-
-# Console handler
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
-console_handler.setFormatter(console_formatter)
-
-# Setup logger
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
-logger.addHandler(file_handler)
-logger.addHandler(console_handler)
 
-# Disable buffering on stdout for immediate output
-sys.stdout.reconfigure(line_buffering=True)
+# Console Handler
+ch = logging.StreamHandler(sys.stdout)
+ch.setLevel(logging.DEBUG) 
+ch.setFormatter(LiveFormatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S'))
+logger.addHandler(ch)
 
-class NetworkConnectionError(Exception):
-    """Custom exception for network connection issues"""
-    def __init__(self, message, retry_allowed=False, reconnect_needed=False):
-        super().__init__(message)
-        self.retry_allowed = retry_allowed
-        self.reconnect_needed = reconnect_needed
+# File Handler
+fh = logging.FileHandler('push_config.log', mode='a')
+fh.setLevel(logging.DEBUG)
+fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s'))
+logger.addHandler(fh)
 
-class ConfigurationError(Exception):
-    """Custom exception for configuration issues"""
-    pass
-
-def expect_prompt(shell, patterns=("#", ">"), timeout=TIMEOUT, show_progress=False):
-    """Wait for expected prompt patterns with timeout"""
+# ========================= HELPERS =============================
+def expect_prompt(shell, patterns=("#", ">"), timeout=TIMEOUT, log_output=True):
     buf, end = "", time.time() + timeout
-    last_log_time = time.time()
-    start_time = time.time()
-    last_progress_time = time.time()
-    
     while time.time() < end:
         if shell.recv_ready():
             data = shell.recv(MAX_READ).decode("utf-8", "ignore")
             buf += data
-            
-            # Live log data chunks every 2 seconds or when pattern found
-            if time.time() - last_log_time > 2 or any(p in buf for p in patterns):
-                if data.strip():
-                    logger.debug(f"[RECV] {data.strip()[-100:]}")
-                last_log_time = time.time()
-            
+            if log_output and data.strip():
+                logger.debug(f"[RECV] {data.strip()[-100:]}") 
             for p in patterns:
-                if p in buf:
-                    return buf
-        else:
-            # Show progress counter every 5 seconds if enabled
-            if show_progress and time.time() - last_progress_time >= 5:
-                elapsed = int(time.time() - start_time)
-                remaining = int(end - time.time())
-                logger.info(f"[WAIT] Elapsed: {elapsed}s, Remaining: {remaining}s...")
-                sys.stdout.flush()
-                last_progress_time = time.time()
-            
-            time.sleep(0.1)
-    
-    logger.warning(f"Timeout waiting for prompt. Buffer: {buf[-200:]}")
+                if p in buf: return buf
+        time.sleep(0.05)
     return buf
 
-def send_cmd(shell, cmd, patterns=("#", ">"), timeout=TIMEOUT, log_cmd=True, show_progress=False):
-    """Send command and wait for prompt"""
-    if log_cmd:
-        logger.debug(f"Sending command: {cmd}")
+def send_cmd(shell, cmd, patterns=("#", ">"), timeout=TIMEOUT):
+    logger.debug(f"[SEND] {cmd}")
     shell.send(cmd + "\n")
-    return expect_prompt(shell, patterns, timeout, show_progress=show_progress)
+    return expect_prompt(shell, patterns, timeout)
 
-def connect_to_agg(retry_count=0):
-    """Connect to aggregation switch with retry logic"""
+def get_hostname(shell) -> str:
     try:
-        logger.info(f"[CONNECT] Attempt {retry_count + 1}/{AGG_MAX_RETRIES} - SSH to aggregation switch: {AGG_IP}")
-        sys.stdout.flush()
-        
+        shell.send("\n")
+        time.sleep(0.5)
+        if shell.recv_ready():
+            out = shell.recv(MAX_READ).decode("utf-8", "ignore")
+            last_line = out.strip().splitlines()[-1]
+            return re.sub(r'[#>]$', '', last_line).strip()
+    except Exception:
+        pass
+    return "UNKNOWN_HOST"
+
+# ========================= CONNECTION LOGIC ====================
+def connect_to_agg(retry=0):
+    global AGG_IP, USERNAME, PASSWORD
+    if not AGG_IP: AGG_IP = input("Aggregation Switch IP: ").strip()
+    if not USERNAME: USERNAME = input("Username: ").strip()
+    if not PASSWORD: PASSWORD = getpass.getpass("Password: ").strip()
+
+    try:
+        logger.info(f"[CONNECT] Attempt {retry+1}/{AGG_MAX_RETRIES} to Aggregation: {AGG_IP}")
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
-            AGG_IP, 
-            username=USERNAME, 
-            password=PASSWORD,
-            look_for_keys=False, 
-            allow_agent=False, 
-            timeout=10
-        )
+        client.connect(AGG_IP, username=USERNAME, password=PASSWORD,
+                       look_for_keys=False, allow_agent=False, timeout=10)
         shell = client.invoke_shell()
+        expect_prompt(shell, ("#", ">"), timeout=15)
         
-        # Wait for initial prompt
-        logger.info("[CONNECT] Waiting for initial prompt...")
-        out = expect_prompt(shell, ("#", ">"))
-        if not out:
-            raise NetworkConnectionError("No initial prompt received")
-        
-        # Enter enable mode
-        logger.info("[CONNECT] Entering enable mode...")
-        out = send_cmd(shell, "enable", patterns=("assword:", "#"))
+        out = send_cmd(shell, "enable", patterns=("assword:", "#", ">"), timeout=5)
         if "assword:" in out:
-            send_cmd(shell, PASSWORD, patterns=("#",))
+            send_cmd(shell, PASSWORD, patterns=("#",), timeout=5)
+            
+        send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
         
-        # Disable pagination
-        logger.info("[CONNECT] Configuring terminal...")
-        send_cmd(shell, "terminal length 0", patterns=("#",))
-        
-        
-        logger.info("[CONNECT] Successfully connected to aggregation switch")
-        return client, shell
-        
-    except (paramiko.SSHException, paramiko.AuthenticationException, TimeoutError) as e:
-        logger.error(f"[CONNECT] Connection failed: {e}")
-        if retry_count < AGG_MAX_RETRIES - 1:
-            logger.info(f"[RETRY] Waiting {AGG_RETRY_DELAY} seconds before retry...")
-            sys.stdout.flush()
+        agg_hostname = get_hostname(shell)
+        logger.info(f"[CONNECT] Connected to Aggregation Switch. Hostname: '{agg_hostname}'")
+        return client, shell, agg_hostname
+    except Exception as e:
+        logger.error(f"[CONNECT] Failed: {e}")
+        if retry < AGG_MAX_RETRIES - 1:
             time.sleep(AGG_RETRY_DELAY)
-            return connect_to_agg(retry_count + 1)
-        else:
-            raise NetworkConnectionError(f"Failed to connect after {AGG_MAX_RETRIES} attempts: {e}")
+            return connect_to_agg(retry+1)
+        raise
 
-def verify_connectivity(shell, target_ip):
-    """Verify device is reachable before attempting configuration"""
-    logger.info(f"[VERIFY] Testing connectivity to {target_ip}")
-    sys.stdout.flush()
+def process_hop(shell, agg_hostname, target_ip, config_commands):
+    """
+    Returns: 'success', 'failed_connection', 'failed_config'
+    """
+    logger.info(f"\n--- Hop Attempt: {target_ip} ---")
     
-    out = send_cmd(shell, f"ping {target_ip} repeat 2", patterns=("#",), timeout=15)
+    if shell.recv_ready(): shell.recv(MAX_READ)
+
+    # 1. SSH Hop
+    shell.send(f"ssh -l {USERNAME} {target_ip}\n")
     
-    if "!!" in out or "Success rate is" in out:
-        logger.info(f"[VERIFY] {target_ip} is reachable")
-        return True
-    else:
-        logger.warning(f"[VERIFY] {target_ip} is not reachable via ping")
-        return False
+    # Common Cisco SSH Failure Patterns
+    failure_patterns = [
+        "refused", 
+        "timed out", 
+        "unreachable", 
+        "Unknown host", 
+        "Connection closed", 
+        "not responding",   # <--- Added based on your log
+        "Open failed", 
+        "Connection reset"
+    ]
+    
+    # We add failure patterns to the expect list so it returns IMMEDIATELY if seen
+    all_patterns = ("(yes/no)?", "assword:", "#", ">") + tuple(failure_patterns)
 
-def backup_config(shell, target_ip):
-    """Backup running configuration before making changes"""
-    try:
-        logger.info(f"[BACKUP] Retrieving current config from {target_ip}")
-        sys.stdout.flush()
-        
-        out = send_cmd(shell, "show running-config", patterns=("#",), timeout=30, show_progress=True)
-        
-        # Save backup to file
-        backup_file = f"backup_{target_ip}_{int(time.time())}.cfg"
-        with open(backup_file, 'w') as f:
-            f.write(out)
-        logger.info(f"[BACKUP] Config saved to {backup_file}")
-        return backup_file
-    except Exception as e:
-        logger.error(f"[BACKUP] Failed to backup config: {e}")
-        return None
+    out = expect_prompt(shell, patterns=all_patterns, timeout=TARGET_SSH_TIMEOUT)
+    
+    # 2. Check for failures in the output
+    # This prevents the script from thinking it's logged in just because the prompt didn't change yet
+    for error_str in failure_patterns:
+        if error_str in out:
+            logger.warning(f"[FAIL] SSH Error detected: '{error_str}' to {target_ip}")
+            return 'failed_connection'
 
-def cleanup_failed_session(shell):
-    """Clean up a failed SSH session attempt"""
-    try:
-        if shell.closed:
-            logger.debug("[CLEANUP] Shell already closed, skipping cleanup")
-            return False
-        
-        logger.debug("[CLEANUP] Attempting to clean up failed session")
-        
-        # Try to send Ctrl+C to interrupt any hanging command
-        try:
-            if not shell.closed:
-                shell.send("\x03")
-                time.sleep(0.5)
-        except:
-            pass
-        
-        # Try to exit nested sessions multiple times
-        for attempt in range(3):
-            try:
-                if shell.closed:
-                    logger.debug("[CLEANUP] Shell closed during cleanup")
-                    return False
-                    
-                shell.send("exit\n")
-                time.sleep(1)
-                
-                # Check if we're back at aggregation prompt
-                if shell.recv_ready():
-                    data = shell.recv(MAX_READ).decode("utf-8", "ignore")
-                    logger.debug(f"[CLEANUP] Received after exit: {data[-200:]}")
-                    
-                    # Look for aggregation switch prompt
-                    if "#" in data:
-                        logger.debug("[CLEANUP] Successfully returned to aggregation switch")
-                        return True
-            except Exception as e:
-                logger.debug(f"[CLEANUP] Exit attempt {attempt + 1} exception: {e}")
-                break
-        
-        # Final verification - send empty command and check for prompt
-        try:
-            if not shell.closed:
-                shell.send("\n")
-                time.sleep(0.5)
-                if shell.recv_ready():
-                    data = shell.recv(MAX_READ).decode("utf-8", "ignore")
-                    if "#" in data:
-                        logger.debug("[CLEANUP] Verified aggregation switch prompt")
-                        return True
-        except:
-            pass
-        
-        logger.warning("[CLEANUP] Could not verify return to aggregation switch")
-        return False
-        
-    except Exception as e:
-        logger.debug(f"[CLEANUP] Cleanup exception: {e}")
-        return False
+    if "(yes/no)?" in out:
+        out = send_cmd(shell, "yes", patterns=("assword:", "#", ">"), timeout=10)
 
-def establish_device_session(shell, target_ip, retry_count=0):
-    """Establish SSH session to target device with retry logic"""
-    try:
-        logger.info(f"[HOP] Attempt {retry_count + 1}/{TARGET_MAX_RETRIES} - SSH to {target_ip}")
-        sys.stdout.flush()
-        
-        # Check if shell is still alive before attempting connection
-        if shell.closed:
-            raise NetworkConnectionError("SSH shell to aggregation switch is closed")
-        
-        # Initiate SSH connection with configurable timeout
-        logger.info(f"[HOP] Initiating SSH connection (timeout: {TARGET_SSH_TIMEOUT}s)...")
-        out = send_cmd(
-            shell, 
-            f"ssh -l {USERNAME} {target_ip}",
-            patterns=("Destination", "(yes/no)?", "assword:", "%", "#", ">", "Connection refused", "Connection timed out"),
-            timeout=TARGET_SSH_TIMEOUT,
-            show_progress=True
-        )
-        
-        logger.debug(f"[HOP] Initial output: {out[-300:]}")
-        
-        # Check for connection failures - these should NOT be retried (device is unreachable)
-        if "Connection refused" in out:
-            raise NetworkConnectionError(f"SSH connection refused by {target_ip} - skipping device")
-        
-        if "Connection timed out" in out or "Destination" in out:
-            raise NetworkConnectionError(f"SSH connection timed out to {target_ip} - device unreachable, skipping")
-        
-        if "No route to host" in out or "Host is unreachable" in out:
-            raise NetworkConnectionError(f"Network unreachable to {target_ip} - skipping device")
-        
-        # Handle host key verification
-        if "(yes/no)?" in out or "yes/no" in out:
-            logger.debug("[HOP] Accepting host key")
-            out = send_cmd(shell, "yes", patterns=("assword:", "%", "#", ">"), timeout=15)
-            logger.debug(f"[HOP] After host key: {out[-300:]}")
-        
-        # Handle password prompt
-        if "assword:" in out:
-            logger.debug("[HOP] Sending password")
-            out = send_cmd(shell, PASSWORD, patterns=("%", "#", ">", "assword:"), timeout=15)
-            logger.debug(f"[HOP] After password: {out[-300:]}")
-            
-            # Check if password was rejected (prompted again or error)
-            if "assword:" in out:
-                # Authentication failure - might be worth retrying
-                raise NetworkConnectionError(f"Authentication failed for {target_ip} - password rejected", retry_allowed=True)
-        
-        # Check for authentication/authorization failures
-        if "% Authentication failed" in out or "% Authorization failed" in out:
-            raise NetworkConnectionError(f"Authentication/Authorization failed for {target_ip}", retry_allowed=True)
-        
-        if "% Bad passwords" in out or "% Login invalid" in out:
-            raise NetworkConnectionError(f"Invalid credentials for {target_ip}", retry_allowed=True)
-        
-        # Verify we got a prompt
-        has_prompt = False
-        if "#" in out or ">" in out:
-            # Extract the last line to check for proper prompt
-            lines = out.strip().split('\n')
-            last_line = lines[-1] if lines else ""
-            logger.debug(f"[HOP] Last line: {last_line}")
-            
-            if last_line.endswith("#") or last_line.endswith(">"):
-                has_prompt = True
-        
-        if not has_prompt:
-            raise NetworkConnectionError(f"No valid prompt received from {target_ip}", retry_allowed=True)
-        
-        # Enter enable mode if in user mode (prompt ends with >)
-        if out.strip().endswith(">") or (out.count(">") > out.count("#")):
-            logger.debug("[HOP] Entering enable mode")
-            out = send_cmd(shell, "enable", patterns=("assword:", "#", "%"), timeout=10)
-            
-            if "assword:" in out:
-                out = send_cmd(shell, PASSWORD, patterns=("#", "%"), timeout=10)
-                
-            if "#" not in out:
-                raise NetworkConnectionError(f"Failed to enter enable mode on {target_ip}", retry_allowed=True)
-        
-        # Verify we're in enable mode with a test command
-        logger.debug("[HOP] Verifying enable mode")
-        out = send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
-        
-        if "#" not in out:
-            raise NetworkConnectionError(f"Device session unstable on {target_ip}", retry_allowed=True)
-        
-        # Additional verification - send empty command and check for prompt
-        out = send_cmd(shell, "", patterns=("#",), timeout=3)
-        if "#" not in out:
-            raise NetworkConnectionError(f"Lost prompt connection to {target_ip}", retry_allowed=True)
-        
-        logger.info(f"[CONNECTED] Successfully connected to {target_ip}")
-        return True
-        
-    except NetworkConnectionError as e:
-        logger.error(f"[HOP] Connection error: {e}")
-        
-        # Clean up failed connection attempt and verify we're back at aggregate
-        cleanup_successful = cleanup_failed_session(shell)
-        
-        if not cleanup_successful and not shell.closed:
-            logger.warning("[HOP] Cleanup verification failed - shell state uncertain")
-        
-        # Check if retry is allowed for this type of error
-        retry_allowed = getattr(e, 'retry_allowed', False)
-        
-        if retry_allowed and retry_count < TARGET_MAX_RETRIES - 1:
-            logger.info(f"[RETRY] Waiting {TARGET_RETRY_DELAY} seconds before retry...")
-            sys.stdout.flush()
-            time.sleep(TARGET_RETRY_DELAY)
-            return establish_device_session(shell, target_ip, retry_count + 1)
-        else:
-            if not retry_allowed:
-                logger.info(f"[SKIP] Device {target_ip} is unreachable - moving to next device")
-            raise NetworkConnectionError(f"Failed to connect to {target_ip} after {retry_count + 1} attempt(s)")
-    except OSError as e:
-        logger.error(f"[HOP] Socket error: {e}")
-        raise NetworkConnectionError(f"Lost connection to aggregation switch: {e}")
-        
-        # Handle host key verification
-        if "(yes/no)?" in out or "yes/no" in out:
-            logger.debug("[HOP] Accepting host key")
-            out = send_cmd(shell, "yes", patterns=("assword:", "%", "#", ">"), timeout=15)
-            logger.debug(f"[HOP] After host key: {out[-300:]}")
-        
-        # Handle password prompt
-        if "assword:" in out:
-            logger.debug("[HOP] Sending password")
-            out = send_cmd(shell, PASSWORD, patterns=("%", "#", ">", "assword:"), timeout=15)
-            logger.debug(f"[HOP] After password: {out[-300:]}")
-            
-            # Check if password was rejected (prompted again or error)
-            if "assword:" in out:
-                raise NetworkConnectionError(f"Authentication failed for {target_ip} - password rejected")
-        
-        # Check for authentication/authorization failures
-        if "% Authentication failed" in out or "% Authorization failed" in out:
-            raise NetworkConnectionError(f"Authentication/Authorization failed for {target_ip}")
-        
-        if "% Bad passwords" in out or "% Login invalid" in out:
-            raise NetworkConnectionError(f"Invalid credentials for {target_ip}")
-        
-        # Verify we got a prompt
-        has_prompt = False
-        if "#" in out or ">" in out:
-            # Extract the last line to check for proper prompt
-            lines = out.strip().split('\n')
-            last_line = lines[-1] if lines else ""
-            logger.debug(f"[HOP] Last line: {last_line}")
-            
-            if last_line.endswith("#") or last_line.endswith(">"):
-                has_prompt = True
-        
-        if not has_prompt:
-            raise NetworkConnectionError(f"No valid prompt received from {target_ip}")
-        
-        # Enter enable mode if in user mode (prompt ends with >)
-        if out.strip().endswith(">") or (out.count(">") > out.count("#")):
-            logger.debug("[HOP] Entering enable mode")
-            out = send_cmd(shell, "enable", patterns=("assword:", "#", "%"), timeout=10)
-            
-            if "assword:" in out:
-                out = send_cmd(shell, PASSWORD, patterns=("#", "%"), timeout=10)
-                
-            if "#" not in out:
-                raise NetworkConnectionError(f"Failed to enter enable mode on {target_ip}")
-        
-        # Verify we're in enable mode with a test command
-        logger.debug("[HOP] Verifying enable mode")
-        out = send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
-        
-        if "#" not in out:
-            raise NetworkConnectionError(f"Device session unstable on {target_ip}")
-        
-        # Additional verification - send empty command and check for prompt
-        out = send_cmd(shell, "", patterns=("#",), timeout=3)
-        if "#" not in out:
-            raise NetworkConnectionError(f"Lost prompt connection to {target_ip}")
-        
-        logger.info(f"[CONNECTED] Successfully connected to {target_ip}")
-        return True
-        
-    except NetworkConnectionError as e:
-        logger.error(f"[HOP] Connection error: {e}")
-        
-        # Clean up failed connection attempt
-        cleanup_failed_session(shell)
-        
-        if retry_count < MAX_RETRIES - 1:
-            logger.info(f"[RETRY] Waiting {RETRY_DELAY} seconds before retry...")
-            sys.stdout.flush()
-            time.sleep(RETRY_DELAY)
-            return establish_device_session(shell, target_ip, retry_count + 1)
-        else:
-            raise NetworkConnectionError(f"Failed to connect to {target_ip} after {MAX_RETRIES} attempts")
-    except OSError as e:
-        logger.error(f"[HOP] Socket error: {e}")
-        raise NetworkConnectionError(f"Lost connection to aggregation switch: {e}")
-        
-        # Handle host key verification
-        if "(yes/no)?" in out or "yes/no" in out:
-            logger.debug("[HOP] Accepting host key")
-            out = send_cmd(shell, "yes", patterns=("assword:", "%", "#", ">"), timeout=15)
-            logger.debug(f"[HOP] After host key: {out[-300:]}")
-        
-        # Handle password prompt
-        if "assword:" in out:
-            logger.debug("[HOP] Sending password")
-            out = send_cmd(shell, PASSWORD, patterns=("%", "#", ">", "assword:"), timeout=15)
-            logger.debug(f"[HOP] After password: {out[-300:]}")
-            
-            # Check if password was rejected (prompted again or error)
-            if "assword:" in out:
-                raise NetworkConnectionError(f"Authentication failed for {target_ip} - password rejected")
-        
-        # Check for authentication/authorization failures
-        if "% Authentication failed" in out or "% Authorization failed" in out:
-            raise NetworkConnectionError(f"Authentication/Authorization failed for {target_ip}")
-        
-        if "% Bad passwords" in out or "% Login invalid" in out:
-            raise NetworkConnectionError(f"Invalid credentials for {target_ip}")
-        
-        # Verify we got a prompt
-        has_prompt = False
-        if "#" in out or ">" in out:
-            # Extract the last line to check for proper prompt
-            lines = out.strip().split('\n')
-            last_line = lines[-1] if lines else ""
-            logger.debug(f"[HOP] Last line: {last_line}")
-            
-            if last_line.endswith("#") or last_line.endswith(">"):
-                has_prompt = True
-        
-        if not has_prompt:
-            raise NetworkConnectionError(f"No valid prompt received from {target_ip}")
-        
-        # Enter enable mode if in user mode (prompt ends with >)
-        if out.strip().endswith(">") or (out.count(">") > out.count("#")):
-            logger.debug("[HOP] Entering enable mode")
-            out = send_cmd(shell, "enable", patterns=("assword:", "#", "%"), timeout=10)
-            
-            if "assword:" in out:
-                out = send_cmd(shell, PASSWORD, patterns=("#", "%"), timeout=10)
-                
-            if "#" not in out:
-                raise NetworkConnectionError(f"Failed to enter enable mode on {target_ip}")
-        
-        # Verify we're in enable mode with a test command
-        logger.debug("[HOP] Verifying enable mode")
-        out = send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
-        
-        if "#" not in out:
-            raise NetworkConnectionError(f"Device session unstable on {target_ip}")
-        
-        # Additional verification - send empty command and check for prompt
-        out = send_cmd(shell, "", patterns=("#",), timeout=3)
-        if "#" not in out:
-            raise NetworkConnectionError(f"Lost prompt connection to {target_ip}")
-        
-        logger.info(f"[CONNECTED] Successfully connected to {target_ip}")
-        return True
-        
-    except NetworkConnectionError as e:
-        logger.error(f"[HOP] Connection error: {e}")
-        
-        # Clean up failed connection attempt
-        cleanup_failed_session(shell)
-        
-        if retry_count < MAX_RETRIES - 1:
-            logger.info(f"[RETRY] Waiting {RETRY_DELAY} seconds before retry...")
-            sys.stdout.flush()
-            time.sleep(RETRY_DELAY)
-            return establish_device_session(shell, target_ip, retry_count + 1)
-        else:
-            raise NetworkConnectionError(f"Failed to connect to {target_ip} after {MAX_RETRIES} attempts")
-    except OSError as e:
-        logger.error(f"[HOP] Socket error: {e}")
-        raise NetworkConnectionError(f"Lost connection to aggregation switch: {e}")
+    if "assword:" in out:
+        out = send_cmd(shell, PASSWORD, patterns=("#", ">", "assword:", "denied"), timeout=15)
+        if "assword:" in out or "denied" in out:
+            logger.error(f"[FAIL] Auth failed for {target_ip}")
+            return 'failed_connection'
 
-def apply_configuration(shell, config_commands, retry_count=0):
-    """Apply configuration commands with verification"""
+    # 3. Enable Mode
+    if ">" in out and "#" not in out:
+        out = send_cmd(shell, "enable", patterns=("assword:", "#"), timeout=8)
+        if "assword:" in out: send_cmd(shell, PASSWORD, patterns=("#",), timeout=8)
+
+    # 4. Final Safety Check (Hostname)
+    # We still keep this, but relies on the error check above to catch connection issues first.
+    send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
+    current_hostname = get_hostname(shell)
+    
+    if current_hostname == agg_hostname:
+        logger.critical(f"[SAFETY] Hostname did not change! Still on {agg_hostname}. Assuming connection failed.")
+        return 'failed_connection'
+    
+    logger.info(f"[CONNECTED] On target: {current_hostname}")
+    
+    # 5. Push Config
     try:
-        # Enter config mode
-        logger.info("[CONFIG] Entering configuration mode...")
-        out = send_cmd(shell, "configure terminal", patterns=("(config)#",), timeout=10)
-        if "(config)#" not in out:
-            raise ConfigurationError("Failed to enter configuration mode")
+        send_cmd(shell, "configure terminal", patterns=("(config)#",), timeout=10)
         
-        failed_commands = []
-        total_cmds = len(config_commands)
-        
-        for idx, cmd in enumerate(config_commands, 1):
-            logger.info(f"[CONFIG] [{idx}/{total_cmds}] Sending: {cmd}")
-            sys.stdout.flush()
-            
+        for cmd in config_commands:
             out = send_cmd(shell, cmd, patterns=("(config)#", "(config-"), timeout=10)
-            
-            # Check for errors in output
-            if "Invalid" in out or "incomplete" in out or "% " in out:
-                logger.error(f"[CONFIG] Command failed: {cmd}")
-                logger.error(f"[CONFIG] Error output: {out[-200:]}")
-                failed_commands.append(cmd)
-            else:
-                logger.info(f"[CONFIG] Command accepted")
+            if "% Invalid" in out or "% Incomplete" in out:
+                logger.error(f"[CONFIG ERROR] Command rejected: {cmd}")
         
-        if failed_commands:
-            raise ConfigurationError(f"Failed commands: {', '.join(failed_commands)}")
+        send_cmd(shell, "end", patterns=("#",), timeout=10)
+        send_cmd(shell, "write memory", patterns=("OK", "#"), timeout=20)
+        logger.info(f"[SUCCESS] Configured {target_ip}")
         
-        # Save configuration with progress counter
-        logger.info("[CONFIG] Saving configuration with 'do write' (timeout: 20s)...")
-        sys.stdout.flush()
-        out = send_cmd(shell, "do write", patterns=("(config)#", "#", "[OK]"), timeout=20, show_progress=True)
-        
-        if "[OK]" in out or "Building configuration" in out:
-            logger.info("[CONFIG] Configuration saved successfully")
-        else:
-            logger.warning("[CONFIG] Configuration save verification unclear")
-        
-        # Exit config mode
-        send_cmd(shell, "end", patterns=("#",), timeout=5)
-        logger.info("[CONFIG] Configuration applied successfully")
-        return True
-        
-    except ConfigurationError as e:
-        logger.error(f"[CONFIG] Configuration error: {e}")
-        # Exit config mode on error
-        try:
-            send_cmd(shell, "end", patterns=("#",), timeout=5)
-        except:
-            pass
-        
-        if retry_count < TARGET_MAX_RETRIES - 1:
-            logger.info(f"[RETRY] Retrying configuration (attempt {retry_count + 2}/{TARGET_MAX_RETRIES})")
-            time.sleep(TARGET_RETRY_DELAY)
-            return apply_configuration(shell, config_commands, retry_count + 1)
-        else:
-            raise ConfigurationError(f"Failed to apply configuration after {TARGET_MAX_RETRIES} attempts")
+        # Exit back
+        try: 
+            send_cmd(shell, "exit", patterns=("#", ">"), timeout=5)
+            send_cmd(shell, "exit", patterns=("#", ">"), timeout=2) 
+        except: pass
+        return 'success'
 
-def exit_device_session(shell):
-    """Safely exit from target device back to aggregation switch"""
-    try:
-        logger.info("[EXIT] Returning to aggregation switch")
-        sys.stdout.flush()
-        
-        send_cmd(shell, "exit", patterns=("#", ">"), timeout=5)
-        time.sleep(1)
-        # Verify we're back at aggregation switch
-        out = send_cmd(shell, "", patterns=("#",), timeout=2)
-        logger.info("[EXIT] Successfully returned to aggregation switch")
     except Exception as e:
-        logger.warning(f"[EXIT] Error during exit: {e}")
+        logger.error(f"[ERROR] Config failed on {target_ip}: {e}")
+        try: send_cmd(shell, "end")
+        except: pass
+        try: send_cmd(shell, "exit")
+        except: pass
+        return 'failed_config'
 
-def push_config(shell, target_ip, config_commands):
-    """Main function to push configuration to a target device"""
-    backup_file = None
-    
-    try:
-        # Check if aggregation shell is still alive
-        if shell.closed:
-            raise NetworkConnectionError("Connection to aggregation switch lost", reconnect_needed=True)
-        
-        # Verify we're at aggregate prompt before starting
-        logger.debug(f"[PUSH] Verifying aggregate prompt before connecting to {target_ip}")
-        try:
-            out = send_cmd(shell, "", patterns=("#",), timeout=3)
-            if "#" not in out:
-                logger.warning("[PUSH] Not at aggregate prompt - attempting to recover")
-                # Try to get back to aggregate
-                for _ in range(3):
-                    shell.send("exit\n")
-                    time.sleep(0.5)
-                out = send_cmd(shell, "", patterns=("#",), timeout=3)
-                if "#" not in out:
-                    raise NetworkConnectionError("Unable to verify aggregate switch prompt", reconnect_needed=True)
-        except OSError:
-            raise NetworkConnectionError("Connection to aggregation switch lost", reconnect_needed=True)
-        
-        # Verify connectivity first
-        if not verify_connectivity(shell, target_ip):
-            raise NetworkConnectionError(f"Device {target_ip} is not reachable")
-        
-        # Establish session to target device
-        establish_device_session(shell, target_ip)
-        
-        # Backup current configuration
-        backup_file = backup_config(shell, target_ip)
-        
-        # Apply configuration
-        apply_configuration(shell, config_commands)
-        
-        # Exit back to aggregation switch
-        exit_device_session(shell)
-        
-        return True, backup_file
-        
-    except NetworkConnectionError as e:
-        logger.error(f"[ERROR] Failed to configure {target_ip}: {e}")
-        
-        # Check if reconnect is needed
-        reconnect_needed = getattr(e, 'reconnect_needed', False)
-        
-        # Check if we need to reconnect to aggregation switch
-        if shell.closed or reconnect_needed or "aggregation switch" in str(e).lower():
-            logger.warning("Connection to aggregation switch lost")
-            return False, backup_file, True  # Return reconnect flag
-        
-        # Attempt to exit gracefully and verify aggregate prompt
-        try:
-            if not shell.closed:
-                cleanup_successful = cleanup_failed_session(shell)
-                if not cleanup_successful:
-                    logger.warning("[PUSH] Could not verify clean return to aggregate switch")
-        except:
-            pass
-        
-        return False, backup_file, False
-        
-    except ConfigurationError as e:
-        logger.error(f"[ERROR] Configuration failed for {target_ip}: {e}")
-        
-        # Attempt to exit gracefully
-        try:
-            if not shell.closed:
-                exit_device_session(shell)
-        except:
-            pass
-        
-        return False, backup_file, False
-
+# ========================= MAIN ================================
 def main():
     if len(sys.argv) != 3:
         print("Usage: python3 push_config.py <devices_file> <commands_file>")
@@ -702,138 +217,75 @@ def main():
     devices_file = sys.argv[1]
     commands_file = sys.argv[2]
     
-    logger.info("=" * 70)
-    logger.info("NETWORK CONFIGURATION AUTOMATION SCRIPT")
-    logger.info("=" * 70)
-    
-    # Validate input files
+    # Load Files
     try:
         with open(devices_file, "r") as f:
-            target_ips = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-        
+            targets = [l.strip() for l in f if l.strip() and not l.startswith("#")]
         with open(commands_file, "r") as f:
-            config_cmds = [line.rstrip() for line in f if line.strip() and not line.startswith("!")]
-        
-        logger.info(f"Loaded {len(target_ips)} devices and {len(config_cmds)} commands")
-        logger.info(f"Log file: network_config.log")
-        logger.info("")
-        
-    except FileNotFoundError as e:
-        logger.error(f"Input file not found: {e}")
+            commands = [l.strip() for l in f if l.strip() and not l.startswith("!")]
+            
+        logger.info(f"Loaded {len(targets)} devices and {len(commands)} commands.")
+    except Exception as e:
+        logger.error(f"Error reading input files: {e}")
         sys.exit(1)
-    
-    # Connect to aggregation switch
-    logger.info("Connecting to aggregation switch...")
+
+    # Connect to Agg
     try:
-        client, shell = connect_to_agg()
-    except NetworkConnectionError as e:
-        logger.error(f"Failed to connect to aggregation switch: {e}")
+        client, shell, agg_hostname = connect_to_agg()
+    except Exception:
         sys.exit(1)
-    
-    # Track results
+
     successful = []
     failed = []
-    start_time = time.time()
-    
-    # Configure each device
-    for idx, target in enumerate(target_ips, 1):
-        logger.info("")
-        logger.info("=" * 70)
-        logger.info(f"DEVICE {idx}/{len(target_ips)}: {target}")
-        logger.info("=" * 70)
+
+    # Processing Loop
+    for idx, target in enumerate(targets, 1):
+        logger.info(f"\n=== Processing Device {idx}/{len(targets)}: {target} ===")
+        status = 'failed'
         
-        # Check if aggregation connection is still alive
-        if shell.closed:
-            logger.error("Connection to aggregation switch lost!")
-            logger.info("Attempting to reconnect...")
-            try:
-                try:
-                    client.close()
-                except:
-                    pass
-                client, shell = connect_to_agg()
-                logger.info("Successfully reconnected to aggregation switch")
-            except NetworkConnectionError as e:
-                logger.error(f"Failed to reconnect to aggregation switch: {e}")
-                logger.error("Remaining devices will be skipped")
-                failed.extend(target_ips[idx-1:])
+        for attempt in range(TARGET_MAX_RETRIES):
+            if attempt > 0:
+                logger.info(f"Retry {attempt+1}/{TARGET_MAX_RETRIES} for {target}...")
+            
+            # Connection Recovery
+            if getattr(shell, "closed", False) or not shell.get_transport().is_active():
+                try: 
+                    client, shell, agg_hostname = connect_to_agg()
+                except: 
+                    sys.exit("Fatal: Aggregation switch died.")
+
+            res = process_hop(shell, agg_hostname, target, commands)
+            
+            if res == 'success':
+                status = 'success'
                 break
+            elif res == 'failed_connection':
+                # If we detected a connection failure (like "not responding"), wait before retry
+                time.sleep(TARGET_RETRY_DELAY)
+            else:
+                time.sleep(TARGET_RETRY_DELAY)
         
-        device_start = time.time()
-        result = push_config(shell, target, config_cmds)
-        
-        # Handle result with reconnect flag
-        if len(result) == 3:
-            success, backup, reconnect_needed = result
-        else:
-            success, backup = result
-            reconnect_needed = False
-        
-        device_elapsed = time.time() - device_start
-        
-        if success:
-            logger.info(f"[SUCCESS] Configuration applied to {target} in {device_elapsed:.1f}s")
+        if status == 'success':
             successful.append(target)
         else:
-            logger.error(f"[FAILED] Could not configure {target} after {device_elapsed:.1f}s")
+            logger.error(f"Failed to configure {target} after retries.")
             failed.append(target)
-            
-            # If reconnect is needed, try to reconnect now
-            if reconnect_needed:
-                logger.info("Attempting to reconnect to aggregation switch...")
-                try:
-                    try:
-                        client.close()
-                    except:
-                        pass
-                    client, shell = connect_to_agg()
-                    logger.info("Successfully reconnected - continuing with remaining devices")
-                except NetworkConnectionError as e:
-                    logger.error(f"Failed to reconnect to aggregation switch: {e}")
-                    logger.error("Stopping configuration for remaining devices")
-                    failed.extend(target_ips[idx:])
-                    break
-        
-        # Small delay between devices
-        time.sleep(2)
-    
-    # Close connection to aggregation switch
-    try:
-        client.close()
-        logger.info("")
-        logger.info("[DISCONNECT] Closed connection to aggregation switch")
-    except:
-        pass
-    
+
     # Summary
-    total_elapsed = time.time() - start_time
-    logger.info("")
-    logger.info("=" * 70)
+    logger.info("\n" + "="*40)
     logger.info("CONFIGURATION SUMMARY")
-    logger.info("=" * 70)
-    logger.info(f"Total time: {total_elapsed:.1f}s")
-    logger.info(f"Total devices: {len(target_ips)}")
+    logger.info("="*40)
+    logger.info(f"Total:      {len(targets)}")
     logger.info(f"Successful: {len(successful)}")
-    logger.info(f"Failed: {len(failed)}")
-    logger.info(f"Success rate: {(len(successful)/len(target_ips)*100):.1f}%")
-    
-    if successful:
-        logger.info(f"\nSuccessful devices:")
-        for device in successful:
-            logger.info(f"   - {device}")
+    logger.info(f"Failed:     {len(failed)}")
     
     if failed:
-        logger.error(f"\nFailed devices:")
-        for device in failed:
-            logger.error(f"   - {device}")
-    
-    logger.info("")
-    logger.info("=" * 70)
-    logger.info("All configuration tasks completed")
-    logger.info("=" * 70)
-    
-    # Exit with error code if any failures
-    sys.exit(0 if not failed else 1)
+        logger.info("\nFAILED DEVICES:")
+        for f in failed:
+            logger.error(f" - {f}")
+            
+    try: client.close()
+    except: pass
 
 if __name__ == "__main__":
     main()
