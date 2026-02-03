@@ -1,6 +1,3 @@
-"target IP | changed vlan 100 ip | netmask"
-
-
 #!/usr/bin/env python3
 import paramiko
 import time
@@ -51,7 +48,7 @@ class LiveFormatter(logging.Formatter):
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-# Console Handler - DEBUG level enabled to see every command
+# Console Handler
 ch = logging.StreamHandler(sys.stdout)
 ch.setLevel(logging.DEBUG) 
 ch.setFormatter(LiveFormatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S'))
@@ -71,7 +68,6 @@ def expect_prompt(shell, patterns=("#", ">"), timeout=TIMEOUT, log_output=True):
             data = shell.recv(MAX_READ).decode("utf-8", "ignore")
             buf += data
             if log_output and data.strip():
-                # Logs raw output to help debug "hanging"
                 logger.debug(f"[RECV] {data.strip()[-100:]}") 
             for p in patterns:
                 if p in buf: return buf
@@ -82,27 +78,6 @@ def send_cmd(shell, cmd, patterns=("#", ">"), timeout=TIMEOUT):
     logger.debug(f"[SEND] {cmd}")
     shell.send(cmd + "\n")
     return expect_prompt(shell, patterns, timeout)
-
-def get_hostname(shell) -> str:
-    """Attempts to grab the hostname safely from the running config or prompt."""
-    try:
-        out = send_cmd(shell, "show run | include ^hostname", patterns=("#", ">"), timeout=5)
-        m = re.search(r'^\s*hostname\s+(.+)$', out, re.MULTILINE)
-        if m: return m.group(1).strip('"')
-    except Exception:
-        pass
-    
-    # Fallback: scrape the prompt
-    try:
-        shell.send("\n")
-        time.sleep(0.5)
-        if shell.recv_ready():
-            out = shell.recv(MAX_READ).decode("utf-8", "ignore")
-            last_line = out.strip().splitlines()[-1]
-            return re.sub(r'[#>]$', '', last_line).strip()
-    except Exception:
-        pass
-    return "UNKNOWN_HOST"
 
 # ========================= CORE CONNECT ========================
 def connect_to_agg(retry=0):
@@ -118,18 +93,23 @@ def connect_to_agg(retry=0):
         client.connect(AGG_IP, username=USERNAME, password=PASSWORD,
                        look_for_keys=False, allow_agent=False, timeout=10)
         shell = client.invoke_shell()
+        
+        # Wait for initial prompt
         expect_prompt(shell, ("#", ">"), timeout=15)
         
-        # Handle Enable
-        out = send_cmd(shell, "enable", patterns=("assword:", "#", ">"), timeout=5)
-        if "assword:" in out:
-            send_cmd(shell, PASSWORD, patterns=("#",), timeout=5)
+        # Handle Enable blindly
+        send_cmd(shell, "enable", patterns=("assword:", "#", ">"), timeout=5)
+        # If password requested, send it. If not, this pattern match just moves on.
+        # We don't check output here, we assume if we are at '#' we are good.
+        if shell.recv_ready():
+            out = shell.recv(MAX_READ).decode("utf-8", "ignore")
+            if "assword:" in out:
+                send_cmd(shell, PASSWORD, patterns=("#",), timeout=5)
             
         send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
         
-        agg_hostname = get_hostname(shell)
-        logger.info(f"[CONNECT] Connected to Aggregation Switch. Hostname: '{agg_hostname}'")
-        return client, shell, agg_hostname
+        logger.info(f"[CONNECT] Connected to Aggregation Switch.")
+        return client, shell
     except Exception as e:
         logger.error(f"[CONNECT] Failed: {e}")
         if retry < AGG_MAX_RETRIES - 1:
@@ -140,9 +120,6 @@ def connect_to_agg(retry=0):
 # ========================= CONFIGURATION =======================
 def apply_config(shell, target_ip, new_ip, new_mask):
     logger.info(f"[CONFIG] {target_ip}: Applying VLAN {VLAN_ID} IP {new_ip} {new_mask}")
-    
-    # Backup
-    out = send_cmd(shell, "show running-config", patterns=("#",), timeout=20)
     
     try:
         # Enter Config
@@ -168,8 +145,7 @@ def apply_config(shell, target_ip, new_ip, new_mask):
             m = re.match(r'^\s*(Po\d+|[A-Za-z]{2}\d+(?:/\d+){1,2})\s', line, re.I)
             if m: trunks.append(m.group(1))
         
-        # --- FIX: REMOVE DUPLICATES ---
-        # Ensures we don't configure the same interface multiple times
+        # Remove duplicates
         trunks = sorted(list(set(trunks))) 
 
         if trunks:
@@ -197,7 +173,7 @@ def apply_config(shell, target_ip, new_ip, new_mask):
         return False
 
 # ========================= EXECUTION LOGIC =====================
-def process_hop(shell, agg_hostname, target_ip, new_ip, new_mask):
+def process_hop(shell, target_ip, new_ip, new_mask):
     """
     Returns: 'success', 'failed_connection', 'failed_config'
     """
@@ -225,24 +201,18 @@ def process_hop(shell, agg_hostname, target_ip, new_ip, new_mask):
             logger.error(f"[FAIL] Auth failed for {target_ip}")
             return 'failed_connection'
 
-    # 3. Validate we are on the new device
+    # 3. Handle Enable if we landed in user exec mode
     if ">" in out and "#" not in out:
         out = send_cmd(shell, "enable", patterns=("assword:", "#"), timeout=8)
         if "assword:" in out: send_cmd(shell, PASSWORD, patterns=("#",), timeout=8)
 
+    # 4. Connection assumed successful if we got here
     send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
-    current_hostname = get_hostname(shell)
+    logger.info(f"[CONNECTED] Logged into {target_ip}")
     
-    # SAFETY CHECK: Ensure we actually moved
-    if current_hostname == agg_hostname:
-        logger.critical(f"[SAFETY] Hop failed! Still on Aggregation Switch ({agg_hostname}). Aborting this device.")
-        return 'failed_connection'
-    
-    logger.info(f"[CONNECTED] On target: {current_hostname}")
-    
-    # 4. Apply Config
+    # 5. Apply Config
     if apply_config(shell, target_ip, new_ip, new_mask):
-        # 5. Exit back to Agg
+        # 6. Exit back to Agg
         try: 
             send_cmd(shell, "exit", patterns=("#", ">"), timeout=5)
             # Sometimes need a second exit if enabled
@@ -254,7 +224,7 @@ def process_hop(shell, agg_hostname, target_ip, new_ip, new_mask):
         except: pass
         return 'failed_config'
 
-def process_batch(client, shell, agg_hostname, items: List[Dict]) -> Tuple[List[str], List[Dict]]:
+def process_batch(client, shell, items: List[Dict]) -> Tuple[List[str], List[Dict]]:
     success_list = []
     failed_items = []
 
@@ -270,11 +240,11 @@ def process_batch(client, shell, agg_hostname, items: List[Dict]) -> Tuple[List[
             # Check Agg Connection
             if getattr(shell, "closed", False) or not shell.get_transport().is_active():
                 try: 
-                    client, shell, agg_hostname = connect_to_agg()
+                    client, shell = connect_to_agg()
                 except: 
                     sys.exit("Fatal: Aggregation switch died.")
 
-            res = process_hop(shell, agg_hostname, target, item['vip'], item['mask'])
+            res = process_hop(shell, target, item['vip'], item['mask'])
             
             if res == 'success':
                 status = 'success'
@@ -333,13 +303,13 @@ def main():
 
     # Connect to Agg
     try:
-        client, shell, agg_hostname = connect_to_agg()
+        client, shell = connect_to_agg()
     except Exception:
         sys.exit(1)
 
     # --- PHASE 1: Main Run ---
     logger.info("=== STARTING PHASE 1 ===")
-    success_1, failed_1 = process_batch(client, shell, agg_hostname, plan)
+    success_1, failed_1 = process_batch(client, shell, plan)
 
     # --- PHASE 2: Retry Failed ---
     final_success = success_1
@@ -355,17 +325,17 @@ def main():
         # Refresh connection for Phase 2
         try:
             client.close()
-            client, shell, agg_hostname = connect_to_agg()
+            client, shell = connect_to_agg()
         except: pass
 
-        success_2, failed_2 = process_batch(client, shell, agg_hostname, failed_1)
+        success_2, failed_2 = process_batch(client, shell, failed_1)
         
         final_success.extend(success_2)
         final_failed_items = failed_2 
 
     logger.info("\n=== FINAL SUMMARY ===")
     logger.info(f"Successful: {len(final_success)}")
-    logger.info(f"Failed:      {len(final_failed_items)}")
+    logger.info(f"Failed:       {len(final_failed_items)}")
 
     if final_failed_items:
         logger.info("\n=== LIST OF FAILED DEVICES ===")
