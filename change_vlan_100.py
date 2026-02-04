@@ -9,10 +9,14 @@ import pandas as pd
 from typing import Tuple, List, Dict
 
 # ========================= USER CONFIG =========================
-# Leave these blank to be prompted at runtime
-AGG_IP = "192.168.1.6"  
-USERNAME = "admin"
-PASSWORD = "cisco"
+AGG_IP = "192.168.1.6"
+
+# Define multiple credentials here. The script tries them in order.
+CREDENTIALS = [
+    {"user": "admin", "pass": "cisco"},
+    {"user": "root", "pass": "secret123"},
+    {"user": "backup_admin", "pass": "Network!2024"}
+]
 
 TIMEOUT = 10
 MAX_READ = 65535
@@ -81,42 +85,72 @@ def send_cmd(shell, cmd, patterns=("#", ">"), timeout=TIMEOUT):
     shell.send(cmd + "\n")
     return expect_prompt(shell, patterns, timeout)
 
+def cleanup_failed_session(shell):
+    """Attempts to escape from a failed SSH prompt back to the main CLI."""
+    for _ in range(3):
+        try:
+            shell.send("\x03") # Ctrl+C
+            time.sleep(0.5)
+            shell.send("\n")   # Enter
+            if shell.recv_ready():
+                data = shell.recv(MAX_READ).decode("utf-8", "ignore")
+                if "#" in data or ">" in data:
+                    return True
+        except:
+            pass
+    return False
+
 # ========================= CORE CONNECT ========================
 def connect_to_agg(retry=0):
-    global AGG_IP, USERNAME, PASSWORD
+    global AGG_IP
     if not AGG_IP: AGG_IP = input("Aggregation Switch IP: ").strip()
-    if not USERNAME: USERNAME = input("Username: ").strip()
-    if not PASSWORD: PASSWORD = getpass.getpass("Password: ").strip()
 
-    try:
-        logger.info(f"[CONNECT] Attempt {retry+1}/{AGG_MAX_RETRIES} to Aggregation: {AGG_IP}")
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(AGG_IP, username=USERNAME, password=PASSWORD,
-                       look_for_keys=False, allow_agent=False, timeout=10)
-        shell = client.invoke_shell()
-        
-        # 1. Clear initial banner/prompt
-        expect_prompt(shell, ("#", ">"), timeout=15)
-        
-        # 2. Handle Enable - FORCE WAIT for Password or #
-        out = send_cmd(shell, "enable", patterns=("assword:", "Password:", "#"), timeout=5)
-        
-        # 3. Send Password if requested
-        if "assword:" in out.lower() or "password:" in out.lower():
-            send_cmd(shell, PASSWORD, patterns=("#",), timeout=5)
+    logger.info(f"[CONNECT] Attempt {retry+1}/{AGG_MAX_RETRIES} to Aggregation: {AGG_IP}")
+    
+    last_exception = None
+
+    for cred in CREDENTIALS:
+        user = cred['user']
+        pwd = cred['pass']
+
+        try:
+            logger.info(f"[AUTH] Trying credential: {user}")
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(AGG_IP, username=user, password=pwd,
+                           look_for_keys=False, allow_agent=False, timeout=10)
+            shell = client.invoke_shell()
             
-        # 4. Disable Pagination (Crucial for batch processing)
-        send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
+            # 1. Clear initial banner/prompt
+            expect_prompt(shell, ("#", ">"), timeout=15)
+            
+            # 2. Handle Enable - FORCE WAIT for Password or #
+            out = send_cmd(shell, "enable", patterns=("assword:", "Password:", "#"), timeout=5)
+            
+            # 3. Send Password if requested
+            if "assword:" in out.lower() or "password:" in out.lower():
+                send_cmd(shell, pwd, patterns=("#",), timeout=5)
+                
+            # 4. Disable Pagination (Crucial for batch processing)
+            send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
+            
+            logger.info(f"[CONNECT] Connected to Aggregation Switch as {user}.")
+            return client, shell
         
-        logger.info(f"[CONNECT] Connected to Aggregation Switch.")
-        return client, shell
-    except Exception as e:
-        logger.error(f"[CONNECT] Failed: {e}")
-        if retry < AGG_MAX_RETRIES - 1:
-            time.sleep(AGG_RETRY_DELAY)
-            return connect_to_agg(retry+1)
-        raise
+        except paramiko.AuthenticationException:
+            logger.warning(f"[AUTH] Authentication failed for user {user}. Trying next...")
+            continue
+        except Exception as e:
+            logger.error(f"[CONNECT] Error with {user}: {e}")
+            last_exception = e
+            continue
+
+    logger.error("[CONNECT] All credentials failed.")
+    if retry < AGG_MAX_RETRIES - 1:
+        time.sleep(AGG_RETRY_DELAY)
+        return connect_to_agg(retry+1)
+    else:
+        raise last_exception if last_exception else Exception("Auth failed")
 
 # ========================= CONFIGURATION =======================
 def apply_config(shell, target_ip, new_ip, new_mask):
@@ -180,66 +214,85 @@ def process_hop(shell, target_ip, new_ip, new_mask):
     """
     logger.info(f"\n--- Hop Attempt: {target_ip} ---")
     
-    # Clean buffer before starting
-    if shell.recv_ready(): shell.recv(MAX_READ)
+    # Iterate through credentials
+    for cred in CREDENTIALS:
+        user = cred['user']
+        pwd = cred['pass']
 
-    # 1. Initiate SSH
-    shell.send(f"ssh -l {USERNAME} {target_ip}\n")
-    
-    # 2. Handle SSH handshake
-    # --- CRITICAL FIX ---
-    # We DO NOT look for '#' or '>' here because banners often contain them.
-    # We ONLY wait for auth prompts or error messages.
-    valid_patterns = ["(yes/no)?", "assword:", "Password:"]
-    error_patterns = ["refused", "timed out", "unreachable", "Unknown host", "Connection closed"]
-    
-    out = expect_prompt(shell, patterns=valid_patterns + error_patterns, timeout=TARGET_SSH_TIMEOUT)
-    
-    if any(x in out for x in error_patterns):
-        logger.warning(f"[FAIL] Connection refused/timed out to {target_ip}")
-        return 'failed_connection'
+        # Clean buffer before starting
+        if shell.recv_ready(): shell.recv(MAX_READ)
+        shell.send("\n") # Wake up prompt
+        time.sleep(0.5)
 
-    # Handle SSH Key Acceptance
-    if "(yes/no)?" in out:
-        out = send_cmd(shell, "yes", patterns=("assword:", "Password:"), timeout=10)
+        logger.info(f"[HOP] Trying user {user} on {target_ip}")
 
-    # Handle Password
-    if "assword:" in out or "Password:" in out:
-        # Now that we've seen the password prompt, we send the password.
-        # NOW we can look for '#' or '>' because we expect to be logged in.
-        out = send_cmd(shell, PASSWORD, patterns=("#", ">", "assword:", "denied"), timeout=15)
-        if "assword:" in out or "denied" in out:
-            logger.error(f"[FAIL] Auth failed for {target_ip}")
+        # 1. Initiate SSH
+        shell.send(f"ssh -l {user} {target_ip}\n")
+        
+        # 2. Handle SSH handshake
+        valid_patterns = ["(yes/no)?", "assword:", "Password:"]
+        # 'denied' or 'closed' means this specific user failed, but host might be up
+        error_patterns = ["refused", "timed out", "unreachable", "Unknown host", "Connection closed"]
+        
+        out = expect_prompt(shell, patterns=valid_patterns + error_patterns, timeout=TARGET_SSH_TIMEOUT)
+        
+        if any(x in out for x in error_patterns):
+            logger.warning(f"[FAIL] Connection refused/timed out to {target_ip}")
+            # If the host is unreachable, trying another user won't help. 
+            # We fail immediately to save time.
             return 'failed_connection'
-    else:
-        # If we didn't get a password prompt (rare, or promptless login), 
-        # check if we are already at the prompt
-        if not any(p in out for p in ["#", ">"]):
-             logger.warning(f"[FAIL] Stuck at banner or unexpected state: {out[-50:]}")
-             return 'failed_connection'
 
-    # 3. Handle Enable if we landed in user exec mode
-    if ">" in out and "#" not in out:
-        out = send_cmd(shell, "enable", patterns=("assword:", "Password:", "#"), timeout=8)
-        if "assword:" in out or "Password:" in out: 
-            send_cmd(shell, PASSWORD, patterns=("#",), timeout=8)
+        # Handle SSH Key Acceptance
+        if "(yes/no)?" in out:
+            out = send_cmd(shell, "yes", patterns=("assword:", "Password:"), timeout=10)
 
-    # 4. Connection assumed successful if we got here
-    send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
-    logger.info(f"[CONNECTED] Logged into {target_ip}")
-    
-    # 5. Apply Config
-    if apply_config(shell, target_ip, new_ip, new_mask):
-        # 6. Exit back to Agg
-        try: 
-            send_cmd(shell, "exit", patterns=("#", ">"), timeout=5)
-            send_cmd(shell, "exit", patterns=("#", ">"), timeout=2) 
-        except: pass
-        return 'success'
-    else:
-        try: send_cmd(shell, "exit", patterns=("#", ">"), timeout=5)
-        except: pass
-        return 'failed_config'
+        # Handle Password
+        auth_success = False
+        if "assword:" in out or "Password:" in out:
+            # Send password
+            out = send_cmd(shell, pwd, patterns=("#", ">", "assword:", "denied", "closed"), timeout=15)
+            
+            if "assword:" in out or "denied" in out or "closed" in out:
+                logger.warning(f"[AUTH] Failed on {target_ip} with {user}. Retrying next credential...")
+                # Escape back to Agg prompt before next loop iteration
+                cleanup_failed_session(shell)
+                continue # Try next credential
+            else:
+                auth_success = True
+        else:
+            # If no password prompt (rare), check if we are in
+            if any(p in out for p in ["#", ">"]):
+                auth_success = True
+            else:
+                 logger.warning(f"[FAIL] Stuck at banner or unexpected state: {out[-50:]}")
+                 cleanup_failed_session(shell)
+                 continue # Retry might fix state, or try next cred
+
+        if auth_success:
+            # 3. Handle Enable if we landed in user exec mode
+            if ">" in out and "#" not in out:
+                out = send_cmd(shell, "enable", patterns=("assword:", "Password:", "#"), timeout=8)
+                if "assword:" in out or "Password:" in out: 
+                    send_cmd(shell, pwd, patterns=("#",), timeout=8)
+
+            # 4. Connection assumed successful
+            send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
+            logger.info(f"[CONNECTED] Logged into {target_ip} as {user}")
+            
+            # 5. Apply Config
+            if apply_config(shell, target_ip, new_ip, new_mask):
+                try: 
+                    send_cmd(shell, "exit", patterns=("#", ">"), timeout=5)
+                    send_cmd(shell, "exit", patterns=("#", ">"), timeout=2) 
+                except: pass
+                return 'success'
+            else:
+                try: send_cmd(shell, "exit", patterns=("#", ">"), timeout=5)
+                except: pass
+                return 'failed_config'
+
+    # If loop ends, all credentials failed
+    return 'failed_connection'
 
 def process_batch(client, shell, items: List[Dict]) -> Tuple[List[str], List[Dict]]:
     success_list = []
@@ -352,7 +405,7 @@ def main():
 
     logger.info("\n=== FINAL SUMMARY ===")
     logger.info(f"Successful: {len(final_success)}")
-    logger.info(f"Failed:       {len(final_failed_items)}")
+    logger.info(f"Failed:        {len(final_failed_items)}")
 
     if final_failed_items:
         logger.info("\n=== LIST OF FAILED DEVICES ===")
