@@ -3,23 +3,23 @@ import paramiko
 import time
 import sys
 import logging
-import getpass
-from typing import Tuple, List
+from typing import List
 
 # ========================= USER CONFIG =========================
-AGG_IP = ""
-USERNAME = ""
-PASSWORD = ""
+AGG_IP = "192.168.1.18"
 
-TIMEOUT = 10
-MAX_READ = 65535
+# Define your list of credentials to cycle through
+CREDENTIALS = [
+    {"user": "admin", "pass": "/2/_HKX6YvCGMwzAdJp"},
+    {"user": "admin", "pass": "cisco"}
+]
 
 # Retry configuration
 AGG_MAX_RETRIES = 3
-AGG_RETRY_DELAY = 5
-TARGET_MAX_RETRIES = 3
-TARGET_RETRY_DELAY = 5
-TARGET_SSH_TIMEOUT = 30 
+TARGET_MAX_RETRIES = 10     # Total cycles (Attempts)
+TARGET_RETRY_DELAY = 10     # Delay between full attempts
+SSH_TIMEOUT = 20            
+MAX_READ = 65535
 # ===============================================================
 
 # ========================= LOGGING SETUP =======================
@@ -56,139 +56,241 @@ fh.setLevel(logging.DEBUG)
 fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s'))
 logger.addHandler(fh)
 
-# ========================= HELPERS =============================
-def expect_prompt(shell, patterns=("#", ">"), timeout=TIMEOUT, log_output=True):
-    buf, end = "", time.time() + timeout
-    while time.time() < end:
+# ========================= CORE HELPERS ========================
+def wait_for_patterns(shell, patterns, timeout=SSH_TIMEOUT):
+    """
+    Reads output until one of the patterns is found.
+    Returns: (matched_pattern, buffer_text)
+    """
+    end_time = time.time() + timeout
+    buf = ""
+    while time.time() < end_time:
         if shell.recv_ready():
-            data = shell.recv(MAX_READ).decode("utf-8", "ignore")
-            buf += data
-            if log_output and data.strip():
-                logger.debug(f"[RECV] {data.strip()[-100:]}") 
+            chunk = shell.recv(MAX_READ).decode("utf-8", "ignore")
+            # logger.debug(f"[RAW] {repr(chunk)}") 
+            buf += chunk
             for p in patterns:
-                if p in buf: return buf
+                if p in buf: return p, buf
         time.sleep(0.05)
-    return buf
+    return None, buf
 
-def send_cmd(shell, cmd, patterns=("#", ">"), timeout=TIMEOUT):
-    logger.debug(f"[SEND] {cmd}")
-    shell.send(cmd + "\n")
-    return expect_prompt(shell, patterns, timeout)
-
-# ========================= CONNECTION LOGIC ====================
-def connect_to_agg(retry=0):
-    global AGG_IP, USERNAME, PASSWORD
-    if not AGG_IP: AGG_IP = input("Aggregation Switch IP: ").strip()
-    if not USERNAME: USERNAME = input("Username: ").strip()
-    if not PASSWORD: PASSWORD = getpass.getpass("Password: ").strip()
-
+def sync_to_agg_prompt(shell):
+    """
+    CRITICAL: Clears the buffer and ensures we are at a clean Jump Host prompt.
+    """
+    logger.debug("[SYNC] Cleaning buffer and syncing prompt...")
     try:
-        logger.info(f"[CONNECT] Attempt {retry+1}/{AGG_MAX_RETRIES} to Aggregation: {AGG_IP}")
+        while shell.recv_ready(): shell.recv(MAX_READ) # Flush
+        shell.send("\n")
+        
+        end_time = time.time() + 10
+        while time.time() < end_time:
+            if shell.recv_ready():
+                chunk = shell.recv(MAX_READ).decode("utf-8", "ignore")
+                if ">" in chunk or "#" in chunk:
+                    logger.debug("[SYNC] Prompt found. Line clear.")
+                    return True
+            time.sleep(0.1)
+    except OSError:
+        return False
+    
+    logger.warning("[SYNC] Failed to find prompt. Sending Ctrl+C...")
+    try:
+        shell.send("\x03"); time.sleep(1)
+    except: pass
+    return False
+
+def connect_to_agg():
+    """Connects to the Jump Host (Aggregation Switch)."""
+    global AGG_IP
+    if not AGG_IP: AGG_IP = input("Aggregation Switch IP: ").strip()
+
+    logger.info(f"[CONNECT] Connecting to Aggregation Switch: {AGG_IP}")
+    try:
+        # Use first credential for Agg Switch
+        user = CREDENTIALS[0]['user']
+        pwd = CREDENTIALS[0]['pass']
+        
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(AGG_IP, username=USERNAME, password=PASSWORD,
+        client.connect(AGG_IP, username=user, password=pwd, 
                        look_for_keys=False, allow_agent=False, timeout=10)
+        
         shell = client.invoke_shell()
-        expect_prompt(shell, ("#", ">"), timeout=15)
+        time.sleep(1)
+        if shell.recv_ready(): shell.recv(MAX_READ)
         
-        out = send_cmd(shell, "enable", patterns=("assword:", "#", ">"), timeout=5)
-        if "assword:" in out:
-            send_cmd(shell, PASSWORD, patterns=("#",), timeout=5)
+        if sync_to_agg_prompt(shell):
+            send_cmd(shell, "terminal length 0")
+            logger.info("[CONNECT] Connected to Aggregation Switch.")
+            return client, shell
+        else:
+            raise Exception("Did not get a valid prompt from Agg Switch")
             
-        send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
-        
-        logger.info(f"[CONNECT] Connected to Aggregation Switch.")
-        return client, shell
     except Exception as e:
         logger.error(f"[CONNECT] Failed: {e}")
-        if retry < AGG_MAX_RETRIES - 1:
-            time.sleep(AGG_RETRY_DELAY)
-            return connect_to_agg(retry+1)
-        raise
+        sys.exit(1)
 
-def process_hop(shell, target_ip, config_commands):
+def send_cmd(shell, cmd, patterns=("#", ">"), timeout=10):
+    logger.debug(f"[SEND] {cmd}")
+    shell.send(cmd + "\n")
+    p, buf = wait_for_patterns(shell, patterns, timeout)
+    return buf
+
+# ========================= LOGIC ENGINE ========================
+
+def attempt_enable(shell, current_pwd):
     """
-    Returns: 'success', 'failed_connection', 'failed_config'
+    Tries to elevate to Enable mode (#).
+    Cycles through all passwords if the first one fails.
     """
-    logger.info(f"\n--- Hop Attempt: {target_ip} ---")
+    logger.info("      > Attempting Enable...")
+    shell.send("enable\n")
     
-    # Clear buffer
-    if shell.recv_ready(): shell.recv(MAX_READ)
-
-    # 1. SSH Hop
-    shell.send(f"ssh -l {USERNAME} {target_ip}\n")
+    p, out = wait_for_patterns(shell, ["Password:", "#", "denied", "closed"])
     
-    # Define Explicit Failure Patterns from Logs
-    failure_patterns = [
-        "refused", 
-        "timed out", 
-        "unreachable", 
-        "Unknown host", 
-        "Connection closed", 
-        "not responding",    # Catch: "ote host not responding"
-        "Open failed", 
-        "Connection reset"
-    ]
+    if p == "#":
+        logger.info("      > Enable Successful (No password needed).")
+        return True
     
-    # We add failure patterns to the expect list so it returns IMMEDIATELY 
-    # instead of waiting for the full timeout when an error occurs.
-    all_patterns = ("(yes/no)?", "assword:", "#", ">") + tuple(failure_patterns)
+    if p == "closed" or p is None: return False
 
-    out = expect_prompt(shell, patterns=all_patterns, timeout=TARGET_SSH_TIMEOUT)
-    
-    # 2. Check for failures in the output
-    for error_str in failure_patterns:
-        if error_str in out:
-            logger.warning(f"[FAIL] SSH Log Error detected: '{error_str}'")
-            return 'failed_connection'
-
-    # 3. Handle SSH Negotiation
-    if "(yes/no)?" in out:
-        out = send_cmd(shell, "yes", patterns=("assword:", "#", ">"), timeout=10)
-
-    if "assword:" in out:
-        out = send_cmd(shell, PASSWORD, patterns=("#", ">", "assword:", "denied"), timeout=15)
-        if "assword:" in out or "denied" in out:
-            logger.error(f"[FAIL] Auth failed for {target_ip}")
-            return 'failed_connection'
-
-    # 4. Enable Mode (if needed)
-    if ">" in out and "#" not in out:
-        out = send_cmd(shell, "enable", patterns=("assword:", "#"), timeout=8)
-        if "assword:" in out: send_cmd(shell, PASSWORD, patterns=("#",), timeout=8)
-
-    # NO HOSTNAME CHECK HERE - RELYING PURELY ON LOGS
-    logger.info(f"[CONNECTED] Log check passed. Proceeding with config on {target_ip}")
-    
-    # 5. Push Config
-    try:
-        send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
-        send_cmd(shell, "configure terminal", patterns=("(config)#",), timeout=10)
+    if p == "Password:" or p == "denied":
+        # Try current password first, then others
+        passwords = [current_pwd]
+        seen = {current_pwd}
+        for c in CREDENTIALS:
+            if c['pass'] not in seen:
+                passwords.append(c['pass'])
+                seen.add(c['pass'])
         
-        for cmd in config_commands:
-            out = send_cmd(shell, cmd, patterns=("(config)#", "(config-"), timeout=10)
+        for i, pwd in enumerate(passwords):
+            logger.debug(f"[ENABLE] Trying password {i+1}/{len(passwords)}")
+            if i > 0: time.sleep(0.5)
+            shell.send(f"{pwd}\n")
+            
+            ep, eout = wait_for_patterns(shell, ["#", "Password:", "denied", "Bad secrets", "closed"])
+            
+            if ep == "#":
+                logger.info("      > Enable Successful!")
+                return True
+            elif ep == "closed":
+                return False
+    
+    logger.error("      > All enable passwords failed.")
+    return False
+
+def push_config_commands(shell, commands):
+    """Actually sends the list of configuration commands."""
+    try:
+        logger.info("      > Starting Configuration...")
+        send_cmd(shell, "terminal length 0")
+        send_cmd(shell, "configure terminal", patterns=["(config)#"])
+        
+        for cmd in commands:
+            out = send_cmd(shell, cmd, patterns=["(config)#", "(config-"])
             if "% Invalid" in out or "% Incomplete" in out:
                 logger.error(f"[CONFIG ERROR] Command rejected: {cmd}")
         
-        send_cmd(shell, "end", patterns=("#",), timeout=10)
-        send_cmd(shell, "write memory", patterns=("OK", "#"), timeout=20)
-        logger.info(f"[SUCCESS] Configured {target_ip}")
-        
-        # Exit back to Aggregation Switch
-        try: 
-            send_cmd(shell, "exit", patterns=("#", ">"), timeout=5)
-            # Sometimes need a second exit if enabled
-            send_cmd(shell, "exit", patterns=("#", ">"), timeout=2) 
-        except: pass
-        return 'success'
-
+        send_cmd(shell, "end")
+        send_cmd(shell, "write memory", patterns=["OK", "#"], timeout=30)
+        logger.info("      > Configuration Saved.")
+        return True
     except Exception as e:
-        logger.error(f"[ERROR] Config failed on {target_ip}: {e}")
-        try: send_cmd(shell, "end")
-        except: pass
-        try: send_cmd(shell, "exit")
-        except: pass
-        return 'failed_config'
+        logger.error(f"      > Config Exception: {e}")
+        return False
+
+def process_target(shell, target_ip, commands):
+    logger.info(f"\n--- Processing Target: {target_ip} ---")
+
+    # OUTER LOOP: ATTEMPTS (1 to 10)
+    for attempt in range(1, TARGET_MAX_RETRIES + 1):
+        logger.info(f"[ATTEMPT {attempt}/{TARGET_MAX_RETRIES}] Starting Credential Cycle...")
+
+        # INNER LOOP: CREDENTIALS
+        for cred_idx, cred in enumerate(CREDENTIALS):
+            user = cred['user']
+            pwd = cred['pass']
+            
+            # 1. Clean Session
+            if not sync_to_agg_prompt(shell):
+                logger.error("   > Sync failed (Jump Host might be busy). Skipping credential.")
+                continue
+
+            logger.info(f"   [Cred {cred_idx+1}] SSH to {target_ip} as {user}...")
+            shell.send(f"ssh -l {user} {target_ip}\n")
+            
+            # 2. Wait for Connection
+            pattern, output = wait_for_patterns(shell, ["Password:", "timed out", "refused", "unknown", "closed by foreign host"])
+            
+            # --- FAIL: NETWORK ---
+            if pattern == "timed out" or pattern is None:
+                logger.warning(f"      > Network Timeout. Moving to next credential...")
+                shell.send("\x03"); time.sleep(1)
+                continue 
+            
+            # --- FAIL: IMMEDIATE CLOSE ---
+            elif pattern == "closed by foreign host":
+                if target_ip in output or "closed" in output:
+                    logger.warning(f"      > Connection closed immediately. Moving to next credential...")
+                    time.sleep(2); continue 
+            
+            # --- SUCCESS: PASSWORD PROMPT ---
+            elif pattern == "Password:":
+                logger.debug(f"[DEBUG] Sending Password...")
+                time.sleep(0.5)
+                shell.send(f"{pwd}\n")
+                
+                login_p, login_out = wait_for_patterns(shell, ["#", ">", "closed by foreign host", "denied", "Connection closed", "Password:"])
+                
+                # --- FAIL: BAD PASSWORD ---
+                if login_p in ["closed by foreign host", "denied", "Connection closed", "Password:"]:
+                    logger.warning(f"      > Auth Failed ({login_p}). Moving to next credential...")
+                    shell.send("\x03"); time.sleep(1)
+                    continue 
+                
+                # --- SUCCESS: LOGGED IN ---
+                elif login_p in ["#", ">"]:
+                    logger.info("      > Login Successful!")
+                    
+                    # 1. HANDLE ENABLE (If needed)
+                    if ">" in login_p:
+                        if not attempt_enable(shell, pwd):
+                            logger.error("      > Enable failed. Logging out...")
+                            shell.send("exit\n"); time.sleep(1)
+                            continue 
+                    
+                    # 2. PUSH CONFIG
+                    config_success = push_config_commands(shell, commands)
+                    
+                    # 3. EXIT GRACEFULLY
+                    logger.info("      > Exiting device...")
+                    shell.send("exit\n"); time.sleep(1)
+                    
+                    # Check if we are back at Agg. If not, send one more exit.
+                    # We peek into buffer; if we see "closed" or Jump Host prompt, we are good.
+                    if not sync_to_agg_prompt(shell):
+                         # If sync fails, maybe we are still on device? Try one more exit.
+                         logger.debug("      > Still seems connected to device. Sending second exit.")
+                         shell.send("exit\n"); time.sleep(1)
+
+                    if config_success:
+                        return True # DONE
+                    else:
+                        logger.warning("      > Config had errors, but connection was okay.")
+                        return False
+
+            # --- FAIL: UNKNOWN ---
+            else:
+                logger.warning(f"      > Unexpected: {pattern}. Moving to next credential...")
+                shell.send("\x03"); time.sleep(1)
+                continue
+
+        logger.warning(f"   > Attempt {attempt} failed for all users. Waiting {TARGET_RETRY_DELAY}s...")
+        time.sleep(TARGET_RETRY_DELAY)
+
+    logger.error(f"Failed to configure {target_ip} after {TARGET_MAX_RETRIES} cycles.")
+    return False
 
 # ========================= MAIN ================================
 def main():
@@ -212,45 +314,34 @@ def main():
         sys.exit(1)
 
     # Connect to Agg
-    try:
-        client, shell = connect_to_agg()
-    except Exception:
-        sys.exit(1)
+    client, shell = connect_to_agg()
 
     successful = []
     failed = []
 
     # Processing Loop
     for idx, target in enumerate(targets, 1):
-        logger.info(f"\n=== Processing Device {idx}/{len(targets)}: {target} ===")
-        status = 'failed'
-        
-        for attempt in range(TARGET_MAX_RETRIES):
-            if attempt > 0:
-                logger.info(f"Retry {attempt+1}/{TARGET_MAX_RETRIES} for {target}...")
-            
-            # Connection Recovery
-            if getattr(shell, "closed", False) or not shell.get_transport().is_active():
-                try: 
-                    client, shell = connect_to_agg()
-                except: 
-                    sys.exit("Fatal: Aggregation switch died.")
+        # --- RECONNECT LOGIC ---
+        # Check if shell is dead before trying to process
+        if shell is None or not shell.get_transport().is_active():
+            logger.warning("!!! Aggregation Connection Lost. Reconnecting... !!!")
+            try:
+                client.close()
+            except: pass
+            try:
+                client, shell = connect_to_agg()
+                logger.info("!!! Reconnected Successfully !!!")
+            except Exception as e:
+                logger.critical(f"FATAL: Could not reconnect to Aggregation Switch: {e}")
+                sys.exit(1)
+        # -----------------------
 
-            res = process_hop(shell, target, commands)
-            
-            if res == 'success':
-                status = 'success'
-                break
-            elif res == 'failed_connection':
-                time.sleep(TARGET_RETRY_DELAY)
-            else:
-                time.sleep(TARGET_RETRY_DELAY)
-        
-        if status == 'success':
+        if process_target(shell, target, commands):
             successful.append(target)
         else:
-            logger.error(f"Failed to configure {target} after retries.")
             failed.append(target)
+
+    client.close()
 
     # Summary
     logger.info("\n" + "="*40)
@@ -264,9 +355,6 @@ def main():
         logger.info("\nFAILED DEVICES:")
         for f in failed:
             logger.error(f" - {f}")
-            
-    try: client.close()
-    except: pass
 
 if __name__ == "__main__":
     main()
