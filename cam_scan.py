@@ -2,848 +2,452 @@
 import paramiko
 import time
 import re
-import json
 import csv
 import logging
 import sys
-import io
+import warnings
 from datetime import datetime
 from collections import deque
 
+# Suppress Cryptography Deprecation Warnings
+warnings.filterwarnings("ignore")
+
 # ============================================================================
-# IDLE-SAFE LOGGING CONFIGURATION
+# LOGGING CONFIGURATION
 # ============================================================================
 
-class IDLESafeHandler(logging.StreamHandler):
-    def __init__(self):
-        super().__init__(sys.stdout)
-        self.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+class CleanConsoleFormatter(logging.Formatter):
+    def format(self, record):
+        timestamp = datetime.fromtimestamp(record.created).strftime('%H:%M:%S')
+        return f"[{timestamp}] {record.getMessage()}"
+
+def setup_logging():
+    log_filename = f"camera_discovery_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     
-    def emit(self, record):
-        try:
-            msg = self.format(record)
-            msg = msg.replace('✓', 'OK').replace('⏳', 'WAIT').replace('○', 'SKIP').replace('✗', 'ERROR').replace('⊗', 'X')
-            print(msg, flush=True)
-        except Exception:
-            self.handleError(record)
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+    
+    file_handler = logging.FileHandler(log_filename, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    root_logger.addHandler(file_handler)
+    
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(CleanConsoleFormatter())
+    root_logger.addHandler(console_handler)
 
-running_in_idle = 'idlelib.run' in sys.modules
-log_filename = f"camera_discovery_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    logging.getLogger("paramiko").setLevel(logging.WARNING)
+    
+    return logging.getLogger(__name__), log_filename
 
-if running_in_idle:
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[logging.FileHandler(log_filename, encoding='utf-8'), IDLESafeHandler()])
-    print("="*80)
-    print(f"RUNNING IN IDLE MODE - Logs: {log_filename}")
-    print("="*80)
-else:
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[logging.FileHandler(log_filename, encoding='utf-8'), logging.StreamHandler()])
-
-logger = logging.getLogger(__name__)
+logger = None 
 
 # ============================================================================
-# USER CONFIG
+# CONFIGURATION
 # ============================================================================
 
-SEED_SWITCH_IP = "192.168.1.100" 
-TIMEOUT = 150
-MAX_READ = 65535
+SEED_SWITCH_IP = "192.168.20.20" 
 CREDENTIAL_SETS = [
-    {"username": "admin",  "password": "cisco",  "enable": ""},
-    {"username": "admin",  "password": "C1sco",  "enable": ""},
-    {"username": "cisco",  "password": "cisco",  "enable": ""},
-    {"username": "admin",  "password": "S1mplex",  "enable": ""}
+    {"username": "admin",  "password": "flounder",  "enable": ""}
 ]
-AGG_MAX_RETRIES = 3
-AGG_RETRY_DELAY = 5
-CDP_LLDP_TIMEOUT = 35
 
-# --- RETRY CONFIGURATION ---
-SSH_HOP_RETRY_ATTEMPTS = 2          
-SSH_HOP_RETRY_BASE_DELAY = 1        
-SSH_HOP_USE_EXPONENTIAL_BACKOFF = False
-SSH_HOP_VERIFY_ROUTE = False        
+TIMEOUT = 120               
+SSH_CONNECT_TIMEOUT = 60    
+COMMAND_TIMEOUT = 60        
+JUMP_RETRIES = 20           
 
-# --- SSH TIMING CONFIGURATION ---
-SSH_CONNECT_TIMEOUT = 30  
-
-# --- MAC TABLE POLLING CONFIGURATION ---
-MAC_POLL_INTERVAL = 5            
-MAC_POLL_MAX_ATTEMPTS = 999999   
-MAC_POLL_INITIAL_WAIT = 15       
-MAC_POLL_BATCH_SIZE = 100        
-MAC_POLL_BATCH_PAUSE = 2         
-MAC_POLL_HARD_TIMEOUT = 45       
-
-# --- INDIRECT DISCOVERY CONFIGURATION ---
-ENABLE_INDIRECT_DISCOVERY = True    
-INDIRECT_DISCOVERY_MIN_MACS = 1     
-INDIRECT_DISCOVERY_MAX_MACS = 100   
-
-#--- SWITCH TYPE DETECTION BY HARDWARE MODEL ---
-HARDWARE_MODEL_MAPPING = {
-    "3850": "AGGREGATE", "WS-C3850": "AGGREGATE",
-    "3650": "EDGE", "WS-C3650": "EDGE",
-    "9300": "EDGE", "C9300": "EDGE",
-    "IE-": "EDGE", "IE-3": "EDGE", "IE-4": "EDGE", "IE-5": "EDGE", "ESS-": "EDGE", "CGS-": "EDGE",
+LINUX_DISABLED_ALGORITHMS = {
+    'pubkeys': ['rsa-sha2-512', 'rsa-sha2-256']
 }
-
-# ============================================================================
-# GLOBAL VARIABLES
-# ============================================================================
 
 PROMPT_RE = re.compile(r"(?m)^[^\r\n>\s][^\r\n>]*[>#]\s?$")
 
-visited_switches = set()
-discovered_aggregates = set()
-aggregate_hostnames = {}
+# GLOBAL STATE
+visited_ips = set()
+visited_hostnames = set()
 camera_data = []
-failed_switches = []
-
-discovery_stats = {
-    "switches_attempted": 0, "switches_successfully_scanned": 0,
-    "switches_failed_auth": 0, "switches_failed_unreachable": 0,
-    "switches_failed_timeout": 0, "switches_failed_other": 0,
-    "aggregates_reconnections": 0, "total_cameras_found": 0,
-    "switches_retried_from_seed": 0, "switches_recovered_on_retry": 0,
-    "total_ports_no_mac": 0,
-    "indirect_discoveries": 0, "switches_with_indirect_discovery": 0,
-    "indirect_upgraded_to_direct": 0, "duplicates_removed": 0,
-    "switches_by_type": {
-        "EDGE": {"attempted": 0, "successful": 0, "failed": 0},
-        "SERVER": {"attempted": 0, "successful": 0, "failed": 0},
-        "OTHER": {"attempted": 0, "successful": 0, "failed": 0},
-        "AGGREGATE": {"attempted": 0, "successful": 0, "failed": 0}
-    },
-    "failure_details": []
-}
-
 agg_client = None
 agg_shell = None
-agg_creds = None
-agg_hostname = None
-session_depth = 0
-device_creds = {}
-hostname_to_ip = {}
+seed_hostname = "Unknown"
 
 # ============================================================================
-# FILTERING LOGIC
+# CORE UTILITIES
 # ============================================================================
-
-def is_device_a_switch(hostname, platform_desc):
-    h_lower = hostname.lower() if hostname else ""
-    p_lower = platform_desc.lower() if platform_desc else ""
-    
-    # 1. EXPANDED BLACKLIST
-    blacklist = [
-        "axis", "camera", "cam-", "cloudcam", "mic", "audio", "video", 
-        "phone", "polycom", "mitel", "yealink", "snom", "audiocodes",
-        "printer", "workstation", "laptop", "linux", "ubuntu", 
-        "windows", "vmware", "apc", "ups", "pdu",
-        "air-", "airon" 
-    ]
-    
-    for term in blacklist:
-        if term in h_lower: return False
-        if term in p_lower: return False
-
-    # 2. RELAXED WHITELIST
-    whitelist = [
-        "cisco", "catalyst", "nexus", "ios", "ws-", "c9", "ie-", "n5k", "n7k", "sf", "sg", "me-"
-    ]
-    
-    for term in whitelist:
-        if term in p_lower: return True
-        
-    if "switch" in p_lower or "bridge" in p_lower: return True
-    
-    return False
-
-# ============================================================================
-# HELPER CLASSES AND FUNCTIONS
-# ============================================================================
-
-class NetworkConnectionError(Exception):
-    def __init__(self, message, retry_allowed=False, reconnect_needed=False):
-        super().__init__(message)
-        self.retry_allowed = retry_allowed
-        self.reconnect_needed = reconnect_needed
 
 def _drain(shell):
-    time.sleep(0.05)
+    time.sleep(0.1) 
     buf = ""
     while shell and not shell.closed and shell.recv_ready():
         try:
-            buf += shell.recv(MAX_READ).decode("utf-8", "ignore")
-        except Exception:
-            break
-        time.sleep(0.02)
+            chunk = shell.recv(65535).decode("utf-8", "ignore")
+            buf += chunk
+        except: break
     return buf
 
-def expect_prompt(shell, timeout=TIMEOUT):
-    buf, end = "", time.time() + timeout
-    while time.time() < end:
-        if shell and not shell.closed and shell.recv_ready():
-            try:
-                buf += shell.recv(MAX_READ).decode("utf-8", "ignore")
-            except Exception:
-                break
-            if PROMPT_RE.search(buf):
-                return buf
-        else:
-            time.sleep(0.05)
-    return buf
-
-def send_cmd(shell, cmd, timeout=TIMEOUT, silent=False):
-    if not silent:
-        logger.debug(f"CMD: {cmd}")
-    if not shell or shell.closed:
-        raise NetworkConnectionError("SSH shell is closed", reconnect_needed=True)
+def send_cmd(shell, cmd, timeout=COMMAND_TIMEOUT, silent=False):
+    if not silent: logger.debug(f"CMD: {cmd}")
     try:
-        _ = _drain(shell)
+        _drain(shell)
         shell.send(cmd + "\n")
-        return expect_prompt(shell, timeout=timeout)
+        time.sleep(0.5)
+        
+        buf = ""
+        end = time.time() + timeout
+        while time.time() < end:
+            if shell.recv_ready():
+                chunk = shell.recv(65535).decode("utf-8", "ignore")
+                if chunk: logger.debug(f"[RX] {repr(chunk)}")
+                buf += chunk
+                if PROMPT_RE.search(buf): return buf
+            time.sleep(0.2)
+        return buf
     except Exception as e:
-        logger.error(f"Exception in send_cmd('{cmd}'): {e}")
-        raise NetworkConnectionError(f"Send command failed: {e}", reconnect_needed=True)
-
-def _ensure_enable(shell, enable_candidates, timeout=10):
-    out = send_cmd(shell, "", timeout=3, silent=True)
-    if out.strip().endswith("#"): return True
-    en = send_cmd(shell, "enable", timeout=5, silent=True)
-    if en.strip().endswith("#"): return True
-    if re.search(r"[Pp]assword:", en):
-        for pw in enable_candidates:
-            if not pw: continue
-            test = send_cmd(shell, pw, timeout=timeout, silent=True)
-            if test.strip().endswith("#"): return True
-        return False
-    return send_cmd(shell, "", timeout=3, silent=True).strip().endswith("#")
-
-def verify_aggregate_connection():
-    global agg_shell
-    try:
-        if not agg_shell or agg_shell.closed: return False
-        agg_shell.send("\n")
-        time.sleep(0.3)
-        return bool(PROMPT_RE.search(agg_shell.recv(MAX_READ).decode("utf-8", "ignore"))) if agg_shell.recv_ready() else False
-    except Exception:
-        return False
+        logger.error(f"Command failed: {cmd} - {e}")
+        return ""
 
 def get_hostname(shell):
-    shell.send("\n")
-    time.sleep(0.2)
-    buff = expect_prompt(shell, timeout=4)
-    for line in reversed(buff.splitlines()):
-        line = line.strip()
-        if line.endswith('#') or line.endswith('>'):
-            return line[:-1]
+    try:
+        _drain(shell)
+        shell.send("\n")
+        time.sleep(1)
+        buf = ""
+        for _ in range(20):
+            if shell.recv_ready():
+                chunk = shell.recv(65535).decode("utf-8", "ignore")
+                buf += chunk
+                if PROMPT_RE.search(buf): break
+            time.sleep(0.1)
+            
+        for line in reversed(buf.splitlines()):
+            line = line.strip()
+            if line.endswith('#') or line.endswith('>'):
+                hostname = line[:-1].strip()
+                if hostname: return hostname
+    except: pass
     return "Unknown"
 
-def _connect_to_aggregate_internal():
-    global agg_client, agg_shell, agg_creds, agg_hostname
-    last_err = None
+def clean_hostname(raw_name):
+    if not raw_name: return ""
+    return raw_name.split('.')[0].upper()
+
+def normalize_intf(interface_name):
+    if not interface_name: return ""
+    name = interface_name.lower().strip()
+    
+    if name.startswith("gi") and not name.startswith("gigabit"):
+        return name.replace("gi", "gigabitethernet")
+    if name.startswith("te") and not name.startswith("tengigabit"):
+        return name.replace("te", "tengigabitethernet")
+    if name.startswith("fa") and not name.startswith("fast"):
+        return name.replace("fa", "fastethernet")
+    if name.startswith("po") and not name.startswith("port-channel"):
+        return name.replace("po", "port-channel")
+        
+    return name
+
+# ============================================================================
+# CONNECTION
+# ============================================================================
+
+def connect_to_seed():
+    global agg_client, agg_shell, seed_hostname
+    logger.info(f"➜ Connecting to Seed Switch {SEED_SWITCH_IP}...")
     for cred in CREDENTIAL_SETS:
         try:
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(SEED_SWITCH_IP, username=cred["username"], password=cred["password"], look_for_keys=False, allow_agent=False, timeout=15)
-            shell = client.invoke_shell()
-            expect_prompt(shell, timeout=TIMEOUT)
-            if not _ensure_enable(shell, [cred.get("enable"), cred.get("password")], timeout=8):
-                client.close()
-                continue
+            client.connect(SEED_SWITCH_IP, username=cred["username"], password=cred["password"], 
+                           allow_agent=False, timeout=20, disabled_algorithms=LINUX_DISABLED_ALGORITHMS)
+            client.get_transport().set_keepalive(15)
+            shell = client.invoke_shell(width=1000, height=1000)
+            
+            time.sleep(1)
+            while not shell.recv_ready(): time.sleep(1)
+            
             send_cmd(shell, "terminal length 0", silent=True)
-            agg_client = client
-            agg_shell = shell
-            agg_creds = cred
-            agg_hostname = get_hostname(agg_shell) or "UNKNOWN"
-            logger.info(f"Seed hostname: {agg_hostname}")
-            return SEED_SWITCH_IP
-        except Exception as e:
-            last_err = e
-    raise last_err or Exception("Unable to connect")
+            if not send_cmd(shell, "", silent=True).strip().endswith("#"):
+                _drain(shell)
+                shell.send("enable\n")
+                time.sleep(1)
+                shell.send(cred["password"] + "\n")
+                time.sleep(1)
+            
+            seed_hostname = get_hostname(shell)
+            visited_hostnames.add(clean_hostname(seed_hostname))
+            visited_ips.add(SEED_SWITCH_IP)
+            agg_client, agg_shell = client, shell
+            logger.info(f"✓ Connected to Seed: {seed_hostname}")
+            return True
+        except: pass
+    return False
 
-def connect_to_seed(retry_count=0):
-    try:
-        return _connect_to_aggregate_internal()
-    except Exception as e:
-        if retry_count < AGG_MAX_RETRIES - 1:
-            time.sleep(AGG_RETRY_DELAY)
-            return connect_to_seed(retry_count + 1)
-        raise NetworkConnectionError(f"Failed after {AGG_MAX_RETRIES} attempts: {e}")
-
-def reconnect_to_aggregate(reason=""):
-    global agg_client
-    if reason: logger.warning(f"[RECONNECT] {reason}")
-    try: agg_client.close() 
-    except: pass
-    return _connect_to_aggregate_internal()
-
-def cleanup_and_return_to_parent(expected_parent, max_attempts=3):
-    global agg_shell, session_depth, agg_hostname
+def explicit_jump_poll(target_ip):
+    global agg_shell
+    logger.info(f"➜ Jumping from Seed -> {target_ip}")
     
-    current = get_hostname(agg_shell)
-    if current == expected_parent: return True
-    
-    if current == agg_hostname:
-        logger.warning(f"Drifted back to SEED ({agg_hostname}). Cannot return to child {expected_parent}.")
-        session_depth = 0
-        return False
+    for cred in CREDENTIAL_SETS:
+        try:
+            _drain(agg_shell)
+            logger.debug(f"[TX] ssh -l {cred['username']} {target_ip}")
+            agg_shell.send(f"ssh -l {cred['username']} {target_ip}\n")
+            
+            buffer = ""
+            start_time = time.time()
+            
+            while (time.time() - start_time) < SSH_CONNECT_TIMEOUT:
+                if agg_shell.recv_ready():
+                    chunk = agg_shell.recv(65535).decode("utf-8", "ignore")
+                    buffer += chunk
+                    logger.debug(f"[POLL-RX] {repr(chunk)}") 
+                
+                if "assword:" in buffer:
+                    logger.debug("Found 'Password:' prompt.")
+                    agg_shell.send(cred["password"] + "\n")
+                    buffer = "" 
+                    time.sleep(1)
+                    continue
 
-    for _ in range(max_attempts):
-        agg_shell.send("exit\n")
-        time.sleep(1)
-        _drain(agg_shell)
-        session_depth = max(0, session_depth - 1)
-        
-        current = get_hostname(agg_shell)
-        if current == expected_parent: return True
-        if current == agg_hostname:
-            session_depth = 0
+                if "yes/no" in buffer:
+                    logger.debug("Found 'yes/no'. Sending yes.")
+                    agg_shell.send("yes\n")
+                    buffer = ""
+                    time.sleep(1)
+                    continue
+                
+                if PROMPT_RE.search(buffer):
+                    lines = buffer.splitlines()
+                    if len(lines) > 1 or (len(lines) == 1 and "ssh" not in lines[0]):
+                         current_host = get_hostname(agg_shell)
+                         clean_host = clean_hostname(current_host)
+                         clean_seed = clean_hostname(seed_hostname)
+                         
+                         if clean_host != clean_seed and current_host != "Unknown":
+                             logger.info(f"  ✓ Logged into {current_host}")
+                             
+                             send_cmd(agg_shell, "terminal length 0", silent=True)
+                             if not send_cmd(agg_shell, "", silent=True).strip().endswith("#"):
+                                 agg_shell.send("enable\n"); time.sleep(1)
+                                 agg_shell.send(cred["password"] + "\n"); time.sleep(1)
+                             
+                             visited_hostnames.add(clean_host)
+                             visited_ips.add(target_ip)
+                             return current_host
+                         elif clean_host == clean_seed:
+                             if "Connection refused" in buffer or "closed by" in buffer:
+                                 logger.warning(f"  ✖ Connection failed to {target_ip}")
+                                 return False
+
+                time.sleep(1)
+
+            logger.warning(f"  ✖ Timeout waiting for jump to {target_ip}")
+            return_to_seed("Timeout")
             return False
             
+        except Exception as e:
+            logger.error(f"Jump exception: {e}")
+            return_to_seed("Exception")
+            
     return False
 
-# --- UPDATED: Loop through all credentials even if one fails ---
-def ssh_to_device(target_ip, expected_hostname=None, parent_hostname=None):
-    global agg_shell, session_depth, device_creds, hostname_to_ip
-    if not parent_hostname: parent_hostname = get_hostname(agg_shell)
+def return_to_seed(context):
+    global agg_shell
+    logger.debug(f"Returning to Seed ({context})...")
+    
+    # Send Ctrl+C first to clear any stuck command lines
+    agg_shell.send("\x03") 
+    time.sleep(0.5)
 
+    for i in range(5):
+        # Check if we see the seed hostname in a quick check
+        _drain(agg_shell)
+        agg_shell.send("\n")
+        time.sleep(0.5)
+        
+        # Read whatever is there
+        if agg_shell.recv_ready():
+            buf = agg_shell.recv(65535).decode("utf-8", "ignore")
+            # Loose match is safer here
+            if seed_hostname in buf:
+                logger.debug("Back at Seed (Confirmed).")
+                return True
+
+        logger.debug(f"Sending exit (attempt {i+1})...")
+        agg_shell.send("exit\n")
+        time.sleep(1.0)
+    
+    logger.critical("Stuck! Reconnecting...")
+    try: agg_client.close()
+    except: pass
+    connect_to_seed()
+    return False
+
+# ============================================================================
+# SCANNER
+# ============================================================================
+
+def scan_current_switch(switch_ip, switch_name):
+    global agg_shell
+    neighbors_to_visit = []
+    bridge_interfaces = set()
+    found_hostnames_this_scan = set()
+
+    # 1. CDP
+    logger.info(f"  ○ Scanning neighbors (CDP)...")
     try:
-        brief = send_cmd(agg_shell, "show ip interface brief", timeout=5, silent=True)
-        for line in brief.splitlines():
-            parts = line.split()
-            if len(parts) >= 2:
-                current_ip = parts[1]
-                if current_ip == target_ip and "up" in line.lower():
-                    logger.info(f"Target IP {target_ip} is current switch (Self-detection)")
-                    return None
+        cdp_out = send_cmd(agg_shell, "show cdp neighbors detail", timeout=60)
+        blocks = re.split(r"-{10,}", cdp_out)
+        for block in blocks:
+            ip_m = re.search(r"IP address: (\d+\.\d+\.\d+\.\d+)", block)
+            intf_m = re.search(r"Interface: (\S+),", block)
+            name_m = re.search(r"Device ID:\s*(.+)", block)
+            
+            if ip_m and intf_m:
+                ip = ip_m.group(1)
+                raw_intf = intf_m.group(1).split(',')[0]
+                norm_intf = normalize_intf(raw_intf)
+                bridge_interfaces.add(norm_intf)
+                
+                hostname = clean_hostname(name_m.group(1).strip()) if name_m else "Unknown"
+                if hostname != "Unknown": found_hostnames_this_scan.add(hostname)
+                
+                if ip not in visited_ips and ip != SEED_SWITCH_IP:
+                    neighbors_to_visit.append(ip)
+                    logger.info(f"    [CDP] Queueing {hostname} ({ip})")
+    except: pass
+
+    # 2. LLDP
+    try:
+        lldp_out = send_cmd(agg_shell, "show lldp neighbors detail", timeout=60)
+        blocks = re.split(r"-{10,}", lldp_out)
+        for block in blocks:
+            ip_m = re.search(r"IP: (\d+\.\d+\.\d+\.\d+)", block)
+            intf_m = re.search(r"Local Intf: (\S+)", block)
+            name_m = re.search(r"System Name:\s*(.+)", block)
+            cap_m = re.search(r"Enabled Capabilities: (.*)", block)
+            
+            if ip_m and intf_m and cap_m:
+                ip = ip_m.group(1)
+                raw_intf = intf_m.group(1)
+                norm_intf = normalize_intf(raw_intf)
+                hostname = clean_hostname(name_m.group(1).strip()) if name_m else "Unknown"
+                
+                if 'B' in cap_m.group(1):
+                    bridge_interfaces.add(norm_intf)
+                    if hostname in found_hostnames_this_scan: continue
+                    if ip not in visited_ips and ip != SEED_SWITCH_IP and ip not in neighbors_to_visit:
+                        neighbors_to_visit.append(ip)
+                        found_hostnames_this_scan.add(hostname)
+                        logger.info(f"    [LLDP] Queueing {hostname} ({ip})")
     except: pass
     
-    for attempt in range(1, SSH_HOP_RETRY_ATTEMPTS + 1):
-        if attempt > 1: 
-            logger.info(f"   ...retrying in {SSH_HOP_RETRY_BASE_DELAY}s")
-            time.sleep(SSH_HOP_RETRY_BASE_DELAY)
-            
-        logger.info(f"[RETRY] SSH hop {attempt}/{SSH_HOP_RETRY_ATTEMPTS} to {target_ip}")
-        
-        if not verify_aggregate_connection(): 
-            raise NetworkConnectionError("Lost connection to parent switch", reconnect_needed=True)
-            
-        current_host = get_hostname(agg_shell)
-        if current_host != parent_hostname:
-            logger.warning(f"Drift detected (on {current_host}, expected {parent_hostname}). Correcting...")
-            cleanup_and_return_to_parent(parent_hostname)
-
-        if SSH_HOP_VERIFY_ROUTE:
-             if not verify_ip_reachable_quick(target_ip, agg_shell):
-                 logger.warning(f"Target {target_ip} not reachable via ping. Skipping SSH.")
-                 return False
-
-        for idx, cred in enumerate(CREDENTIAL_SETS, 1):
-            try:
-                agg_shell.send(f"ssh -l {cred['username']} {target_ip}\n")
-                
-                end_time = time.time() + SSH_CONNECT_TIMEOUT 
-                pw_sent = False
-                success = False
-                
-                while time.time() < end_time:
-                    if agg_shell.recv_ready():
-                        out = agg_shell.recv(MAX_READ).decode('utf-8', 'ignore')
-                        if "assword:" in out and not pw_sent:
-                            agg_shell.send(cred['password'] + "\n")
-                            pw_sent = True
-                            end_time = time.time() + 10 
-                        elif "(yes/no)" in out:
-                            agg_shell.send("yes\n")
-                        elif PROMPT_RE.search(out):
-                            new_host = get_hostname(agg_shell)
-                            if new_host != parent_hostname:
-                                logger.info(f"   Login successful: {new_host}")
-                                _ensure_enable(agg_shell, [cred.get('enable'), cred['password']])
-                                send_cmd(agg_shell, "terminal length 0", silent=True)
-                                session_depth += 1
-                                return True
-                            else:
-                                # Sometimes prompt reappears if login fails/timeouts quickly
-                                break
-                    time.sleep(0.1)
-
-            except Exception as e:
-                logger.debug(f"SSH attempt {idx} error: {e}")
-
-            # --- FAIL-SAFE: Abort hanging connection ---
-            logger.debug(f"   Cred {idx} failed/timeout. Sending Interrupts...")
-            agg_shell.send("\x03") 
-            time.sleep(1.0)
-            agg_shell.send("\x1a")
-            time.sleep(0.5)
-            agg_shell.send("\n")   
-            _drain(agg_shell)
-            
-            # Check prompt status
-            check_host = get_hostname(agg_shell)
-            
-            if check_host == parent_hostname:
-                # Prompt recovered. Try next credential.
-                logger.warning(f"   Credential {idx} failed. Prompt recovered. Trying next...")
-                continue 
-            else:
-                # Prompt lost. This is fatal for this session.
-                logger.warning(f"   Failed to recover prompt (On {check_host}, expected {parent_hostname}). Aborting device.")
-                return False 
-            
-    return False
-
-def verify_ip_reachable_quick(target_ip, shell, timeout=3):
+    # 3. MAC SCANNING
+    logger.info(f"  ○ Harvesting MACs (skipping {len(bridge_interfaces)} uplinks)...")
+    count = 0
     try:
-        ping_out = send_cmd(shell, f"ping {target_ip} timeout 1 repeat 2", timeout=timeout, silent=True)
-        return bool(re.search(r"Success rate is [1-9]|!+|\d+ packets received", ping_out))
-    except: return True
-
-def exit_device():
-    global agg_shell, session_depth
-    if not agg_shell or agg_shell.closed: return False
-    try:
-        agg_shell.send("exit\n"); time.sleep(0.6); _drain(agg_shell)
-        session_depth = max(0, session_depth - 1)
-        return True
-    except: return False
-
-def convert_mac_format(mac):
-    clean = mac.replace(".", "").upper()
-    return ":".join([clean[i:i+2] for i in range(0, 12, 2)])
-
-def normalize_interface_name(intf):
-    if not intf: return ""
-    intf = intf.strip()
-    replacements = [
-        ('TenGigabitEthernet', 'tengigabitethernet'), ('TenGigE', 'tengigabitethernet'),
-        ('GigabitEthernet', 'gigabitethernet'), ('GigE', 'gigabitethernet'), ('Gi', 'gigabitethernet'),
-        ('FastEthernet', 'fastethernet'), ('Fa', 'fastethernet'),
-        ('TwentyFiveGigE', 'twentyfivegigabitethernet'), ('Twe', 'twentyfivegigabitethernet'),
-        ('Te', 'tengigabitethernet')
-    ]
-    for short, full in replacements:
-        if intf.startswith(short) and len(intf) > len(short):
-            if intf[len(short)].isdigit() or intf[len(short)] in ['/', ' ']:
-                return (full + intf[len(short):]).replace(' ', '').lower()
-    return intf.lower()
-
-def get_switch_hardware_model(shell):
-    try:
-        ver = send_cmd(shell, "show version", timeout=10, silent=True)
-        if m := re.search(r"Model [Nn]umber\s*:\s*(\S+)", ver): return m.group(1)
-        if m := re.search(r"cisco\s+(\S+)\s+\(", ver): return m.group(1)
-        return None
-    except: return None
-
-def determine_switch_type(hostname, hardware_model=None):
-    if not hostname: return "OTHER"
-    if hardware_model:
-        if "3850" in hardware_model: return "AGGREGATE"
-        if "9300" in hardware_model: return "SERVER" if "SRV" in hostname.upper() else "EDGE"
-    if "SMSAGG" in hostname.upper(): return "AGGREGATE"
-    return "EDGE"
-
-def is_aggregate_switch(hostname, hardware_model=None):
-    return determine_switch_type(hostname, hardware_model) == "AGGREGATE"
-
-def parse_cdp_neighbors(output):
-    neighbors = []
-    blocks = re.split(r"-{10,}", output)
-    for block in blocks:
-        block = block.strip()
-        if not block or "Device ID:" not in block: continue
-        nbr = {"hostname": None, "mgmt_ip": None, "local_intf": None}
+        agg_shell.send("clear mac address-table dynamic\n")
+        time.sleep(1); _drain(agg_shell)
         
-        if m := re.search(r"Device ID:\s*(\S+)", block): nbr["hostname"] = m.group(1)
-        
-        # Central Filter
-        platform_match = re.search(r"Platform:\s*(.+?)(?:,|$)", block, re.I)
-        platform = platform_match.group(1) if platform_match else ""
-        if not is_device_a_switch(nbr["hostname"], platform): continue
+        int_out = send_cmd(agg_shell, "show ip interface brief")
+        interfaces = []
+        for line in int_out.splitlines():
+            parts = line.split()
+            if len(parts) >= 6 and "up" in parts[4].lower() and "up" in parts[5].lower():
+                raw_port = parts[0]
+                if "Vlan" not in raw_port and "Loopback" not in raw_port:
+                    norm_port = normalize_intf(raw_port)
+                    if norm_port not in bridge_interfaces:
+                        interfaces.append(raw_port)
 
-        if m := re.search(r"Interface:\s*([^\s,]+)", block): nbr["local_intf"] = m.group(1).rstrip(',')
-        if m := re.search(r"(?:Entry|Management|IP)\s+address(?:\(es\))?:.*?\s+(\d+\.\d+\.\d+\.\d+)", block, re.S | re.I): 
-            nbr["mgmt_ip"] = m.group(1)
-        elif m := re.findall(r"\d+\.\d+\.\d+\.\d+", block):
-            for ip in m:
-                if not ip.startswith("0.") and not ip.startswith("224."):
-                    nbr["mgmt_ip"] = ip; break
-        
-        if nbr["hostname"] and nbr["local_intf"]: neighbors.append(nbr)
-    return neighbors
-
-def parse_lldp_neighbors(output):
-    neighbors = []
-    blocks = re.split(r'[-]{40,}', output)
-    for block in blocks:
-        if "Local Intf:" not in block: continue
-        nbr = {"hostname": None, "mgmt_ip": None, "local_intf": None}
-        
-        if m := re.search(r'^System Name:\s*(.+?)$', block, re.M): 
-            nbr["hostname"] = m.group(1).strip().strip('"')
-        
-        if m := re.search(r'^Local Intf:\s*(\S+)', block, re.M): nbr["local_intf"] = m.group(1)
-        
-        sys_desc = ""
-        if m := re.search(r'^System Description:\s*\n([\s\S]+?)(?=^Time|^System)', block, re.M):
-            sys_desc = m.group(1).strip()
-            
-        # Central Filter
-        if not is_device_a_switch(nbr["hostname"], sys_desc): continue
-        
-        if m := re.search(r'IP:\s*(\d+\.\d+\.\d+\.\d+)', block): nbr["mgmt_ip"] = m.group(1)
-        if not nbr["mgmt_ip"] and (m := re.search(r'Address:\s*(\d+\.\d+\.\d+\.\d+)', block)): nbr["mgmt_ip"] = m.group(1)
-        
-        if nbr["hostname"] and nbr["local_intf"]: neighbors.append(nbr)
-    return neighbors
-
-def get_interface_status(shell):
-    out = send_cmd(shell, "show ip interface brief", timeout=10)
-    up_intfs = []
-    excludes = ("Vlan", "Loopback", "Tunnel", "Null", "Po", "Ap", "Mgmt", "Gi0/0", "GigabitEthernet0/0")
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) > 4 and parts[0].startswith(excludes): continue
-        if len(parts) > 4 and "up" in parts[4].lower() and "up" in parts[5].lower():
-            up_intfs.append(parts[0])
-    return up_intfs
-
-def parse_mac_table_interface(raw):
-    entries = []
-    for line in raw.splitlines():
-        parts = line.split()
-        if len(parts) >= 4 and parts[0].isdigit() and "." in parts[1]:
-             entries.append({"vlan": parts[0], "mac_address": parts[1], "port": parts[-1]})
-    return entries
-
-def poll_port_for_mac(shell, interface):
-    logger.info(f"  [POLL] {interface} - waiting for MAC address...")
-    start_time = time.time()
-    while (time.time() - start_time) < MAC_POLL_HARD_TIMEOUT:
-        try:
-            res = send_cmd(shell, f"show mac address-table interface {interface}", timeout=5, silent=True)
-            entries = parse_mac_table_interface(res)
-            if entries:
-                logger.info(f"  [OK] {interface}: MAC found")
-                return entries
-            time_left = MAC_POLL_HARD_TIMEOUT - (time.time() - start_time)
-            if time_left > 0: time.sleep(min(MAC_POLL_INTERVAL, time_left))
-        except Exception as e:
-            time.sleep(1)
-    logger.error(f"  [CRITICAL] {interface}: Hard timeout after {MAC_POLL_HARD_TIMEOUT}s")
-    discovery_stats["total_ports_no_mac"] += 1
-    return [{"vlan": "UNKNOWN", "mac_address": "UNKNOWN", "port": interface}]
-
-def discover_cameras_from_switch(shell, switch_hostname, switch_type="UNKNOWN"):
-    logger.info("="*80)
-    logger.info(f"Scanning {switch_type} switch: {switch_hostname}")
-    logger.info("="*80)
-
-    hardware_model = get_switch_hardware_model(shell)
-    if hardware_model:
-        detected_type = determine_switch_type(switch_hostname, hardware_model)
-        if detected_type != switch_type: switch_type = detected_type
-
-    send_cmd(shell, "clear mac address-table dynamic", timeout=10)
-    time.sleep(MAC_POLL_INITIAL_WAIT)
-
-    downstream_candidates = []
-    neighbor_ports_normalized = set()
-    
-    cdp_out = send_cmd(shell, "show cdp neighbors detail", timeout=CDP_LLDP_TIMEOUT, silent=True)
-    if "CDP is not enabled" not in cdp_out:
-        for nbr in parse_cdp_neighbors(cdp_out):
-            if nbr.get("local_intf"):
-                neighbor_ports_normalized.add(normalize_interface_name(nbr["local_intf"]))
-                if nbr.get("mgmt_ip"):
-                    downstream_candidates.append(nbr)
-                    logger.info(f"NEIGHBOR (CDP): {nbr['local_intf']} -> {nbr['hostname']} ({nbr['mgmt_ip']})")
-                else:
-                    logger.warning(f"NEIGHBOR (CDP): {nbr['local_intf']} -> {nbr['hostname']} (NO IP) - Queuing Indirect Scan")
-                    downstream_candidates.append(nbr)
-
-    lldp_out = send_cmd(shell, "show lldp neighbors detail", timeout=CDP_LLDP_TIMEOUT, silent=True)
-    if "LLDP is not enabled" not in lldp_out:
-        for nbr in parse_lldp_neighbors(lldp_out):
-            if nbr.get("local_intf"):
-                norm = normalize_interface_name(nbr["local_intf"])
-                if norm not in neighbor_ports_normalized:
-                    neighbor_ports_normalized.add(norm)
-                    if nbr.get("mgmt_ip"):
-                        downstream_candidates.append(nbr)
-                        logger.info(f"NEIGHBOR (LLDP): {nbr['local_intf']} -> {nbr['hostname']} ({nbr['mgmt_ip']})")
-                    else:
-                        logger.warning(f"NEIGHBOR (LLDP): {nbr['local_intf']} -> {nbr['hostname']} (NO IP) - Queuing Indirect Scan")
-                        downstream_candidates.append(nbr)
-
-    up_interfaces = get_interface_status(shell)
-    ports_to_scan = [p for p in up_interfaces if normalize_interface_name(p) not in neighbor_ports_normalized]
-    
-    logger.info(f"Scanning {len(ports_to_scan)} ports (excluding {len(neighbor_ports_normalized)} uplinks)...")
-
-    for idx, intf in enumerate(ports_to_scan, 1):
-        logger.info(f"  Port {idx}/{len(ports_to_scan)}: {intf}")
-        entries = poll_port_for_mac(shell, intf)
-        
-        for entry in entries:
-            mac = entry["mac_address"]
-            if mac == "UNKNOWN":
-                camera_data.append({
-                    "switch_name": switch_hostname, "switch_type": switch_type,
-                    "port": intf, "mac_address": "UNKNOWN", "status": "TIMEOUT",
-                    "vlan": "UNKNOWN"
-                })
-            else:
-                mac_fmt = convert_mac_format(mac)
-                camera_data.append({
-                    "switch_name": switch_hostname, "switch_type": switch_type,
-                    "port": intf, "mac_address": mac_fmt, "status": "OK",
-                    "vlan": entry.get("vlan", "0")
-                })
-                discovery_stats["total_cameras_found"] += 1
-                logger.info(f"  [+] Device: {mac_fmt} on {intf}")
-
-    return downstream_candidates
-
-def discover_devices_via_mac_table(shell, uplink_port, downstream_switch_name, downstream_switch_ip, downstream_switch_type):
-    if not ENABLE_INDIRECT_DISCOVERY: return 0
-    logger.info(f"INDIRECT DISCOVERY: Scanning parent port {uplink_port} for {downstream_switch_name}")
-    
-    try:
-        current_host = get_hostname(shell)
-        res = send_cmd(shell, f"show mac address-table interface {uplink_port}", timeout=15, silent=True)
-        entries = parse_mac_table_interface(res)
-        
-        if len(entries) < INDIRECT_DISCOVERY_MIN_MACS:
-            logger.warning(f"Only {len(entries)} MACs found (threshold {INDIRECT_DISCOVERY_MIN_MACS}). Skipping.")
-            return 0
-            
-        added = 0
-        for e in entries[:INDIRECT_DISCOVERY_MAX_MACS]:
-            camera_data.append({
-                "switch_name": downstream_switch_name,
-                "switch_type": downstream_switch_type,
-                "switch_ip": downstream_switch_ip,
-                "port": "UNKNOWN (Indirect)",
-                "mac_address": convert_mac_format(e["mac_address"]),
-                "vlan": e.get("vlan", "0"),
-                "status": "INDIRECT",
-                "parent_switch": current_host,
-                "parent_port": uplink_port,
-                "notes": "Indirect discovery via parent MAC table"
-            })
-            added += 1
-        discovery_stats["indirect_discoveries"] += added
-        logger.info(f"Added {added} indirect devices.")
-        return added
-    except Exception as e:
-        logger.error(f"Indirect discovery failed: {e}")
-        return 0
-
-def upgrade_indirect_to_direct_discovery(switch_name, switch_ip):
-    indirect_entries = [e for e in camera_data if e.get("switch_name") == switch_name and e.get("status") == "INDIRECT"]
-    if not indirect_entries: return
-    
-    direct_entries = [e for e in camera_data if e.get("switch_name") == switch_name and e.get("status") != "INDIRECT"]
-    duplicates = []
-    for ind in indirect_entries:
-        match = next((d for d in direct_entries if d["mac_address"] == ind["mac_address"]), None)
-        if match:
-            match["was_indirect"] = True
-            duplicates.append(ind)
-            
-    for dup in duplicates:
-        if dup in camera_data:
-            camera_data.remove(dup)
-    
-    logger.info(f"Deduplicated {len(duplicates)} records for {switch_name}")
-
-def process_switch(parent_ip, neighbor_info, switch_type="UNKNOWN", is_retry=False):
-    global failed_switches, agg_shell
-    switch_ip = neighbor_info.get("mgmt_ip") or neighbor_info.get("ip")
-    switch_name = neighbor_info.get("remote_name") or neighbor_info.get("hostname")
-    local_intf = neighbor_info.get("local_intf") or neighbor_info.get("local_port")
-
-    if switch_ip and switch_ip in visited_switches and not is_retry: return True
-    
-    logger.info("*"*80)
-    logger.info(f"Processing: {switch_name} ({switch_ip if switch_ip else 'NO IP'})")
-    
-    if switch_ip and not is_retry: 
-        visited_switches.add(switch_ip)
-        discovery_stats["switches_attempted"] += 1
-
-    try:
-        parent_hostname = get_hostname(agg_shell)
-        if not verify_aggregate_connection(): raise NetworkConnectionError("Lost parent")
-
-        ssh_success = False
-        
-        if switch_ip:
-            ssh_success = ssh_to_device(switch_ip, switch_name, parent_hostname)
+        # Log what we are actually attempting to scan
+        if not interfaces:
+            logger.warning("    ! No up/up access ports found to scan.")
         else:
-            logger.info("No IP address. Skipping SSH and trying Indirect Discovery directly.")
-        
-        if not ssh_success:
-            if switch_ip:
-                logger.error(f"SSH Failed to {switch_name}. Attempting Indirect.")
+            logger.debug(f"    Scanning ports: {', '.join(interfaces)}")
+
+        for intf in interfaces:
+            mac_out = send_cmd(agg_shell, f"show mac address-table interface {intf}", timeout=10, silent=True)
+            unique_macs = set(re.findall(r"([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})", mac_out, re.I))
             
-            found = 0
-            if ENABLE_INDIRECT_DISCOVERY and local_intf:
-                found = discover_devices_via_mac_table(agg_shell, local_intf, switch_name, switch_ip or "NO_IP", switch_type)
-            
-            if not is_retry:
-                failed_switches.append({
-                    "switch_name": switch_name, "switch_ip": switch_ip, 
-                    "switch_type": switch_type, "local_intf": local_intf,
-                    "parent_hostname": parent_hostname, "indirect_found": found
+            for mac in unique_macs:
+                camera_data.append({
+                    "switch": switch_name, "ip": switch_ip, "port": intf, "mac": mac
                 })
-            return found > 0
-
-        actual_hostname = get_hostname(agg_shell)
-        try:
-            downstream_candidates = discover_cameras_from_switch(agg_shell, actual_hostname, switch_type)
-            discovery_stats["switches_successfully_scanned"] += 1
-            
-            if downstream_candidates:
-                logger.info(f"Daisy-Chain: Found {len(downstream_candidates)} downstream neighbors.")
-                for cand in downstream_candidates:
-                    cand_ip = cand.get("mgmt_ip")
-                    if (not cand_ip) or (cand_ip and cand_ip not in visited_switches):
-                        logger.info(f" >> Descending to {cand['hostname']} ({cand_ip if cand_ip else 'NO IP'})")
-                        process_switch(switch_ip, cand, determine_switch_type(cand["hostname"]), is_retry)
-                        
-                        current = get_hostname(agg_shell)
-                        if current == "Unknown":
-                             logger.error("Connection dead after recursion. Reconnecting.")
-                             raise NetworkConnectionError("Session died in recursion")
-                        if current != actual_hostname:
-                            logger.warning(f"Recursion drift detected! Expected {actual_hostname}, got {current}. Fixing.")
-                            if current == parent_hostname:
-                                logger.warning("Drifted back to parent. Aborting this chain to save socket.")
-                                break 
-                            else:
-                                cleanup_and_return_to_parent(actual_hostname)
-        
-        except Exception as e:
-            logger.error(f"Error scanning {switch_name}: {e}")
-        
-        current_loc = get_hostname(agg_shell)
-        if current_loc == parent_hostname:
-            logger.info(f"Already back at parent {parent_hostname}. Skipping exit.")
-        else:
-            logger.debug(f"Exiting {actual_hostname}...")
-            exit_device()
-            
-        return True
-
+                count += 1
+                logger.info(f"    [+] Found {mac} on {intf}")
     except Exception as e:
-        logger.error(f"Process error: {e}")
-        try:
-            current = get_hostname(agg_shell)
-            if current != parent_hostname and current != "Unknown":
-                cleanup_and_return_to_parent(parent_hostname)
-        except: pass
-        return False
+        logger.error(f"MAC harvest failed: {e}")
 
-def check_for_duplicate_macs():
-    logger.info("FINAL DUPLICATE CHECK")
-    mac_map = {}
-    for e in camera_data:
-        if e["mac_address"] != "UNKNOWN": mac_map.setdefault(e["mac_address"], []).append(e)
-    
-    removed = 0
-    for mac, entries in mac_map.items():
-        if len(entries) > 1:
-            keep = next((e for e in entries if e.get("status") != "INDIRECT"), entries[0])
-            for e in entries:
-                if e != keep:
-                    camera_data.remove(e)
-                    removed += 1
-    discovery_stats["duplicates_removed"] = removed
-    logger.info(f"Removed {removed} duplicates.")
+    logger.info(f"    -> Harvested {count} MACs.")
+    return list(set(neighbors_to_visit))
 
-def scan_aggregate_switch(shell, agg_ip, aggregates_to_process, seed_ips):
-    if agg_ip in visited_switches: return
-    visited_switches.add(agg_ip)
-    hostname = get_hostname(shell)
-    logger.info(f"Scanning ROOT AGGREGATE: {hostname}")
-    
-    cdp_out = send_cmd(shell, "show cdp neighbors detail", silent=True)
-    for nbr in parse_cdp_neighbors(cdp_out):
-        if is_aggregate_switch(nbr["hostname"]) and nbr["mgmt_ip"] not in seed_ips:
-            if nbr["mgmt_ip"] not in aggregates_to_process:
-                aggregates_to_process.append(nbr["mgmt_ip"])
-    
-    candidates = discover_cameras_from_switch(shell, hostname, "AGGREGATE")
-    
-    for cand in candidates:
-        cand_ip = cand.get("mgmt_ip")
-        if (not cand_ip) or (cand_ip and cand_ip not in visited_switches):
-            process_switch(agg_ip, cand, determine_switch_type(cand["hostname"]), is_retry=False)
-
-def retry_failed_switches_from_seed():
-    if not failed_switches: return
-    logger.info("PHASE 3: Ensuring clean connection to Seed before retries...")
-    reconnect_to_aggregate("Clean Start for Retries")
-    
-    logger.info(f"PHASE 3: RETRYING {len(failed_switches)} SWITCHES")
-    for item in failed_switches:
-        nbr = {"mgmt_ip": item["switch_ip"], "remote_name": item["switch_name"], "local_intf": item["local_intf"]}
-        process_switch(SEED_SWITCH_IP, nbr, item["switch_type"], is_retry=True)
+# ============================================================================
+# MAIN
+# ============================================================================
 
 def main():
-    logger.info("STARTING DISCOVERY V22 (FINAL)")
-    connect_to_seed()
+    global logger
+    logger, logfile = setup_logging()
     
-    aggs = deque([SEED_SWITCH_IP])
-    seed_ips = {SEED_SWITCH_IP}
+    logger.info("========================================")
+    logger.info(f"STARTING DISCOVERY V38 (EXIT FIX)")
+    logger.info(f"Log File: {logfile}")
+    logger.info("========================================")
     
-    while aggs:
-        agg_ip = aggs.popleft()
-        try:
-            if get_hostname(agg_shell) != agg_hostname:
-                if not cleanup_and_return_to_parent(agg_hostname): reconnect_to_aggregate()
-            
-            if agg_ip != SEED_SWITCH_IP:
-                if not ssh_to_device(agg_ip): continue
-            
-            scan_aggregate_switch(agg_shell, agg_ip, aggs, seed_ips)
-            
-            if agg_ip != SEED_SWITCH_IP: exit_device()
-            
-        except Exception as e:
-            logger.error(f"Aggregate error: {e}")
-            reconnect_to_aggregate()
+    if not connect_to_seed(): return
 
-    retry_failed_switches_from_seed()
-    check_for_duplicate_macs()
+    queue = deque()
+    initial_neighbors = scan_current_switch(SEED_SWITCH_IP, seed_hostname)
+    for n in initial_neighbors: queue.append(n)
+
+    while queue:
+        target_ip = queue.popleft()
+        if target_ip in visited_ips: continue
+        
+        target_host = None
+        
+        for attempt in range(1, JUMP_RETRIES + 1):
+            target_host = explicit_jump_poll(target_ip)
+            if target_host:
+                break 
+            else:
+                logger.warning(f"  ⚠ Jump attempt {attempt}/{JUMP_RETRIES} failed. Retrying...")
+                clean_seed = clean_hostname(seed_hostname)
+                curr = clean_hostname(get_hostname(agg_shell))
+                if curr != clean_seed: return_to_seed("Retry Reset")
+        
+        if target_host:
+            new_hops = scan_current_switch(target_ip, target_host)
+            for h in new_hops: queue.append(h)
+            return_to_seed(target_host)
+        else:
+            logger.error(f"  ✖ Failed to jump to {target_ip}. Skipping.")
+            clean_seed = clean_hostname(seed_hostname)
+            if clean_hostname(get_hostname(agg_shell)) != clean_seed: return_to_seed("Give Up")
+
+    # DEDUPLICATION
+    logger.info("  ○ Post-Processing: Deduplicating MACs...")
+    unique_devices = {}
+    for device in camera_data:
+        mac = device['mac']
+        if mac not in unique_devices:
+            unique_devices[mac] = device
+    
+    final_data = list(unique_devices.values())
     
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    json_file = f"camera_inventory_{len(camera_data)}devices_{ts}.json"
-    output_data = {
-        "discovery_metadata": {"timestamp": ts, "seed_switch": SEED_SWITCH_IP, "total_devices": len(camera_data), "total_aggregates": len(discovered_aggregates)},
-        "discovery_statistics": discovery_stats,
-        "cameras": camera_data
-    }
-    with open(json_file, "w", encoding='utf-8') as f: json.dump(output_data, f, indent=2)
-    logger.info(f"Saved JSON: {json_file}")
-
-    csv_file = f"camera_inventory_{len(camera_data)}devices_{ts}.csv"
-    with open(csv_file, "w", newline='', encoding='utf-8') as f:
-        fieldnames = ["switch_name", "switch_type", "port", "mac_address", "vlan", "status", "parent_switch", "parent_port", "notes"]
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+    csv_filename = f"camera_inventory_{ts}.csv"
+    with open(csv_filename, "w", newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=["switch", "ip", "port", "mac"])
         writer.writeheader()
-        writer.writerows(camera_data)
-    logger.info(f"Saved CSV: {csv_file}")
-    
-    logger.info(f"Done. Found {len(camera_data)} devices.")
+        writer.writerows(final_data)
+        
+    logger.info("========================================")
+    logger.info(f"DONE. Scanned: {len(visited_hostnames)} Switches.")
+    logger.info(f"Raw Devices: {len(camera_data)}")
+    logger.info(f"Unique Devices: {len(final_data)}")
+    logger.info(f"Saved to: {csv_filename}")
+    logger.info("========================================")
 
 if __name__ == "__main__":
     main()
