@@ -47,13 +47,12 @@ logger = None
 
 SEED_SWITCH_IP = "192.168.20.20" 
 CREDENTIAL_SETS = [
-    {"username": "admin",  "password": "flounder",  "enable": ""},
-    {"username": "manager", "password": "alternative_pass", "enable": ""}
+    {"username": "Admin",  "password": "wrong_password",  "enable": ""}, # Fails
+    {"username": "admin",  "password": "flounder",  "enable": ""}        # Succeeds
 ]
 
 SSH_CONNECT_TIMEOUT = 45    
 COMMAND_TIMEOUT = 60        
-JUMP_RETRIES = 2            
 
 LINUX_DISABLED_ALGORITHMS = {'pubkeys': ['rsa-sha2-512', 'rsa-sha2-256']}
 PROMPT_RE = re.compile(r"(?m)^[^\r\n>\s][^\r\n>]*[>#]\s?$")
@@ -71,7 +70,7 @@ seed_hostname = "Unknown"
 # ============================================================================
 
 def _drain(shell):
-    time.sleep(0.3) 
+    time.sleep(0.5) 
     buf = ""
     while shell and not shell.closed and shell.recv_ready():
         try:
@@ -162,13 +161,12 @@ def explicit_jump_poll(target_ip):
     
     for cred in CREDENTIAL_SETS:
         try:
-            # Step 1: Clear the line on the Seed Switch
+            # Clear previous context
             agg_shell.send("\x03") 
             time.sleep(0.5)
             _drain(agg_shell)
             
-            # Step 2: Send SSH command
-            logger.debug(f"  Trying user: {cred['username']}")
+            logger.debug(f"  Trying credential: {cred['username']}")
             agg_shell.send(f"ssh -l {cred['username']} {target_ip}\n")
             
             buffer = ""
@@ -181,7 +179,7 @@ def explicit_jump_poll(target_ip):
                     
                     if "password:" in buffer.lower():
                         agg_shell.send(cred["password"] + "\n")
-                        buffer = "" # Reset buffer to look for new prompts
+                        buffer = ""
                         continue
                     
                     if "yes/no" in buffer.lower():
@@ -189,19 +187,27 @@ def explicit_jump_poll(target_ip):
                         buffer = ""
                         continue
 
+                    # If this credential fails, we break the while loop to try the next credential
                     if any(x in buffer.lower() for x in ["permission denied", "connection refused", "closed by"]):
-                        logger.warning(f"  ✖ Credential {cred['username']} failed.")
-                        break # Try next credential set
+                        logger.warning(f"   ✖ Credential {cred['username']} failed.")
+                        # Reset shell for next attempt
+                        agg_shell.send("\x03")
+                        time.sleep(1)
+                        break 
 
+                    # If we see a prompt, we are IN
                     if PROMPT_RE.search(buffer):
                         current_host = get_hostname(agg_shell)
+                        # Safety: make sure we aren't still on the seed
                         if clean_hostname(current_host) != clean_hostname(seed_hostname):
-                            logger.info(f"    ✓ Logged into {current_host}")
+                            logger.info(f"     ✓ Logged into {current_host}")
+                            # Prepare the remote shell
                             send_cmd(agg_shell, "terminal length 0", silent=True)
                             return current_host
                 time.sleep(0.5)
         except Exception as e:
-            logger.error(f"  Jump Exception: {e}")
+            logger.error(f"  Jump Exception on {cred['username']}: {e}")
+            
     return False
 
 def return_to_seed(context):
@@ -213,12 +219,14 @@ def return_to_seed(context):
         _drain(agg_shell)
         agg_shell.send("exit\n")
         time.sleep(1.0)
-        agg_shell.send("\n")
-        if seed_hostname in _drain(agg_shell): return True
+        # Check if we see the seed name in the buffer
+        buf = _drain(agg_shell)
+        if seed_hostname.lower() in buf.lower(): 
+            return True
     return connect_to_seed()
 
 # ============================================================================
-# SCANNER (WITH PORT-CHANNEL SUPPRESSION)
+# SCANNER
 # ============================================================================
 
 def scan_current_switch(switch_ip, switch_name):
@@ -241,12 +249,11 @@ def scan_current_switch(switch_ip, switch_name):
                     neighbors_to_visit.append(ip)
 
     # 2. MAC HARVESTING
-    logger.info(f"  ○ Harvesting MACs (Filtering Trunks/Port-channels)...")
+    logger.info(f"   ○ Harvesting MACs (Filtering Trunks/Port-channels)...")
     count = 0
     try:
-        agg_shell.send("clear mac address-table dynamic\n")
+        send_cmd(agg_shell, "clear mac address-table dynamic", timeout=5)
         time.sleep(1)
-        _drain(agg_shell)
         
         int_out = send_cmd(agg_shell, "show ip interface brief")
         interfaces = []
@@ -254,11 +261,8 @@ def scan_current_switch(switch_ip, switch_name):
             parts = line.split()
             if len(parts) >= 6 and "up" in parts[4].lower() and "up" in parts[5].lower():
                 raw_port = parts[0]
-                
-                # CRITICAL FIX: Ignore logical Port-channels and Vlan interfaces
                 if any(x in raw_port for x in ["Vlan", "Loopback", "Port-channel", "Po"]):
                     continue
-                
                 if normalize_intf(raw_port) not in bridge_interfaces:
                     interfaces.append(raw_port)
 
@@ -268,7 +272,7 @@ def scan_current_switch(switch_ip, switch_name):
             for mac in macs:
                 camera_data.append({"switch": switch_name, "ip": switch_ip, "port": intf, "mac": mac})
                 count += 1
-                logger.info(f"    [+] {mac} on {intf}")
+                logger.info(f"     [+] {mac} on {intf}")
     except Exception as e:
         logger.error(f"MAC harvest error: {e}")
 
@@ -283,25 +287,40 @@ def main():
     logger, logfile = setup_logging()
     
     logger.info("========================================")
-    logger.info(f"STARTING DISCOVERY - V40 (PORT-CHANNEL SUPPRESSION)")
+    logger.info(f"STARTING DISCOVERY V41 (CREDENTIAL FIX)")
     logger.info("========================================")
     
-    if not connect_to_seed(): return
+    if not connect_to_seed(): 
+        logger.error("Failed to connect to seed switch.")
+        return
 
+    # Start queue with seed neighbors
     queue = deque(scan_current_switch(SEED_SWITCH_IP, seed_hostname))
 
     while queue:
         target_ip = queue.popleft()
-        if target_ip in visited_ips: continue
+        if target_ip in visited_ips: 
+            continue
         
         target_host = explicit_jump_poll(target_ip)
+        
         if target_host:
+            # Mark as visited only AFTER successful jump
             visited_ips.add(target_ip)
+            visited_hostnames.add(clean_hostname(target_host))
+            
+            # Now Scan
             new_hops = scan_current_switch(target_ip, target_host)
-            for h in new_hops: queue.append(h)
+            for h in new_hops:
+                if h not in visited_ips:
+                    queue.append(h)
+            
+            # Go back to seed for the next IP in the queue
             return_to_seed(target_host)
         else:
-            logger.error(f"  ✖ Failed {target_ip} with all credentials.")
+            logger.error(f"   ✖ Skipping {target_ip} (Credential/Connection Failure)")
+            # Ensure we are back at seed even after failure
+            return_to_seed("Failure Recovery")
 
     # FINAL EXPORT
     unique_devices = {d['mac']: d for d in camera_data}.values()
@@ -312,7 +331,7 @@ def main():
         writer.writerows(unique_devices)
         
     logger.info("========================================")
-    logger.info(f"DONE. Scanned {len(visited_hostnames)} Switches. Found {len(unique_devices)} devices.")
+    logger.info(f"DONE. Scanned {len(visited_hostnames)} Switches. Found {len(unique_devices)} unique devices.")
     logger.info(f"File: {csv_filename}")
     logger.info("========================================")
 
