@@ -9,331 +9,292 @@ import warnings
 from datetime import datetime
 from collections import deque
 
-# Suppress Cryptography Deprecation Warnings
 warnings.filterwarnings("ignore")
 
 # ============================================================================
-# LOGGING CONFIGURATION
+# CONFIG
 # ============================================================================
+MAX_RETRIES = 10
+RETRY_DELAY = 10  # seconds
 
-class CleanConsoleFormatter(logging.Formatter):
-    def format(self, record):
-        timestamp = datetime.fromtimestamp(record.created).strftime('%H:%M:%S')
-        return f"[{timestamp}] {record.getMessage()}"
-
+# ============================================================================
+# LOGGING (Always Enabled)
+# ============================================================================
 def setup_logging():
-    log_filename = f"camera_discovery_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
+    # Force UTF-8 encoding for the log file and the console stream
+    file_handler = logging.FileHandler("scan_full_log.txt", mode='w', encoding='utf-8')
+    stream_handler = logging.StreamHandler(sys.stdout)
     
-    file_handler = logging.FileHandler(log_filename, encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    root_logger.addHandler(file_handler)
-    
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(CleanConsoleFormatter())
-    root_logger.addHandler(console_handler)
-
-    logging.getLogger("paramiko").setLevel(logging.WARNING)
-    return logging.getLogger(__name__), log_filename
-
-logger = None 
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-SEED_SWITCH_IP = "192.168.20.20" 
-CREDENTIAL_SETS = [
-    {"username": "Admin",  "password": "wrong_password",  "enable": ""}, # Fails
-    {"username": "admin",  "password": "flounder",  "enable": ""}        # Succeeds
-]
-
-SSH_CONNECT_TIMEOUT = 45    
-COMMAND_TIMEOUT = 60        
-
-LINUX_DISABLED_ALGORITHMS = {'pubkeys': ['rsa-sha2-512', 'rsa-sha2-256']}
-PROMPT_RE = re.compile(r"(?m)^[^\r\n>\s][^\r\n>]*[>#]\s?$")
-
-# GLOBAL STATE
-visited_ips = set()
-visited_hostnames = set()
-camera_data = []
-agg_client = None
-agg_shell = None
-seed_hostname = "Unknown"
-
-# ============================================================================
-# CORE UTILITIES
-# ============================================================================
-
-def _drain(shell):
-    time.sleep(0.5) 
-    buf = ""
-    while shell and not shell.closed and shell.recv_ready():
-        try:
-            chunk = shell.recv(65535).decode("utf-8", "ignore")
-            buf += chunk
-        except: break
-    return buf
-
-def send_cmd(shell, cmd, timeout=COMMAND_TIMEOUT, silent=False):
-    if not silent: logger.debug(f"CMD: {cmd}")
-    try:
-        _drain(shell)
-        shell.send(cmd + "\n")
-        time.sleep(0.5)
-        buf = ""
-        end = time.time() + timeout
-        while time.time() < end:
-            if shell.recv_ready():
-                chunk = shell.recv(65535).decode("utf-8", "ignore")
-                buf += chunk
-                if PROMPT_RE.search(buf): return buf
-            time.sleep(0.2)
-        return buf
-    except Exception as e:
-        logger.error(f"Command failed: {cmd} - {e}")
-        return ""
-
-def get_hostname(shell):
-    try:
-        _drain(shell)
-        shell.send("\n")
-        time.sleep(1)
-        buf = ""
-        for _ in range(15):
-            if shell.recv_ready():
-                buf += shell.recv(65535).decode("utf-8", "ignore")
-                if PROMPT_RE.search(buf): break
-            time.sleep(0.1)
-        for line in reversed(buf.splitlines()):
-            line = line.strip()
-            if line.endswith('#') or line.endswith('>'):
-                hostname = line[:-1].strip()
-                if hostname: return hostname
-    except: pass
-    return "Unknown"
-
-def clean_hostname(raw_name):
-    if not raw_name: return ""
-    return raw_name.split('.')[0].upper()
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[%(asctime)s] %(message)s',
+        handlers=[file_handler, stream_handler]
+    )
 
 def normalize_intf(name):
+    """Normalize interface names to a consistent format."""
     if not name: return ""
-    n = name.lower().strip()
-    if n.startswith("gi") and not n.startswith("gigabit"): return n.replace("gi", "gigabitethernet")
-    if n.startswith("te") and not n.startswith("tengigabit"): return n.replace("te", "tengigabitethernet")
-    if n.startswith("fa") and not n.startswith("fast"): return n.replace("fa", "fastethernet")
-    if n.startswith("po") and not n.startswith("port-channel"): return n.replace("po", "port-channel")
+    n = name.lower().replace("pv", "").replace("vlan", "")
+    n = re.sub(r'[^a-z0-9/]', '', n)
+    n = n.replace("gigabitethernet", "gi").replace("tengigabitethernet", "te")
+    n = n.replace("fastethernet", "fa").replace("portchannel", "po")
     return n
 
+def is_valid_ip(ip):
+    return re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip)
+
 # ============================================================================
-# CONNECTION & JUMP LOGIC
+# PARSER
 # ============================================================================
+def _parse_neighbor_detail(output, protocol, port_to_meta, neighbor_jump_list, infra_ports):
+    INFRA_CDP_CAPS  = re.compile(r"\b(?:Switch|Router|IGMP)\b", re.I)
+    INFRA_LLDP_CAPS = re.compile(r"\b(?:B|R)\b")
 
-def connect_to_seed():
-    global agg_client, agg_shell, seed_hostname
-    logger.info(f"➜ Connecting to Seed Switch {SEED_SWITCH_IP}...")
-    for cred in CREDENTIAL_SETS:
+    current_intf = current_ip = current_name = current_cdp_caps = current_lldp_enabled_caps = None
+
+    def _flush_block():
+        nonlocal current_intf, current_ip, current_name, current_cdp_caps, current_lldp_enabled_caps
+        if current_intf and current_ip:
+            infra = (protocol == "CDP" and current_cdp_caps and INFRA_CDP_CAPS.search(current_cdp_caps)) or \
+                    (protocol == "LLDP" and current_lldp_enabled_caps and INFRA_LLDP_CAPS.search(current_lldp_enabled_caps))
+            
+            if infra:
+                neighbor_jump_list[current_intf] = current_ip
+                infra_ports.add(current_intf)
+            elif not infra:
+                if current_intf not in port_to_meta:
+                    port_to_meta[current_intf] = {"ip": current_ip, "name": current_name or "Unknown", "source": protocol}
+        current_intf = current_ip = current_name = current_cdp_caps = current_lldp_enabled_caps = None
+
+    for line in output.splitlines():
+        if re.match(r"-{10,}", line.strip()):
+            _flush_block()
+            continue
+        m = re.search(r"(?:Local Intf|Interface)\s*:\s*(\S+?)(?:,|$)", line, re.I)
+        if m:
+            _flush_block()
+            current_intf = normalize_intf(m.group(1))
+            continue
+        m = re.search(r"(?:System Name|Device ID)\s*:\s*(.+)", line, re.I)
+        if m: current_name = m.group(1).strip()
+        m = re.search(r"^\s+IP(?:\s+address)?\s*:\s*(\d+\.\d+\.\d+\.\d+)", line, re.I)
+        if m and current_intf and not current_ip: current_ip = m.group(1)
+        m = re.search(r"^Capabilities\s*:\s*(.+)", line, re.I)
+        if m: current_cdp_caps = m.group(1).strip()
+        m = re.search(r"Enabled [Cc]apabilities\s*:\s*(.+)", line, re.I)
+        if m: current_lldp_enabled_caps = m.group(1).strip()
+    _flush_block()
+
+# ============================================================================
+# SCANNER CORE
+# ============================================================================
+def scan_current_switch(switch_ip, switch_name, agg_shell, inventory_map, stats):
+    neighbor_jump_list, port_to_meta, infra_ports, mac_to_ip = {}, {}, set(), {}
+
+    send_cmd(agg_shell, "terminal length 0")
+    trunk_out = send_cmd(agg_shell, "show interfaces trunk")
+    trunks = re.findall(r"(?m)^(\S+)\s+(?:on|desirable|auto|off|nonegotiate|trunking)", trunk_out)
+    for t in trunks: infra_ports.add(normalize_intf(t))
+
+    _parse_neighbor_detail(send_cmd(agg_shell, "show lldp neighbors detail"), "LLDP", port_to_meta, neighbor_jump_list, infra_ports)
+    _parse_neighbor_detail(send_cmd(agg_shell, "show cdp neighbors detail"), "CDP", port_to_meta, neighbor_jump_list, infra_ports)
+
+    if len(neighbor_jump_list) > 20:
+        logging.warning(f" [!] {switch_name} is a Core Hub. Skipping MAC sweep.")
+        return [ip for ip in neighbor_jump_list.values() if is_valid_ip(ip)]
+
+    arp_out = send_cmd(agg_shell, "show ip arp")
+    for line in arp_out.splitlines():
+        m = re.match(r"\s*Internet\s+(\d+\.\d+\.\d+\.\d+)\s+\S+\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})", line, re.I)
+        if m: mac_to_ip[m.group(2).lower()] = m.group(1)
+
+    mac_table = send_cmd(agg_shell, "show mac address-table dynamic")
+    seen_macs, port_mac_count = set(), {}
+
+    for line in mac_table.splitlines():
+        if not re.search(r'[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}', line, re.I): continue
+        parts = line.split()
+        if len(parts) < 4: continue
         try:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(SEED_SWITCH_IP, username=cred["username"], password=cred["password"], 
-                           timeout=20, disabled_algorithms=LINUX_DISABLED_ALGORITHMS)
-            shell = client.invoke_shell(width=1000, height=1000)
-            time.sleep(2)
-            send_cmd(shell, "terminal length 0", silent=True)
-            seed_hostname = get_hostname(shell)
-            visited_hostnames.add(clean_hostname(seed_hostname))
-            visited_ips.add(SEED_SWITCH_IP)
-            agg_client, agg_shell = client, shell
-            logger.info(f"✓ Connected to Seed: {seed_hostname}")
-            return True
-        except: continue
-    return False
+            vlan, mac, raw_port = parts[0], parts[1].lower(), parts[-1]
+            norm = normalize_intf(raw_port)
+            if not norm or norm in infra_ports or "po" in norm or mac in seen_macs: continue
+            port_mac_count[norm] = port_mac_count.get(norm, 0) + 1
+            multi_port = port_mac_count[norm] > 1
 
-def explicit_jump_poll(target_ip):
-    global agg_shell
-    logger.info(f"➜ Attempting Jump to {target_ip}...")
-    
-    for cred in CREDENTIAL_SETS:
-        try:
-            # Clear previous context
-            agg_shell.send("\x03") 
-            time.sleep(0.5)
-            _drain(agg_shell)
-            
-            logger.debug(f"  Trying credential: {cred['username']}")
-            agg_shell.send(f"ssh -l {cred['username']} {target_ip}\n")
-            
-            buffer = ""
-            start_time = time.time()
-            
-            while (time.time() - start_time) < SSH_CONNECT_TIMEOUT:
-                if agg_shell.recv_ready():
-                    chunk = agg_shell.recv(65535).decode("utf-8", "ignore")
-                    buffer += chunk
-                    
-                    if "password:" in buffer.lower():
-                        agg_shell.send(cred["password"] + "\n")
-                        buffer = ""
-                        continue
-                    
-                    if "yes/no" in buffer.lower():
-                        agg_shell.send("yes\n")
-                        buffer = ""
-                        continue
+            camera_ip = mac_to_ip.get(mac)
+            meta = port_to_meta.get(norm)
+            if camera_ip:
+                ip_source = "ARP"
+                if meta and meta["ip"] == camera_ip: ip_source = meta["source"]
+                camera_name = meta["name"] if (meta and not multi_port) else "Unknown (multi-MAC port)"
+            elif meta and not multi_port:
+                camera_ip, camera_name, ip_source = meta["ip"], meta["name"], meta["source"]
+            else:
+                camera_ip, camera_name, ip_source = "None", "Unknown", "Unknown"
 
-                    # If this credential fails, we break the while loop to try the next credential
-                    if any(x in buffer.lower() for x in ["permission denied", "connection refused", "closed by"]):
-                        logger.warning(f"   ✖ Credential {cred['username']} failed.")
-                        # Reset shell for next attempt
-                        agg_shell.send("\x03")
-                        time.sleep(1)
-                        break 
+            inventory_map.append({
+                "switch_name": switch_name, "switch_ip": switch_ip, "port": raw_port,
+                "vlan": vlan, "mac_address": mac, "camera_ip": camera_ip,
+                "camera_name": camera_name, "ip_source": ip_source, "multi_mac_port": multi_port
+            })
+            logging.info(f"   [MAPPED] {raw_port} -> {mac} | IP: {camera_ip} | Source: {ip_source}")
+            stats["total_macs_found"] += 1
+            seen_macs.add(mac)
+        except Exception: continue
+    return [ip for ip in neighbor_jump_list.values() if is_valid_ip(ip)]
 
-                    # If we see a prompt, we are IN
-                    if PROMPT_RE.search(buffer):
-                        current_host = get_hostname(agg_shell)
-                        # Safety: make sure we aren't still on the seed
-                        if clean_hostname(current_host) != clean_hostname(seed_hostname):
-                            logger.info(f"     ✓ Logged into {current_host}")
-                            # Prepare the remote shell
-                            send_cmd(agg_shell, "terminal length 0", silent=True)
-                            return current_host
-                time.sleep(0.5)
-        except Exception as e:
-            logger.error(f"  Jump Exception on {cred['username']}: {e}")
-            
-    return False
+# ============================================================================
+# UTILS
+# ============================================================================
+def send_cmd(shell, cmd, timeout=30):
+    while shell.recv_ready(): shell.recv(65535)
+    shell.send(cmd + "\n")
+    time.sleep(1.2)
+    buf = ""
+    start = time.time()
+    while (time.time() - start) < timeout:
+        if shell.recv_ready():
+            chunk = shell.recv(65535).decode("utf-8", "ignore")
+            buf += chunk
+            if re.search(r"(?m)^[^\r\n>\s][^\r\n>]*[>#]\s?$", buf): break
+        time.sleep(0.1)
+    return buf
 
-def return_to_seed(context):
-    global agg_shell
-    logger.debug(f"Returning to Seed from {context}...")
-    agg_shell.send("\x03") 
+def clean_shell(shell, curr_host):
+    shell.send("\x03\n")
     time.sleep(0.5)
-    for i in range(4):
-        _drain(agg_shell)
-        agg_shell.send("exit\n")
-        time.sleep(1.0)
-        # Check if we see the seed name in the buffer
-        buf = _drain(agg_shell)
-        if seed_hostname.lower() in buf.lower(): 
-            return True
-    return connect_to_seed()
+    buf = send_cmd(shell, "\n")
+    m = re.search(r"([\w\d\.\-]+)[>#]\s*$", buf.strip())
+    return m.group(1) if m else curr_host
 
-# ============================================================================
-# SCANNER
-# ============================================================================
+def try_login(shell, target_ip, cred, current_host):
+    logging.info(f" -> Attempting SSH to {target_ip}...")
+    while shell.recv_ready(): shell.recv(65535)
+    shell.send(f"ssh -l {cred['username']} {target_ip}\n")
+    start, pwd_sent, buf = time.time(), False, ""
+    while (time.time() - start) < 45:
+        if shell.recv_ready():
+            chunk = shell.recv(65535).decode("utf-8", "ignore")
+            buf += chunk
+            if "yes/no" in chunk.lower(): shell.send("yes\n"); buf = ""
+            if "password:" in chunk.lower():
+                if pwd_sent: shell.send("\x03\n"); time.sleep(1); return None
+                shell.send(cred["password"] + "\n")
+                pwd_sent = True; buf = ""; start = time.time()
+            m = re.search(r"([\w\d\.\-]+)[>#]\s*$", buf.strip())
+            if m and m.group(1) != current_host:
+                send_cmd(shell, "terminal length 0")
+                return m.group(1)
+            if any(x in buf.lower() for x in ["refused", "timed out", "no route", "permission denied"]): return None
+        time.sleep(0.15)
+    shell.send("\x03\n"); time.sleep(1); return None
 
-def scan_current_switch(switch_ip, switch_name):
-    global agg_shell
-    neighbors_to_visit = []
-    bridge_interfaces = set()
-
-    # 1. DISCOVERY (CDP/LLDP)
-    for cmd in ["show cdp neighbors detail", "show lldp neighbors detail"]:
-        out = send_cmd(agg_shell, cmd, timeout=30)
-        blocks = re.split(r"-{10,}", out)
-        for block in blocks:
-            ip_m = re.search(r"(?:IP address|IP): (\d+\.\d+\.\d+\.\d+)", block)
-            intf_m = re.search(r"(?:Interface|Local Intf): ([^,\n\r]+)", block)
-            if ip_m and intf_m:
-                ip = ip_m.group(1)
-                norm_intf = normalize_intf(intf_m.group(1).split(',')[0])
-                bridge_interfaces.add(norm_intf)
-                if ip not in visited_ips and ip != SEED_SWITCH_IP:
-                    neighbors_to_visit.append(ip)
-
-    # 2. MAC HARVESTING
-    logger.info(f"   ○ Harvesting MACs (Filtering Trunks/Port-channels)...")
-    count = 0
-    try:
-        send_cmd(agg_shell, "clear mac address-table dynamic", timeout=5)
-        time.sleep(1)
+def try_login_with_retry(shell, target_ip, creds, current_host, stats):
+    """Attempts SSH to target_ip trying all credentials each retry."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        logging.info(f"   [ATTEMPT {attempt}/{MAX_RETRIES}] SSH to {target_ip}...")
+        for cred in creds:
+            host = try_login(shell, target_ip, cred, current_host)
+            if host: return host, current_host
+            current_host = clean_shell(shell, current_host)
         
-        int_out = send_cmd(agg_shell, "show ip interface brief")
-        interfaces = []
-        for line in int_out.splitlines():
-            parts = line.split()
-            if len(parts) >= 6 and "up" in parts[4].lower() and "up" in parts[5].lower():
-                raw_port = parts[0]
-                if any(x in raw_port for x in ["Vlan", "Loopback", "Port-channel", "Po"]):
-                    continue
-                if normalize_intf(raw_port) not in bridge_interfaces:
-                    interfaces.append(raw_port)
-
-        for intf in interfaces:
-            mac_out = send_cmd(agg_shell, f"show mac address-table interface {intf}", timeout=10, silent=True)
-            macs = set(re.findall(r"([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})", mac_out, re.I))
-            for mac in macs:
-                camera_data.append({"switch": switch_name, "ip": switch_ip, "port": intf, "mac": mac})
-                count += 1
-                logger.info(f"     [+] {mac} on {intf}")
-    except Exception as e:
-        logger.error(f"MAC harvest error: {e}")
-
-    return list(set(neighbors_to_visit))
-
-# ============================================================================
-# MAIN
-# ============================================================================
+        if attempt < MAX_RETRIES:
+            stats["total_retries"] += 1
+            logging.info(f"   [RETRY] All creds failed for {target_ip}, waiting {RETRY_DELAY}s...")
+            time.sleep(RETRY_DELAY)
+    return None, current_host
 
 def main():
-    global logger
-    logger, logfile = setup_logging()
+    setup_logging()
+    SEED_IP = "192.168.0.251"
+    SEED_IP_ALIASES = {"192.168.1.252"}
+    CREDS = [
+        {"username": "admin", "password": "admin"},
+        {"username": "Admin", "password": "/2/_HKX6YvCGMwzAdJp"},
+        {"username": "Admin", "password": "cisco"}
+    ]
     
-    logger.info("========================================")
-    logger.info(f"STARTING DISCOVERY V41 (CREDENTIAL FIX)")
-    logger.info("========================================")
+    visited_ips = {SEED_IP} | SEED_IP_ALIASES
+    visited_hosts, inventory_map = set(), []
+    stats = {
+        "total_macs_found": 0, "switches_attempted": 0, 
+        "switches_success": 0, "switches_failed": 0, "total_retries": 0
+    }
     
-    if not connect_to_seed(): 
-        logger.error("Failed to connect to seed switch.")
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    
+    try:
+        client.connect(SEED_IP, username=CREDS[0]['username'], password=CREDS[0]['password'], timeout=15)
+        shell = client.invoke_shell(); time.sleep(2)
+        send_cmd(shell, "terminal length 0")
+        seed_host = re.search(r"([\w\d\.\-]+)[>#]", send_cmd(shell, "\n")).group(1)
+        visited_hosts.add(seed_host)
+    except Exception as e:
+        logging.error(f"Failed to connect to seed: {e}")
         return
 
-    # Start queue with seed neighbors
-    queue = deque(scan_current_switch(SEED_SWITCH_IP, seed_hostname))
-
+    queue = deque([SEED_IP])
+    curr_host = seed_host
+    
     while queue:
-        target_ip = queue.popleft()
-        if target_ip in visited_ips: 
-            continue
-        
-        target_host = explicit_jump_poll(target_ip)
-        
-        if target_host:
-            # Mark as visited only AFTER successful jump
-            visited_ips.add(target_ip)
-            visited_hostnames.add(clean_hostname(target_host))
+        ip = queue.popleft()
+        if ip != SEED_IP:
+            stats["switches_attempted"] += 1
+            host, curr_host = try_login_with_retry(shell, ip, CREDS, curr_host, stats)
             
-            # Now Scan
-            new_hops = scan_current_switch(target_ip, target_host)
-            for h in new_hops:
-                if h not in visited_ips:
-                    queue.append(h)
-            
-            # Go back to seed for the next IP in the queue
-            return_to_seed(target_host)
+            if host:
+                if host in visited_hosts:
+                    logging.info(f"   [SKIP] {host} ({ip}) already visited.")
+                    visited_ips.add(ip)
+                    shell.send("exit\n"); time.sleep(1.0)
+                    curr_host = clean_shell(shell, curr_host)
+                    continue
+                visited_hosts.add(host)
+                stats["switches_success"] += 1
+                logging.info(f"-> Processing {host} ({ip})")
+            else:
+                stats["switches_failed"] += 1
+                logging.error(f"   [X] Jump Failed for {ip} after {MAX_RETRIES} attempts.")
+                continue
         else:
-            logger.error(f"   ✖ Skipping {target_ip} (Credential/Connection Failure)")
-            # Ensure we are back at seed even after failure
-            return_to_seed("Failure Recovery")
-
-    # FINAL EXPORT
-    unique_devices = {d['mac']: d for d in camera_data}.values()
-    csv_filename = f"camera_inventory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    with open(csv_filename, "w", newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=["switch", "ip", "port", "mac"])
-        writer.writeheader()
-        writer.writerows(unique_devices)
+            stats["switches_attempted"] += 1
+            stats["switches_success"] += 1
+            host = seed_host
+            
+        send_cmd(shell, "terminal length 0")
+        new_ips = scan_current_switch(ip, host, shell, inventory_map, stats)
+        for n_ip in new_ips:
+            if n_ip not in visited_ips:
+                visited_ips.add(n_ip)
+                queue.append(n_ip)
         
-    logger.info("========================================")
-    logger.info(f"DONE. Scanned {len(visited_hostnames)} Switches. Found {len(unique_devices)} unique devices.")
-    logger.info(f"File: {csv_filename}")
-    logger.info("========================================")
+        if ip != SEED_IP:
+            shell.send("exit\n"); time.sleep(1.0)
+            curr_host = clean_shell(shell, curr_host)
+
+    # Summary Report
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    generated_files = []
+    if inventory_map:
+        csv_name = f"camera_inventory_{ts}.csv"
+        with open(csv_name, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=inventory_map[0].keys())
+            writer.writeheader()
+            writer.writerows(inventory_map)
+        generated_files.append(csv_name)
+    generated_files.append("scan_full_log.txt")
+    
+    print("\n" + "="*60 + "\n  SCAN COMPLETE\n" + "="*60)
+    print(f"  Switches attempted  : {stats['switches_attempted']}")
+    print(f"  Switches successful : {stats['switches_success']}")
+    print(f"  Switches failed     : {stats['switches_failed']}")
+    print(f"  Total retries       : {stats['total_retries']}")
+    print(f"  Cameras/endpoints   : {stats['total_macs_found']}")
+    print("-" * 60 + "\n  Generated files:")
+    for f in generated_files: print(f"    -> {f}")
+    print("="*60 + "\n")
 
 if __name__ == "__main__":
     main()
