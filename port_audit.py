@@ -32,19 +32,19 @@ warnings.filterwarnings("ignore")
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-AGG_SWITCH_IP = ""
+AGG_SWITCH_IP = "192.168.0.251"
 
 CREDENTIAL_SETS = [
-    {"username": "",  "password": "", "enable": ""}
+    {"username": "admin",  "password": "cisco",                "enable": ""}
 ]
 
 CMD_TIMEOUT  = 60
 JUMP_TIMEOUT = 30
 
-RETRY_COUNT = 2    # How many times to retry a failed connection (not counting the first attempt)
+RETRY_COUNT = 10    # How many times to retry a failed connection (not counting the first attempt)
 RETRY_DELAY = 5    # Seconds to wait between retries
 
-CLEAR_WAIT  = 300  # Seconds to wait after 'clear counters' before collecting (default: 5 min)
+CLEAR_WAIT  = 30  # Seconds to wait after 'clear counters' before collecting (default: 5 min)
 
 # ============================================================================
 # INTERFACE NAME NORMALIZATION
@@ -280,16 +280,53 @@ def send_cmd(shell, cmd, timeout=CMD_TIMEOUT, silent=False):
         return ""
 
 def get_hostname(shell):
+    """
+    Reliably extract the hostname from the current shell session.
+
+    Strategy:
+      1. Tickle the prompt up to 3 times with \n and read back the prompt line.
+         The prompt on Cisco IOS-XE is  HOSTNAME#  or  HOSTNAME>
+      2. If prompt-parsing fails (shell still settling, ANSI garbage, long MOTD),
+         fall back to 'show version | include hostname' which is unambiguous.
+    """
+    # ── Pass 1: read the prompt directly (fast path) ────────────────────────
+    for _ in range(3):
+        try:
+            shell.send("\n"); time.sleep(0.8)
+            buf = _drain(shell)
+            for line in reversed([l.strip() for l in buf.splitlines() if l.strip()]):
+                # Strip ANSI escape codes before matching
+                clean = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line)
+                if clean.endswith(("#", ">")):
+                    name = re.sub(r"^[^\w]+", "", clean[:-1].strip())
+                    # Sanity-check: must look like a hostname (≥2 chars, no spaces)
+                    if name and len(name) >= 2 and " " not in name:
+                        return name
+        except Exception:
+            pass
+
+    # ── Pass 2: ask the device directly via show version ────────────────────
     try:
-        shell.send("\n\n"); time.sleep(1)
+        shell.send("show version | include [Ss]ystem [Nn]ame\n")
+        time.sleep(1.5)
         buf = _drain(shell)
-        for line in reversed([l.strip() for l in buf.splitlines() if l.strip()]):
-            if line.endswith(("#", ">")):
-                name = re.sub(r"^[^\w]+", "", line[:-1].strip())
-                if name:
-                    return name
-    except:
+        m = re.search(r"[Ss]ystem [Nn]ame\s*[:\-]?\s*(\S+)", buf)
+        if m:
+            return m.group(1).strip()
+    except Exception:
         pass
+
+    # ── Pass 3: parse 'show running-config | include hostname' ──────────────
+    try:
+        shell.send("show running-config | include ^hostname\n")
+        time.sleep(1.5)
+        buf = _drain(shell)
+        m = re.search(r"^hostname\s+(\S+)", buf, re.M)
+        if m:
+            return m.group(1).strip()
+    except Exception:
+        pass
+
     return "Unknown"
 
 # ============================================================================
@@ -472,8 +509,8 @@ def run_commands(shell):
     transceiver = send_cmd(shell, "show interfaces transceiver")
     logger.info("  [7/8] show lldp neighbors detail")
     lldp        = send_cmd(shell, "show lldp neighbors detail", timeout=60)
-    logger.info("  [8/8] show mac address-table")
-    mac_table   = send_cmd(shell, "show mac address-table", timeout=60)
+    logger.info("  [8/8] show mac address-table dynamic")
+    mac_table   = send_cmd(shell, "show mac address-table dynamic", timeout=60)
     return dict(ip_brief=ip_brief, intf_full=intf_full,
                 intf_status=intf_status, intf_trunk=intf_trunk,
                 intf_errs=intf_errs, transceiver=transceiver,
@@ -1093,50 +1130,72 @@ def parse_lldp(lldp_out):
 
 def parse_mac_table(mac_table_out):
     """
-    Parses 'show mac address-table'.
+    Parses 'show mac address-table dynamic'.
 
-    IOS-XE format:
+    C9500 IOS-XE output format:
           Mac Address Table
     -------------------------------------------
     Vlan    Mac Address       Type        Ports
     ----    -----------       --------    -----
      100    001a.2b3c.4d5e   DYNAMIC     Twe1/0/3
-     100    001a.2b3c.4d5f   DYNAMIC     Twe1/0/3
-     800    aabb.ccdd.eeff   STATIC      CPU
+     800    001a.2b3c.4d5f   DYNAMIC     Po1
+     All    0000.0000.0000   STATIC      CPU        <- skipped by port filter
+
+    Robustness notes:
+    - Uses a regex per line rather than positional split so column padding
+      and "All" VLAN values don't cause silent misses.
+    - MAC is found by pattern anywhere in the line, port is the last token.
+    - CPU / Router / Supervisor / Drop ports are excluded.
+    - Works with both Cisco dotted (xxxx.xxxx.xxxx) and colon/dash formats.
 
     Returns:
-      { intf_key: [ "AA:BB:CC:DD:EE:FF", ... ] }   — all unique MACs per port,
-                                                       in XX:XX:XX:XX:XX:XX format,
-                                                       CPU/Router entries excluded.
+      { intf_key: [ "AA:BB:CC:DD:EE:FF", ... ] }
     """
-    result   = {}
-    SKIP_PORTS = {"cpu", "router", "supervisor", "vlan"}
+    result = {}
+
+    # Ports we never want to record MACs for
+    SKIP_PORTS = {"cpu", "router", "supervisor", "drop", "vlan", "igmp"}
+
+    # Match a line that contains a MAC address — Cisco dotted or colon/dash
+    MAC_PAT = re.compile(
+        r"([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}"   # Cisco dotted
+        r"|[0-9a-f]{2}[:\-][0-9a-f]{2}[:\-][0-9a-f]{2}"
+        r"[:\-][0-9a-f]{2}[:\-][0-9a-f]{2}[:\-][0-9a-f]{2})",  # colon/dash
+        re.I
+    )
 
     for line in mac_table_out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        # Must contain a MAC
+        mac_m = MAC_PAT.search(line)
+        if not mac_m:
+            continue
+
+        # Port is the last whitespace-separated token on the line
         parts = line.split()
-        # Expect at least 4 columns: Vlan  MacAddr  Type  Port
-        if len(parts) < 4:
-            continue
+        port  = parts[-1]
 
-        # Vlan column must be numeric
-        if not parts[0].isdigit():
-            continue
-
-        mac_raw = parts[1]
-        port    = parts[3]
-
-        # Skip CPU/internal entries
+        # Skip internal/CPU ports
         if any(port.lower().startswith(s) for s in SKIP_PORTS):
             continue
 
-        # Validate MAC pattern  (Cisco: xxxx.xxxx.xxxx  or  xx:xx:xx:xx:xx:xx)
-        clean = re.sub(r"[:.\-]", "", mac_raw).lower()
-        if len(clean) != 12 or not re.fullmatch(r"[0-9a-f]{12}", clean):
+        # Port must start with a letter and be at least 3 chars long.
+        # This filters stray summary lines like "42" or "Total" while allowing
+        # Po1, Gi0/1, Twe1/0/1, Ap1/0/1, Te1/1/1 etc.
+        if not re.match(r"^[A-Za-z]{2}", port) or len(port) < 3:
             continue
 
+        # Normalise MAC to XX:XX:XX:XX:XX:XX uppercase
+        raw_mac = mac_m.group(1)
+        clean   = re.sub(r"[:.\-]", "", raw_mac).lower()
+        if len(clean) != 12 or not re.fullmatch(r"[0-9a-f]{12}", clean):
+            continue
         mac_fmt = ":".join(clean[i:i+2] for i in range(0, 12, 2)).upper()
-        key     = intf_key(port)
 
+        key = intf_key(port)
         if key not in result:
             result[key] = []
         if mac_fmt not in result[key]:
@@ -1240,16 +1299,11 @@ def assemble_rows(up_map, raw_cmds):
         row["LLDP Neighbor MAC"] = lldp.get("mac",      "")
         row["LLDP Neighbor IP"]  = lldp.get("ip",       "")
 
-        # MAC address-table entries — populated only when no LLDP neighbor found.
-        # Always captures every unique MAC on the port (handles bridged cameras).
-        if not lldp:
-            row["MAC Table Entries"] = "; ".join(mac_tbl) if mac_tbl else ""
-        else:
-            # Port has an LLDP peer — MAC is already captured there; leave blank
-            # unless there are *extra* MACs beyond the LLDP chassis MAC
-            lldp_mac = lldp.get("mac", "").upper()
-            extras = [m for m in mac_tbl if m.upper() != lldp_mac]
-            row["MAC Table Entries"] = "; ".join(extras) if extras else ""
+        # MAC address-table entries — always populate with every unique MAC
+        # seen on this port regardless of whether LLDP found a neighbor.
+        # Multiple MACs on one port = bridged device (camera with built-in switch,
+        # unmanaged hub, IP phone + PC passthrough, etc.)
+        row["MAC Table Entries"] = "; ".join(mac_tbl) if mac_tbl else ""
 
         row["Has Drops?"] = "YES" if any(
             _int(row.get(c, 0)) > 0 for c in DROP_COLUMNS
@@ -1299,12 +1353,28 @@ def write_excel(all_device_rows, out_path):
         used_sheet_names.add(sheet_name)
         ws = wb.create_sheet(title=sheet_name)
 
-        for ci, col in enumerate(COLUMNS, 1):
-            _hdr(ws.cell(row=1, column=ci, value=col))
-        ws.freeze_panes = "B2"
-        ws.row_dimensions[1].height = 36
+        # ── Row 1: full device identity (never truncated) ────────────────────
+        # Extract hostname and IP from the device label "HOSTNAME (IP)"
+        _ip_m   = re.search(r"\(([^)]+)\)$", device)
+        _ip     = _ip_m.group(1) if _ip_m else ""
+        _host   = device.replace(f" ({_ip})", "").strip() if _ip else device.strip()
+        title_cell = ws.cell(row=1, column=1,
+                             value=f"Device: {_host}   IP: {_ip}   "
+                                   f"Collected: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        title_cell.font      = Font(bold=True, size=11, color="FFFFFF")
+        title_cell.fill      = PatternFill("solid", fgColor="1F4E79")
+        title_cell.alignment = Alignment(horizontal="left", vertical="center")
+        ws.merge_cells(start_row=1, start_column=1,
+                       end_row=1,   end_column=len(COLUMNS))
+        ws.row_dimensions[1].height = 22
 
-        for ri, row_data in enumerate(rows, 2):
+        # ── Row 2: column headers ─────────────────────────────────────────────
+        for ci, col in enumerate(COLUMNS, 1):
+            _hdr(ws.cell(row=2, column=ci, value=col))
+        ws.freeze_panes = "B3"          # freeze title + header, first col
+        ws.row_dimensions[2].height = 36
+
+        for ri, row_data in enumerate(rows, 3):
             mode   = row_data.get("Mode", "").lower()
             is_alt = (ri % 2 == 0)
 
@@ -1352,7 +1422,7 @@ def write_excel(all_device_rows, out_path):
         # Auto-size columns
         for ci, col in enumerate(COLUMNS, 1):
             mx = len(col)
-            for ri2 in range(2, ws.max_row + 1):
+            for ri2 in range(3, ws.max_row + 1):   # skip title row
                 v = ws.cell(row=ri2, column=ci).value
                 if v:
                     mx = max(mx, len(str(v)))
@@ -1368,7 +1438,7 @@ def write_excel(all_device_rows, out_path):
                                 f"Access/Other: {total - trunks}  |  Drop ports: {drops}"))
         footer_cell.font = Font(bold=True, size=9, color="1F4E79")
 
-        logger.info(f"  Sheet '{sheet_name}': {total} interfaces, {drops} with drops")
+        logger.info(f"  Sheet '{sheet_name}' [{_host}]: {total} interfaces, {drops} with drops")
 
     # ── Run Summary sheet (index 0) ──────────────────────────────────────────
     ws_s = wb.create_sheet(title="Run Summary", index=0)
