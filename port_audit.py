@@ -35,16 +35,17 @@ warnings.filterwarnings("ignore")
 AGG_SWITCH_IP = "192.168.0.251"
 
 CREDENTIAL_SETS = [
-    {"username": "admin",  "password": "cisco",                "enable": ""}
+    {"username": "admin",  "password": "admin",                "enable": "flounder"},
+    {"username": "Admin",  "password": "/2/_HKX6YvCGMwzAdJp",  "enable": ""},
 ]
 
 CMD_TIMEOUT  = 60
 JUMP_TIMEOUT = 30
 
-RETRY_COUNT = 10    # How many times to retry a failed connection (not counting the first attempt)
+RETRY_COUNT = 2    # How many times to retry a failed connection (not counting the first attempt)
 RETRY_DELAY = 5    # Seconds to wait between retries
 
-CLEAR_WAIT  = 30  # Seconds to wait after 'clear counters' before collecting (default: 5 min)
+CLEAR_WAIT  = 300  # Seconds to wait after 'clear counters' before collecting (default: 5 min)
 
 # ============================================================================
 # INTERFACE NAME NORMALIZATION
@@ -147,6 +148,17 @@ COLUMNS = [
     "Rx Power (dBm)",
     "SFP Alarms",      # human-readable alarm list e.g. "LOW-RX, HIGH-TEMP"
     "SFP Status",      # OK | WARN | ALARM | NOT PRESENT | N/A
+    # From show interfaces transceiver detail (fiber SFP thresholds)
+    "Rx Hi Alarm (dBm)",   # DOM threshold — high alarm
+    "Rx Hi Warn (dBm)",    # DOM threshold — high warning
+    "Rx Lo Warn (dBm)",    # DOM threshold — low warning  (most useful for fiber)
+    "Rx Lo Alarm (dBm)",   # DOM threshold — low alarm
+    "Tx Hi Alarm (dBm)",
+    "Tx Hi Warn (dBm)",
+    "Tx Lo Warn (dBm)",
+    "Tx Lo Alarm (dBm)",
+    "Rx Margin (dB)",      # Rx Power minus Rx Lo Warn — negative means below threshold
+    "Fiber Rx Health",     # OK / NEAR WARN / BELOW WARN / BELOW ALARM / N/A
     # From show lldp neighbors detail
     "LLDP Neighbor",     # System name
     "LLDP Neighbor MAC", # Chassis MAC from LLDP
@@ -507,14 +519,19 @@ def run_commands(shell):
     intf_errs   = send_cmd(shell, "show interfaces counters errors")
     logger.info("  [6/6] show interfaces transceiver")
     transceiver = send_cmd(shell, "show interfaces transceiver")
-    logger.info("  [7/8] show lldp neighbors detail")
+    logger.info("  [7/9] show lldp neighbors detail")
     lldp        = send_cmd(shell, "show lldp neighbors detail", timeout=60)
-    logger.info("  [8/8] show mac address-table dynamic")
+    logger.info("  [8/9] show mac address-table dynamic")
     mac_table   = send_cmd(shell, "show mac address-table dynamic", timeout=60)
+    logger.info("  [9/10] show interfaces transceiver detail")
+    xcvr_detail  = send_cmd(shell, "show interfaces transceiver detail", timeout=60)
+    logger.info("  [10/10] show etherchannel summary")
+    etherchannel = send_cmd(shell, "show etherchannel summary")
     return dict(ip_brief=ip_brief, intf_full=intf_full,
                 intf_status=intf_status, intf_trunk=intf_trunk,
                 intf_errs=intf_errs, transceiver=transceiver,
-                lldp=lldp, mac_table=mac_table)
+                lldp=lldp, mac_table=mac_table, xcvr_detail=xcvr_detail,
+                etherchannel=etherchannel)
 
 # ============================================================================
 # PARSERS
@@ -1204,6 +1221,192 @@ def parse_mac_table(mac_table_out):
     return result
 
 
+def parse_transceiver_detail(xcvr_detail_out):
+    """
+    Parses 'show interfaces transceiver detail'.
+
+    Extracts per-interface threshold values for Rx and Tx optical power.
+    Only produces entries for fiber SFP interfaces that support DOM.
+
+    C9500 IOS-XE — two column orderings are seen in the wild:
+
+    Layout A  (Current first):
+    ─────────────────────────────────────────────────────────────────────────
+    TwentyFiveGigE1/0/1
+                              Current    High Alarm  High Warn   Low Warn  Low Alarm
+      Temperature (Celsius) :  35.1        85.0        80.0        -5.0      -10.0
+      Optical Tx Power (dBm):  -2.51        1.9         0.9        -8.2       -9.2
+      Optical Rx Power (dBm):  -3.14        2.0        -1.0       -14.0      -15.0
+    ─────────────────────────────────────────────────────────────────────────
+
+    Layout B  (Thresholds first, current last):
+    ─────────────────────────────────────────────────────────────────────────
+    TwentyFiveGigE1/0/1
+                               High Alarm  High Warn  Low Warn   Low Alarm
+      Temperature (Celsius) :  85.0        80.0       -5.0       -10.0       35.1
+      Optical Tx Power (dBm):   1.9         0.9        -8.2       -9.2       -2.51
+      Optical Rx Power (dBm):   2.0        -1.0       -14.0      -15.0       -3.14
+    ─────────────────────────────────────────────────────────────────────────
+
+    Returns:
+      { intf_key: {
+          "Rx Hi Alarm (dBm)": float, "Rx Hi Warn (dBm)":  float,
+          "Rx Lo Warn (dBm)":  float, "Rx Lo Alarm (dBm)": float,
+          "Tx Hi Alarm (dBm)": float, "Tx Hi Warn (dBm)":  float,
+          "Tx Lo Warn (dBm)":  float, "Tx Lo Alarm (dBm)": float,
+      } }
+    Only interfaces with valid optical readings are returned.
+    """
+    result  = {}
+
+    # Split into per-interface blocks — interface name at column 0
+    blocks = re.split(r"\n(?=[A-Za-z])", xcvr_detail_out)
+
+    # Pattern to extract all numeric tokens (including negative floats) from a line
+    NUM_PAT  = re.compile(r"-?\d+\.\d+|-?\d+")
+
+    # Patterns to identify Rx / Tx power lines
+    RX_PAT   = re.compile(r"optical\s+rx|rx\s+power", re.I)
+    TX_PAT   = re.compile(r"optical\s+tx|tx\s+power", re.I)
+
+    # Column header pattern — detects which layout we are in
+    # Layout A has "Current" before "High Alarm"
+    # Layout B has "High Alarm" without "Current" preceding it
+    LAYOUT_A = re.compile(r"current.*high\s+alarm", re.I)
+    LAYOUT_B = re.compile(r"high\s+alarm.*high\s+warn", re.I)
+
+    def _safe_float(s):
+        try:
+            return float(s)
+        except (TypeError, ValueError):
+            return None
+
+    for block in blocks:
+        lines = block.splitlines()
+        if not lines:
+            continue
+
+        # First non-empty line must be an interface name
+        first = lines[0].strip()
+        if not re.match(r"^[A-Za-z][\w/.-]+$", first):
+            continue
+        key = intf_key(first)
+
+        # Skip if "not present" or no DOM support
+        if re.search(r"not present|not installed|dom not supported|"
+                     r"transceiver is not present|n/a", block, re.I):
+            continue
+
+        # Detect column layout from the header line inside this block
+        layout = "B"   # default
+        col_order_rx  = ["hi_alarm", "hi_warn", "lo_warn", "lo_alarm"]   # Layout B
+        col_order_tx  = ["hi_alarm", "hi_warn", "lo_warn", "lo_alarm"]
+
+        for line in lines:
+            if LAYOUT_A.search(line):
+                layout = "A"
+                # Layout A: Current  Hi-Alarm  Hi-Warn  Lo-Warn  Lo-Alarm
+                col_order_rx = ["current", "hi_alarm", "hi_warn", "lo_warn", "lo_alarm"]
+                col_order_tx = ["current", "hi_alarm", "hi_warn", "lo_warn", "lo_alarm"]
+                break
+            if LAYOUT_B.search(line):
+                layout = "B"
+                # Layout B: Hi-Alarm  Hi-Warn  Lo-Warn  Lo-Alarm  [Current at end]
+                col_order_rx = ["hi_alarm", "hi_warn", "lo_warn", "lo_alarm"]
+                col_order_tx = ["hi_alarm", "hi_warn", "lo_warn", "lo_alarm"]
+                break
+
+        d = {}
+
+        for line in lines[1:]:
+            nums = NUM_PAT.findall(line)
+            if not nums:
+                continue
+
+            if RX_PAT.search(line):
+                for idx, field in enumerate(col_order_rx):
+                    if idx < len(nums):
+                        v = _safe_float(nums[idx])
+                        if v is not None and field != "current":
+                            key_name = {
+                                "hi_alarm": "Rx Hi Alarm (dBm)",
+                                "hi_warn":  "Rx Hi Warn (dBm)",
+                                "lo_warn":  "Rx Lo Warn (dBm)",
+                                "lo_alarm": "Rx Lo Alarm (dBm)",
+                            }[field]
+                            d[key_name] = v
+
+            elif TX_PAT.search(line):
+                for idx, field in enumerate(col_order_tx):
+                    if idx < len(nums):
+                        v = _safe_float(nums[idx])
+                        if v is not None and field != "current":
+                            key_name = {
+                                "hi_alarm": "Tx Hi Alarm (dBm)",
+                                "hi_warn":  "Tx Hi Warn (dBm)",
+                                "lo_warn":  "Tx Lo Warn (dBm)",
+                                "lo_alarm": "Tx Lo Alarm (dBm)",
+                            }[field]
+                            d[key_name] = v
+
+        # Only store if we got at least Rx thresholds
+        if "Rx Lo Warn (dBm)" in d or "Rx Lo Alarm (dBm)" in d:
+            result[key] = d
+
+    return result
+
+
+def parse_etherchannel(etherchannel_out):
+    """
+    Parses 'show etherchannel summary'.
+
+    C9500 IOS-XE format:
+    ─────────────────────────────────────────────────────────────────────────
+    Flags:  D - down        P - bundled in port-channel
+            I - stand-alone s - suspended
+            H - Hot-standby (LACP only)
+            R - Layer3      S - Layer2
+            U - in use      N - not in use, no aggregation
+            f - failed to allocate aggregator
+
+    Number of channel-groups in use: 1
+    Number of aggregators:           1
+
+    Group  Port-channel  Protocol    Ports
+    ------+-------------+-----------+-----------------------------------------------
+    1      Po1(SU)         LACP      Twe1/1/2(P)  Twe1/1/3(P)
+    ─────────────────────────────────────────────────────────────────────────
+
+    Returns:
+      { intf_key_of_member: "Po1" }
+      e.g. { "twe1/1/2": "Po1", "twe1/1/3": "Po1" }
+    """
+    result  = {}
+    # Match the data rows — group number, port-channel, protocol, then member ports
+    # Members look like:  Twe1/1/2(P)  Twe1/1/3(P)   flag in parentheses
+    MEMBER_PAT = re.compile(r"([A-Za-z][\w/.-]+)\([A-Za-z]+\)")
+    PO_PAT     = re.compile(r"(Po\d+)\(", re.I)
+
+    for line in etherchannel_out.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("Flags", "Number", "Group", "---", "R", "S")):
+            continue
+        # Find the Port-channel on this line
+        po_m = PO_PAT.search(line)
+        if not po_m:
+            continue
+        po_name = po_m.group(1)   # e.g. "Po1"
+        # Find all member ports on the same line
+        members = MEMBER_PAT.findall(line)
+        for member in members:
+            # Skip the port-channel itself appearing as a member token
+            if member.lower().startswith("po"):
+                continue
+            result[intf_key(member)] = po_name
+
+    return result
+
+
 # ============================================================================
 # ROW ASSEMBLY
 # ============================================================================
@@ -1224,8 +1427,10 @@ def assemble_rows(up_map, raw_cmds):
     counter_map = parse_intf_full(raw_cmds["intf_full"], set(up_map.keys()))
     err_map     = parse_intf_counters_errors(raw_cmds["intf_errs"])
     sfp_map     = parse_transceiver(raw_cmds.get("transceiver", ""))
-    lldp_map     = parse_lldp(raw_cmds.get("lldp", ""))
-    mac_tbl_map  = parse_mac_table(raw_cmds.get("mac_table", ""))
+    lldp_map      = parse_lldp(raw_cmds.get("lldp", ""))
+    mac_tbl_map   = parse_mac_table(raw_cmds.get("mac_table", ""))
+    xcvr_dtl_map  = parse_transceiver_detail(raw_cmds.get("xcvr_detail", ""))
+    po_member_map = parse_etherchannel(raw_cmds.get("etherchannel", ""))
 
     rows = []
     for key in sorted(up_map.keys(), key=lambda k: _sort_key(up_map[k])):
@@ -1238,16 +1443,32 @@ def assemble_rows(up_map, raw_cmds):
         err  = err_map.get(key,     {})
         trk  = trunk_map.get(key,   {})
         sfp  = sfp_map.get(key,     {})
-        lldp    = lldp_map.get(key,     {})
-        mac_tbl = mac_tbl_map.get(key, [])
+        lldp     = lldp_map.get(key,      {})
+        mac_tbl  = mac_tbl_map.get(key,  [])
+        xcvr_dtl = xcvr_dtl_map.get(key, {})
 
         row["Description"] = st.get("description") or ctr.get("Description", "")
 
-        # Mode
-        if key in trunk_map:
-            row["Mode"] = "trunk"
-        elif display.lower().startswith("port-channel") or key.startswith("po"):
+        # ── Mode detection — priority order ──────────────────────────────────
+        # 1. Explicit port-channel interface (Po1)
+        # 2. Port-channel member (bundled into EtherChannel) — labeled as
+        #    "pc-member (PoX)" so you know which bundle it belongs to
+        # 3. In show interfaces trunk → trunk
+        # 4. show interfaces status vlan field == "trunk" → trunk
+        #    (catches trunk members NOT in 'show int trunk' like EtherChannel members
+        #     and ports with no cdp / nonegotiate where IOS omits them)
+        # 5. Default → access
+        _po_parent  = po_member_map.get(key, "")
+        _status_vlan = st.get("vlan", "").lower()
+
+        if display.lower().startswith("port-channel") or key.startswith("po"):
             row["Mode"] = "port-channel"
+        elif _po_parent:
+            row["Mode"] = f"pc-member ({_po_parent})"
+        elif key in trunk_map:
+            row["Mode"] = "trunk"
+        elif _status_vlan == "trunk":
+            row["Mode"] = "trunk"
         else:
             row["Mode"] = "access"
 
@@ -1255,10 +1476,18 @@ def assemble_rows(up_map, raw_cmds):
         row["Speed"]  = st.get("speed")  or ctr.get("Speed",  "")
         row["Duplex"] = st.get("duplex") or ctr.get("Duplex", "")
 
-        # VLAN info
+        # VLAN info — trunk_map or fallback to status vlan field
+        _is_trunk = row["Mode"] in ("trunk",) or row["Mode"].startswith("pc-member")
         if key in trunk_map:
             row["Native VLAN"]   = trk.get("native_vlan",  "")
             row["Allowed VLANs"] = trk.get("allowed_vlans", "")
+        elif _is_trunk and _status_vlan == "trunk":
+            # Member port not in trunk table — pull allowed VLANs from
+            # the parent port-channel entry in trunk_map if available
+            _po_key = intf_key(_po_parent) if _po_parent else ""
+            _po_trk = trunk_map.get(_po_key, {})
+            row["Native VLAN"]   = _po_trk.get("native_vlan",  "")
+            row["Allowed VLANs"] = _po_trk.get("allowed_vlans", "")
         else:
             row["Native VLAN"]   = ""
             row["Allowed VLANs"] = st.get("vlan", "")
@@ -1294,6 +1523,41 @@ def assemble_rows(up_map, raw_cmds):
         row["SFP Alarms"]    = sfp.get("SFP Alarms",       "")
         row["SFP Status"]    = sfp.get("SFP Status",       "N/A")
 
+        # Transceiver detail — thresholds and margin (fiber interfaces only)
+        for _tc in ["Rx Hi Alarm (dBm)", "Rx Hi Warn (dBm)",
+                    "Rx Lo Warn (dBm)",  "Rx Lo Alarm (dBm)",
+                    "Tx Hi Alarm (dBm)", "Tx Hi Warn (dBm)",
+                    "Tx Lo Warn (dBm)",  "Tx Lo Alarm (dBm)"]:
+            row[_tc] = xcvr_dtl.get(_tc, "N/A")
+
+        # Rx Margin = current Rx power minus Low Warn threshold
+        # Negative margin means the signal is already below the warning threshold
+        _rx_now     = sfp.get("Rx Power (dBm)", None)
+        _rx_lo_warn = xcvr_dtl.get("Rx Lo Warn (dBm)", None)
+        if isinstance(_rx_now, (int, float)) and isinstance(_rx_lo_warn, (int, float)):
+            _margin = round(float(_rx_now) - float(_rx_lo_warn), 2)
+            row["Rx Margin (dB)"] = _margin
+            if _margin < 0:
+                row["Fiber Rx Health"] = "BELOW WARN"
+            elif _margin < 2:
+                row["Fiber Rx Health"] = "NEAR WARN"
+            else:
+                row["Fiber Rx Health"] = "OK"
+        elif xcvr_dtl:
+            # Thresholds present but current Rx reading unavailable
+            row["Rx Margin (dB)"]  = "N/A"
+            row["Fiber Rx Health"] = "N/A"
+        else:
+            # Not a fiber/DOM interface
+            row["Rx Margin (dB)"]  = ""
+            row["Fiber Rx Health"] = ""
+
+        # Also compare against Low Alarm for deeper diagnosis
+        _rx_lo_alarm = xcvr_dtl.get("Rx Lo Alarm (dBm)", None)
+        if isinstance(_rx_now, (int, float)) and isinstance(_rx_lo_alarm, (int, float)):
+            if float(_rx_now) < float(_rx_lo_alarm):
+                row["Fiber Rx Health"] = "BELOW ALARM"
+
         # LLDP neighbor info
         row["LLDP Neighbor"]     = lldp.get("hostname", "")
         row["LLDP Neighbor MAC"] = lldp.get("mac",      "")
@@ -1324,6 +1588,10 @@ DROP_YES   = PatternFill("solid", fgColor="C00000")
 SFP_WARN   = PatternFill("solid", fgColor="FFE699")   # amber — SFP warning threshold
 SFP_ALARM  = PatternFill("solid", fgColor="FF7F00")   # orange — SFP alarm threshold
 SFP_ABSENT = PatternFill("solid", fgColor="BFBFBF")   # grey — NOT PRESENT
+RX_OK      = PatternFill("solid", fgColor="C6EFCE")   # green  — Rx healthy
+RX_NEAR    = PatternFill("solid", fgColor="FFEB9C")   # yellow — within 2 dB of threshold
+RX_WARN    = PatternFill("solid", fgColor="FF7F00")   # orange — below Low Warn
+RX_ALARM   = PatternFill("solid", fgColor="C00000")   # red    — below Low Alarm
 ALT_FILL   = PatternFill("solid", fgColor="F5F5F5")
 _THIN      = Side(style="thin", color="CCCCCC")
 _BORDER    = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
@@ -1418,6 +1686,33 @@ def write_excel(all_device_rows, out_path):
                 if col == "Has Drops?" and val == "YES":
                     cell.fill = DROP_YES
                     cell.font = Font(size=9, bold=True, color="FFFFFF")
+
+                # Fiber Rx Health — color-coded signal margin status
+                if col == "Fiber Rx Health":
+                    if val == "OK":
+                        cell.fill = RX_OK
+                        cell.font = Font(size=9, bold=True, color="1A6130")
+                    elif val == "NEAR WARN":
+                        cell.fill = RX_NEAR
+                        cell.font = Font(size=9, bold=True, color="5C4000")
+                    elif val == "BELOW WARN":
+                        cell.fill = RX_WARN
+                        cell.font = Font(size=9, bold=True, color="FFFFFF")
+                    elif val == "BELOW ALARM":
+                        cell.fill = RX_ALARM
+                        cell.font = Font(size=9, bold=True, color="FFFFFF")
+
+                # Rx Margin — highlight negative values (signal below threshold)
+                if col == "Rx Margin (dB)" and val not in ("", "N/A"):
+                    try:
+                        if float(val) < 0:
+                            cell.fill = RX_ALARM
+                            cell.font = Font(size=9, bold=True, color="FFFFFF")
+                        elif float(val) < 2:
+                            cell.fill = RX_NEAR
+                            cell.font = Font(size=9, bold=True, color="5C4000")
+                    except (TypeError, ValueError):
+                        pass
 
         # Auto-size columns
         for ci, col in enumerate(COLUMNS, 1):
