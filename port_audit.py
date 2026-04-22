@@ -32,11 +32,10 @@ warnings.filterwarnings("ignore")
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-AGG_SWITCH_IP = "192.168.0.251"
+AGG_SWITCH_IP = ""
 
 CREDENTIAL_SETS = [
-    {"username": "admin",  "password": "admin",                "enable": "flounder"},
-    {"username": "Admin",  "password": "/2/_HKX6YvCGMwzAdJp",  "enable": ""},
+    {"username": "",  "password": "", "enable": ""}
 ]
 
 CMD_TIMEOUT  = 60
@@ -340,6 +339,47 @@ def get_hostname(shell):
         pass
 
     return "Unknown"
+
+def verify_on_target(shell, expected_hostname):
+    """
+    Confirm the current shell prompt belongs to expected_hostname, NOT the agg.
+
+    Sends a blank line and reads the resulting prompt. Compares it against:
+      - The expected target hostname
+      - The known aggregate hostname (agg_hostname global)
+
+    Returns:
+      True  — prompt matches the target, safe to collect
+      False — prompt matches the agg or is unrecognisable (wrong device)
+
+    This catches the race condition where get_hostname() reads a stale buffered
+    target hostname while the shell has already silently dropped back to the agg.
+    """
+    try:
+        shell.send("\n"); time.sleep(0.8)
+        buf = _drain(shell)
+        for line in reversed([l.strip() for l in buf.splitlines() if l.strip()]):
+            clean = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line)
+            if not clean.endswith(("#", ">")):
+                continue
+            prompt_host = re.sub(r"^[^\w]+", "", clean[:-1].strip()).lower()
+            exp = expected_hostname.lower()
+            agg = agg_hostname.lower()
+
+            # Definitive hit: prompt contains target hostname
+            if exp and (exp in prompt_host or prompt_host in exp):
+                return True
+            # Definitive miss: we are back on the aggregate
+            if agg and agg != "unknown" and (agg in prompt_host or prompt_host in agg):
+                logger.warning(f"  verify_on_target: prompt is the AGGREGATE "
+                               f"('{prompt_host}'), not '{exp}' — shell drifted back")
+                return False
+    except Exception as e:
+        logger.warning(f"  verify_on_target error: {e}")
+    # Could not confirm either way — assume OK but log it
+    logger.debug(f"  verify_on_target: could not confirm prompt for '{expected_hostname}'")
+    return True   # optimistic — let run_commands proceed; OSError will catch a real drop
+
 
 # ============================================================================
 # AGG / JUMP HOST
@@ -1830,6 +1870,12 @@ def main():
                 if not hostname:
                     break  # credential failure — retrying won't help
                 shell = agg_shell
+
+            # ── Verify we are actually on the target, not the agg ──────────
+            if not args.no_jump:
+                if not verify_on_target(shell, hostname):
+                    logger.warning(f"  Shell is on wrong device — treating as drop, retrying ...")
+                    continue  # triggers retry loop: reconnect agg → re-jump → re-verify
 
             # ── Collect commands ────────────────────────────────────────────
             try:
