@@ -32,19 +32,20 @@ warnings.filterwarnings("ignore")
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-AGG_SWITCH_IP = ""
+AGG_SWITCH_IP = "192.168.1.11"
 
 CREDENTIAL_SETS = [
-    {"username": "",  "password": "", "enable": ""}
+    {"username": "admin",  "password": "cisco", "enable": ""},
+    {"username": "admin",  "password": "AG37jjYpnyB4@",  "enable": ""},
 ]
 
 CMD_TIMEOUT  = 60
 JUMP_TIMEOUT = 30
 
-RETRY_COUNT = 2    # How many times to retry a failed connection (not counting the first attempt)
+RETRY_COUNT = 10    # How many times to retry a failed connection (not counting the first attempt)
 RETRY_DELAY = 5    # Seconds to wait between retries
 
-CLEAR_WAIT  = 300  # Seconds to wait after 'clear counters' before collecting (default: 5 min)
+CLEAR_WAIT  = 30  # Seconds to wait after 'clear counters' before collecting (default: 5 min)
 
 # ============================================================================
 # INTERFACE NAME NORMALIZATION
@@ -421,42 +422,134 @@ def connect_to_agg(agg_ip):
     logger.error(f"  Gave up connecting to aggregate {agg_ip} after {RETRY_COUNT + 1} attempts")
     return False
 
+# Patterns that definitively mean this credential was rejected
+_AUTH_FAIL_PATTERNS = re.compile(
+    r"closed by foreign host"
+    r"|connection.*closed"
+    r"|authentication failed"
+    r"|login invalid"
+    r"|access denied"
+    r"|permission denied"
+    r"|% bad passwords"
+    r"|% too many failed",
+    re.I
+)
+
+
 def jump_to_target(target_ip):
+    """
+    SSH from the aggregate shell into target_ip, trying each credential set.
+
+    Key behaviours:
+    - Sends a credential's password exactly ONCE per SSH session.
+      If a second "Password:" prompt arrives it means the first password was
+      wrong — mark this credential as failed and move on immediately.
+    - Detects "[Connection to X closed by foreign host]" and similar messages
+      as a definitive auth failure for the current credential.
+    - Accounts for the per-attempt delay (up to 5 s) the target may impose
+      between password prompts by using a per-credential timeout of
+      max(JUMP_TIMEOUT, len(CREDENTIAL_SETS) * 10) seconds.
+    """
     global agg_shell
+
+    # Give enough time for the target's inter-prompt delay across all creds
+    cred_timeout = max(JUMP_TIMEOUT, len(CREDENTIAL_SETS) * 10)
+
     for attempt in range(1, RETRY_COUNT + 2):
         if attempt > 1:
-            logger.info(f"  [Retry {attempt - 1}/{RETRY_COUNT}] Jumping to {target_ip} in {RETRY_DELAY}s ...")
+            logger.info(f"  [Retry {attempt - 1}/{RETRY_COUNT}] Jumping to {target_ip} "
+                        f"in {RETRY_DELAY}s ...")
             time.sleep(RETRY_DELAY)
-            return_to_agg()   # ensure we're back at a clean agg prompt before retrying
+            return_to_agg()
+
         for i, cred in enumerate(CREDENTIAL_SETS):
+            logger.debug(f"  Trying credential #{i} for {target_ip}")
             try:
-                agg_shell.send("\x03"); time.sleep(0.3); _drain(agg_shell)
+                # Clean the agg shell buffer before each SSH attempt
+                agg_shell.send("\x03"); time.sleep(0.4); _drain(agg_shell)
                 agg_shell.send(f"ssh -l {cred['username']} {target_ip}\n")
-                buf, start = "", time.time()
-                while (time.time() - start) < JUMP_TIMEOUT:
+
+                buf            = ""
+                start          = time.time()
+                pw_sent        = False   # track whether we have already sent a password
+                                         # for this credential attempt
+                cred_failed    = False
+
+                while (time.time() - start) < cred_timeout:
                     if agg_shell.recv_ready():
                         chunk = agg_shell.recv(65535).decode("utf-8", "ignore")
-                        buf += chunk
-                        if "password:" in chunk.lower():
-                            agg_shell.send(cred["password"] + "\n")
+                        buf  += chunk
+
+                        # ── Definitive auth failure strings ──────────────────
+                        if _AUTH_FAIL_PATTERNS.search(chunk):
+                            logger.warning(f"  Cred #{i} rejected by {target_ip}: "
+                                           f"{chunk.strip()!r:.80}")
+                            cred_failed = True
+                            break
+
+                        # ── Host key / first-time connection ─────────────────
                         if "yes/no" in chunk.lower():
                             agg_shell.send("yes\n")
+
+                        # ── Password prompt ───────────────────────────────────
+                        if "password:" in chunk.lower():
+                            if not pw_sent:
+                                agg_shell.send(cred["password"] + "\n")
+                                pw_sent = True
+                            else:
+                                # Second password prompt = wrong password
+                                logger.warning(f"  Cred #{i} password rejected by {target_ip} "
+                                               f"(second prompt received)")
+                                cred_failed = True
+                                break
+
+                        # ── Got a shell prompt ────────────────────────────────
                         if re.search(r"(?m)^[^\r\n>\s][^\r\n>]*[>#]\s?$", buf):
+                            # Check we are not just seeing the agg's own prompt
+                            # after the target closed the connection
+                            if _AUTH_FAIL_PATTERNS.search(buf):
+                                logger.warning(f"  Cred #{i} — connection closed before "
+                                               f"prompt established for {target_ip}")
+                                cred_failed = True
+                                break
+
+                            # Handle user-exec mode (> instead of #)
                             if ">" in buf and "#" not in buf:
                                 agg_shell.send("enable\n"); time.sleep(0.5)
-                                agg_shell.send(cred.get("enable", cred["password"]) + "\n")
+                                agg_shell.send(
+                                    cred.get("enable", cred["password"]) + "\n")
+                                time.sleep(1)
+                                # Drain the enable response before proceeding
+                                buf += _drain(agg_shell)
+
                             send_cmd(agg_shell, "terminal length 0", silent=True)
                             hostname = get_hostname(agg_shell)
                             logger.info(f"  Jumped to {hostname} ({target_ip})"
                                         + (f" [attempt {attempt}]" if attempt > 1 else ""))
                             stats.record(target_ip, i, True, hostname=hostname)
                             return hostname
-                    time.sleep(0.3)
+
+                    time.sleep(0.2)
+
+                if cred_failed:
+                    stats.record(target_ip, i, False, error="Authentication rejected")
+                    # Drain any lingering output before trying next credential
+                    time.sleep(1); _drain(agg_shell)
+                    continue   # next credential
+
+                # Timed out waiting for prompt — log and try next credential
+                logger.warning(f"  Cred #{i} timed out waiting for prompt from {target_ip}")
+                stats.record(target_ip, i, False, error="Timed out")
+                time.sleep(1); _drain(agg_shell)
+
             except Exception as e:
                 stats.record(target_ip, i, False, error=str(e))
-        logger.warning(f"  All credentials failed on attempt {attempt} for {target_ip}")
+                logger.warning(f"  Cred #{i} exception for {target_ip}: {e}")
+
+        logger.warning(f"  All credentials exhausted on attempt {attempt} for {target_ip}")
+
     stats.record(target_ip, len(CREDENTIAL_SETS) - 1, False,
-                 error=f"Failed after {RETRY_COUNT + 1} attempts")
+                 error=f"All credentials failed after {RETRY_COUNT + 1} attempts")
     logger.error(f"  Gave up jumping to {target_ip} after {RETRY_COUNT + 1} attempts")
     return False
 
