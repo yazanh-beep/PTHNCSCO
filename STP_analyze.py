@@ -21,6 +21,15 @@ import traceback
 import paramiko
 
 # ─────────────────────────────────────────────
+#  CUSTOM EXCEPTIONS
+# ─────────────────────────────────────────────
+
+class JumpSessionLost(Exception):
+    """Raised when the jump switch socket dies mid-run."""
+    pass
+
+
+# ─────────────────────────────────────────────
 #  CONFIGURATION — edit before running
 # ─────────────────────────────────────────────
 JUMP_HOST_IP     = "192.168.1.11"    # Aggregate/jump switch IP (reachable from server)
@@ -326,7 +335,10 @@ def hop_to_device(
             backoff *= 2
 
         print(f"  [HOP]  Attempt {attempt}/{MAX_HOP_RETRIES} -> {device_ip}")
-        shell.send(f"ssh -l {username} {device_ip}\n")
+        try:
+            shell.send(f"ssh -l {username} {device_ip}\n")
+        except OSError as e:
+            raise JumpSessionLost(f"Jump socket dead before hop: {e}") from e
 
         deadline     = time.time() + CONN_TIMEOUT
         output       = ""
@@ -445,19 +457,32 @@ def enable_privilege_mode(shell, device_ip: str, password: str) -> bool:
 
 
 def _return_to_jump_prompt(shell):
-    """Best-effort return to jump switch prompt after a failed hop."""
-    shell.send("\x03")   # Ctrl-C
-    time.sleep(0.5)
-    shell.send("exit\n")
-    time.sleep(1)
-    drain_buffer(shell)
+    """
+    Best-effort return to jump switch prompt after a failed hop.
+    Raises JumpSessionLost if the socket is already dead so the
+    caller can trigger a full jump reconnect.
+    """
+    try:
+        shell.send("\x03")   # Ctrl-C
+        time.sleep(0.5)
+        shell.send("exit\n")
+        time.sleep(1)
+        drain_buffer(shell)
+    except OSError as e:
+        raise JumpSessionLost(f"Jump socket dead during cleanup: {e}") from e
 
 
 def exit_device(shell):
-    """Clean exit back to jump switch after a successful hop."""
-    shell.send("exit\n")
-    time.sleep(1)
-    drain_buffer(shell)
+    """
+    Clean exit back to jump switch after a successful hop.
+    Raises JumpSessionLost if the socket has gone away.
+    """
+    try:
+        shell.send("exit\n")
+        time.sleep(1)
+        drain_buffer(shell)
+    except OSError as e:
+        raise JumpSessionLost(f"Jump socket dead on exit: {e}") from e
 
 
 # ─────────────────────────────────────────────
@@ -745,6 +770,26 @@ def write_summary(summary_rows: list[dict], output_dir: str) -> str:
     return filename
 
 
+
+def reconnect_jump(
+    jump_ip: str, username: str, password: str, old_client
+) -> tuple:
+    """
+    Close the dead jump connection and establish a fresh one.
+    Returns (new_jump_client, new_shell).
+    """
+    print(f"\n  [JUMP] Socket lost — reconnecting to {jump_ip} ...")
+    try:
+        old_client.close()
+    except Exception:
+        pass   # already dead
+
+    new_client = connect_to_jump(jump_ip, username, password)
+    new_shell  = open_jump_shell(new_client, password)
+    print(f"  [JUMP] Reconnected successfully")
+    return new_client, new_shell
+
+
 # ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
@@ -783,53 +828,97 @@ def main():
     summary_rows = []
 
     # ── Iterate devices ───────────────────────
+    MAX_JUMP_RECONNECTS = 3   # max jump reconnects per device before giving up
+
     for idx, device_ip in enumerate(devices, 1):
         print(f"\n[{idx}/{len(devices)}] ── {device_ip} {'─'*35}")
         STATS.start_device(device_ip)
 
-        try:
-            is_jump = device_ip.strip() == args.jump.strip()
+        # Attempt the device with jump-reconnect recovery
+        jump_reconnects = 0
+        device_done     = False
 
-            if is_jump:
-                print("  [INFO] Jump switch — running commands directly on this session")
-                clear_stp_counters(shell, device_ip)
-                results = run_stp_audit(shell, device_ip)
+        while not device_done:
+            try:
+                is_jump = device_ip.strip() == args.jump.strip()
 
-            else:
-                connected = hop_to_device(shell, device_ip, username, password)
-                if not connected:
+                if is_jump:
+                    print("  [INFO] Jump switch — running commands directly on this session")
+                    clear_stp_counters(shell, device_ip)
+                    results = run_stp_audit(shell, device_ip)
+
+                else:
+                    connected = hop_to_device(shell, device_ip, username, password)
+                    if not connected:
+                        summary_rows.append({
+                            "ip":           device_ip,
+                            "status":       "failed",
+                            "clean":        False,
+                            "findings":     [f"🚨 UNREACHABLE — {STATS.per_device[device_ip]['error_detail']}"],
+                            "error_detail": STATS.per_device[device_ip]["error_detail"],
+                            "report_file":  "N/A",
+                        })
+                        device_done = True
+                        continue
+
+                    clear_stp_counters(shell, device_ip)
+                    results = run_stp_audit(shell, device_ip)
+                    exit_device(shell)
+                    print(f"  [EXIT] Returned to jump switch")
+
+                STATS.device_ok(device_ip)
+                device_done = True
+
+            except JumpSessionLost as e:
+                jump_reconnects += 1
+                print(f"\n  [JUMP] Session lost: {e}")
+
+                if jump_reconnects > MAX_JUMP_RECONNECTS:
+                    reason = f"jump reconnect limit ({MAX_JUMP_RECONNECTS}) exceeded"
+                    STATS.device_failed(device_ip, reason)
+                    print(f"  [FAIL] {device_ip}: {reason} — skipping device")
                     summary_rows.append({
                         "ip":           device_ip,
                         "status":       "failed",
                         "clean":        False,
-                        "findings":     [f"🚨 UNREACHABLE — {STATS.per_device[device_ip]['error_detail']}"],
-                        "error_detail": STATS.per_device[device_ip]["error_detail"],
+                        "findings":     [f"🚨 JUMP LOST: {reason}"],
+                        "error_detail": reason,
                         "report_file":  "N/A",
                     })
+                    device_done = True
                     continue
 
-                clear_stp_counters(shell, device_ip)
-                results = run_stp_audit(shell, device_ip)
-                exit_device(shell)
-                print(f"  [EXIT] Returned to jump switch")
+                print(f"  [JUMP] Reconnect attempt {jump_reconnects}/{MAX_JUMP_RECONNECTS} — retrying {device_ip} after reconnect ...")
+                # Reset the device stats so retry starts clean
+                STATS.start_device(device_ip)
+                try:
+                    jump_client, shell = reconnect_jump(args.jump, username, password, jump_client)
+                except SystemExit:
+                    print(f"[FATAL] Cannot reconnect to jump switch — aborting run")
+                    raise
 
-            STATS.device_ok(device_ip)
+                # Loop back and retry the device with fresh shell
 
-        except Exception as e:
-            reason = f"unexpected exception: {e}"
-            STATS.device_failed(device_ip, reason)
-            print(f"  [ERROR] {device_ip}: {reason}")
-            traceback.print_exc()
-            _return_to_jump_prompt(shell)
-            summary_rows.append({
-                "ip":           device_ip,
-                "status":       "failed",
-                "clean":        False,
-                "findings":     [f"🚨 EXCEPTION: {reason}"],
-                "error_detail": reason,
-                "report_file":  "N/A",
-            })
-            continue
+            except Exception as e:
+                reason = f"unexpected exception: {e}"
+                STATS.device_failed(device_ip, reason)
+                print(f"  [ERROR] {device_ip}: {reason}")
+                traceback.print_exc()
+                # Try to clean up — if shell is dead this raises JumpSessionLost
+                # which we handle on the next outer iteration
+                try:
+                    _return_to_jump_prompt(shell)
+                except JumpSessionLost:
+                    pass   # will be caught if we loop again; device is done here
+                summary_rows.append({
+                    "ip":           device_ip,
+                    "status":       "failed",
+                    "clean":        False,
+                    "findings":     [f"🚨 EXCEPTION: {reason}"],
+                    "error_detail": reason,
+                    "report_file":  "N/A",
+                })
+                device_done = True
 
         findings    = analyze_results(device_ip, results)
         report_file = save_report(device_ip, results, findings, args.output)
