@@ -5,6 +5,15 @@ port_audit.py  –  Cisco Switch Port Drop & Counter Auditor
 Verified against C9500 (TwentyFiveGigE / HundredGigE / AppGigabitEthernet)
 running IOS-XE with dual-stack interface name formats.
 
+CHANGELOG (this revision):
+  - clear_counters() now answers the [confirm] prompt as soon as it appears
+    and verifies the device prompt returns (saves ~15s per device, and logs
+    a warning if the confirm was never seen).
+  - 'show interfaces counters errors' is snapshot twice (baseline right after
+    clear counters, final after CLEAR_WAIT) and the sheet shows the DELTA.
+    This handles Cat9k IOS-XE releases where 'clear counters' does NOT reset
+    the hardware error-counter table behind that command.
+
 Usage:
     python port_audit.py --targets devices.txt
     python port_audit.py --targets devices.txt --agg 10.0.0.1
@@ -127,7 +136,7 @@ COLUMNS = [
     "Deferred",
     "Lost Carrier",
     "No Carrier",
-    # From show interfaces counters errors
+    # From show interfaces counters errors (DELTA over CLEAR_WAIT window)
     "Align Err",
     "FCS Err",
     "Xmit Err",
@@ -607,21 +616,65 @@ def return_to_agg():
 # ============================================================================
 def clear_counters(shell):
     """
-    Issues 'clear counters' and confirms the [confirm] prompt.
+    Issues 'clear counters' and handles all observed device behaviours:
+      a) Device asks  ... [confirm]      -> answer with Enter, wait for prompt
+      b) Device executes silently        -> prompt returns immediately
+         (seen with 'file prompt quiet' or on some platforms)
+      c) Device rejects the command      -> log the error
     Raises OSError if the socket drops.
     """
-    logger.info("  [*] clear counters (sending confirmation) ...")
-    # Send the command — IOS will reply with "[confirm]" and wait
-    send_cmd(shell, "clear counters", timeout=15, silent=True)
-    # Send a blank line to confirm; IOS accepts Enter as confirmation
-    shell.send("\n")
-    time.sleep(2)
-    _drain(shell)   # consume the confirmation echo
+    logger.info("  [*] clear counters ...")
+    _drain(shell)
+    shell.send("clear counters\n")
+    PROMPT = re.compile(r"(?m)^[^\r\n>\s][^\r\n>]*[>#]\s?$")
+    buf, end, confirmed = "", time.time() + 15, False
+    while time.time() < end:
+        if shell.closed:
+            raise OSError("Socket closed during clear counters")
+        if shell.recv_ready():
+            buf += shell.recv(65535).decode("utf-8", "ignore")
+            low = buf.lower()
+
+            # Path (a): confirmation prompt
+            if not confirmed and ("[confirm]" in low or "(y/n)" in low):
+                shell.send("\n")
+                confirmed = True
+                continue   # wait for the prompt that follows
+
+            # Prompt is back -- require the command echo in the buffer so a
+            # stale prompt fragment from earlier output can't fool us
+            if PROMPT.search(buf) and "clear counters" in low:
+                # Path (c): command rejected
+                if ("% invalid" in low or "% incomplete" in low
+                        or "% ambiguous" in low):
+                    logger.warning("  [!] clear counters rejected: "
+                                   f"{buf.strip()[-120:]!r}")
+                    return
+                # Paths (a) and (b): success
+                logger.info("  [*] counters cleared "
+                            + ("(confirmed)" if confirmed
+                               else "(no confirmation prompt on this device)"))
+                return
+        time.sleep(0.2)
+    logger.warning("  [!] clear counters: "
+                   + ("prompt not seen after confirm" if confirmed
+                      else "no [confirm] and no prompt within 15s -- "
+                           "counters may NOT be cleared"))
+    # Dump what the device actually sent so the failure is diagnosable
+    logger.warning(f"  [!] raw device output (last 300 chars): {buf[-300:]!r}")
 
 
 def run_commands(shell):
     # ── Step 0: clear counters then wait ─────────────────────────────────────
     clear_counters(shell)
+
+    # Baseline snapshot of the hardware error table. On Cat9k IOS-XE,
+    # 'clear counters' does NOT reset 'show interfaces counters errors'
+    # (the confirm text is literal: it clears the "show interface" counters
+    # only). We collect this table now and compute a delta after CLEAR_WAIT
+    # so the sheet shows only errors accumulated during the measurement window.
+    logger.info("  [*] baseline: show interfaces counters errors")
+    errs_baseline = send_cmd(shell, "show interfaces counters errors")
 
     logger.info(f"  Waiting {CLEAR_WAIT}s for traffic to accumulate ...")
     wait_end = time.time() + CLEAR_WAIT
@@ -639,22 +692,22 @@ def run_commands(shell):
                 raise
         time.sleep(1)
 
-    # ── Step 1-6: collect ─────────────────────────────────────────────────────
-    logger.info("  [1/6] show ip interface brief")
+    # ── Step 1-10: collect ───────────────────────────────────────────────────
+    logger.info("  [1/10] show ip interface brief")
     ip_brief    = send_cmd(shell, "show ip interface brief")
-    logger.info("  [2/6] show interfaces")
+    logger.info("  [2/10] show interfaces")
     intf_full   = send_cmd(shell, "show interfaces", timeout=90)
-    logger.info("  [3/6] show interfaces status")
+    logger.info("  [3/10] show interfaces status")
     intf_status = send_cmd(shell, "show interfaces status")
-    logger.info("  [4/6] show interfaces trunk")
+    logger.info("  [4/10] show interfaces trunk")
     intf_trunk  = send_cmd(shell, "show interfaces trunk")
-    logger.info("  [5/6] show interfaces counters errors")
+    logger.info("  [5/10] show interfaces counters errors")
     intf_errs   = send_cmd(shell, "show interfaces counters errors")
-    logger.info("  [6/6] show interfaces transceiver")
+    logger.info("  [6/10] show interfaces transceiver")
     transceiver = send_cmd(shell, "show interfaces transceiver")
-    logger.info("  [7/9] show lldp neighbors detail")
+    logger.info("  [7/10] show lldp neighbors detail")
     lldp        = send_cmd(shell, "show lldp neighbors detail", timeout=60)
-    logger.info("  [8/9] show mac address-table dynamic")
+    logger.info("  [8/10] show mac address-table dynamic")
     mac_table   = send_cmd(shell, "show mac address-table dynamic", timeout=60)
     logger.info("  [9/10] show interfaces transceiver detail")
     xcvr_detail  = send_cmd(shell, "show interfaces transceiver detail", timeout=60)
@@ -662,7 +715,8 @@ def run_commands(shell):
     etherchannel = send_cmd(shell, "show etherchannel summary")
     return dict(ip_brief=ip_brief, intf_full=intf_full,
                 intf_status=intf_status, intf_trunk=intf_trunk,
-                intf_errs=intf_errs, transceiver=transceiver,
+                intf_errs=intf_errs, intf_errs_base=errs_baseline,
+                transceiver=transceiver,
                 lldp=lldp, mac_table=mac_table, xcvr_detail=xcvr_detail,
                 etherchannel=etherchannel)
 
@@ -1250,7 +1304,7 @@ def parse_lldp(lldp_out):
         mac = ""
         if chassis_m:
             raw_mac = chassis_m.group(1)
-            # Normalise to Cisco dotted-quad format xxxx.xxxx.xxxx
+            # Normalise to colon format XX:XX:XX:XX:XX:XX
             clean = re.sub(r"[:\-\.]", "", raw_mac).lower()
             if len(clean) == 12:
                 mac = ":".join(clean[i:i+2] for i in range(0, 12, 2)).upper()
@@ -1558,7 +1612,21 @@ def assemble_rows(up_map, raw_cmds):
     status_map  = parse_intf_status(raw_cmds["intf_status"])
     trunk_map   = parse_trunk_ports(raw_cmds["intf_trunk"])
     counter_map = parse_intf_full(raw_cmds["intf_full"], set(up_map.keys()))
-    err_map     = parse_intf_counters_errors(raw_cmds["intf_errs"])
+
+    # ── Error counters: DELTA between final and baseline snapshots ──────────
+    # On Cat9k IOS-XE 'clear counters' does NOT reset the hardware table
+    # behind 'show interfaces counters errors', so we subtract the baseline
+    # taken right after the clear from the final reading taken after
+    # CLEAR_WAIT. The result reflects only the measurement window.
+    err_final   = parse_intf_counters_errors(raw_cmds["intf_errs"])
+    err_base    = parse_intf_counters_errors(raw_cmds.get("intf_errs_base", ""))
+    err_map     = {}
+    for _k, _vals in err_final.items():
+        _b = err_base.get(_k, {})
+        # max(0, ...) guards against counters that DID reset mid-window
+        # (release where clear works) or a counter wrap
+        err_map[_k] = {c: max(0, v - _b.get(c, 0)) for c, v in _vals.items()}
+
     sfp_map     = parse_transceiver(raw_cmds.get("transceiver", ""))
     lldp_map      = parse_lldp(raw_cmds.get("lldp", ""))
     mac_tbl_map   = parse_mac_table(raw_cmds.get("mac_table", ""))
@@ -1638,7 +1706,7 @@ def assemble_rows(up_map, raw_cmds):
         ]:
             row[col] = ctr.get(col, 0)
 
-        # Counters from show interfaces counters errors
+        # Counters from show interfaces counters errors (delta over window)
         for col in [
             "Align Err", "FCS Err", "Xmit Err", "Rcv Err",
             "Undersize", "Out Discards",
@@ -1963,6 +2031,28 @@ def main():
                 if not hostname:
                     break  # credential failure — retrying won't help
                 shell = agg_shell
+
+            # ── Guard: prompt was never identified ──────────────────────────
+            # If get_hostname() failed on all three passes, the CLI prompt is
+            # not recognisable (non-IOS device, enable failure, ANSI-wrapped
+            # prompt, ...). Every send_cmd() would burn its full timeout and
+            # return partial buffers, producing garbage rows — probe once and
+            # skip the device instead of collecting unreliable data.
+            if hostname == "Unknown":
+                logger.warning("  Hostname could not be determined — probing CLI ...")
+                try:
+                    probe = send_cmd(shell, "show clock", timeout=10)
+                except OSError:
+                    probe = ""
+                if not re.search(r"(?m)^[^\r\n>\s][^\r\n>]*[>#]\s?$", probe):
+                    logger.error(f"  {target_ip}: CLI prompt not recognised — "
+                                 f"likely not a supported IOS device. Skipping.")
+                    logger.error(f"  Probe raw output (last 300 chars): {probe[-300:]!r}")
+                    stats.record(target_ip, -1, False,
+                                 error="Unrecognised CLI prompt — skipped")
+                    break
+                logger.info("  CLI responds to commands — continuing despite "
+                            "unknown hostname.")
 
             # ── Verify we are actually on the target, not the agg ──────────
             if not args.no_jump:
