@@ -391,6 +391,74 @@ def verify_on_target(shell, expected_hostname):
     return True   # optimistic — let run_commands proceed; OSError will catch a real drop
 
 
+def _read_prompt_line(shell):
+    """
+    Sends a blank line and returns the last prompt-looking line ('HOST#' /
+    'HOST>'), ANSI-stripped. Returns "" if no prompt line was seen.
+    """
+    try:
+        shell.send("\n"); time.sleep(0.8)
+        buf = _drain(shell)
+        for line in reversed([l.strip() for l in buf.splitlines() if l.strip()]):
+            clean = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line)
+            if clean.endswith(("#", ">")):
+                return clean
+    except Exception:
+        pass
+    return ""
+
+
+def ensure_enable(shell, cred):
+    """
+    Make sure the session is in privileged-exec mode (# prompt).
+
+    Checks the ACTUAL prompt line — never the whole banner buffer, since
+    MOTD banners routinely contain '#' characters and would defeat any
+    'is "#" in buf' style heuristic.
+
+    If the prompt is '>', attempts 'enable' with the credential's enable
+    password (falling back to the login password), then re-checks.
+
+    Returns True only when a '#' prompt is positively confirmed.
+    """
+    prompt = _read_prompt_line(shell)
+    if prompt.endswith("#"):
+        return True
+    if not prompt.endswith(">"):
+        logger.warning(f"  ensure_enable: no recognisable prompt ({prompt!r})")
+        return False
+
+    # At user-exec — try enable password candidates (deduplicated, in order)
+    candidates = []
+    for pw in (cred.get("enable", ""), cred.get("password", "")):
+        if pw and pw not in candidates:
+            candidates.append(pw)
+    if not candidates:
+        candidates = [""]   # enable with no password (rare but legal)
+
+    for pw in candidates:
+        try:
+            shell.send("enable\n"); time.sleep(0.7)
+            out = _drain(shell)
+            if "password" in out.lower():
+                shell.send(pw + "\n"); time.sleep(1.0)
+                _drain(shell)
+            prompt = _read_prompt_line(shell)
+            if prompt.endswith("#"):
+                return True
+            # '% Access denied' / back at '>' — IOS may still be waiting for
+            # more password attempts; send returns to flush, then next cand.
+            shell.send("\n"); time.sleep(0.4); _drain(shell)
+        except Exception as e:
+            logger.warning(f"  ensure_enable error: {e}")
+            return False
+
+    logger.warning("  ensure_enable: still at user-exec ('>') — enable "
+                   "password rejected. Add the correct enable secret to "
+                   "CREDENTIAL_SETS.")
+    return False
+
+
 # ============================================================================
 # AGG / JUMP HOST
 # ============================================================================
@@ -415,10 +483,12 @@ def connect_to_agg(agg_ip):
                 client.get_transport().set_keepalive(20)
                 shell = client.invoke_shell()
                 time.sleep(1)
-                banner = _drain(shell)
-                if ">" in banner and "#" not in banner:
-                    shell.send("enable\n"); time.sleep(0.5)
-                    shell.send(cred.get("enable", cred["password"]) + "\n"); time.sleep(1)
+                _drain(shell)
+                if not ensure_enable(shell, cred):
+                    logger.warning(f"  Cred #{i}: cannot reach privileged-exec on aggregate")
+                    stats.record(agg_ip, i, False, error="Enable failed (stuck at >)")
+                    client.close()
+                    continue
                 send_cmd(shell, "terminal length 0", silent=True)
                 agg_hostname = get_hostname(shell)
                 agg_client, agg_shell = client, shell
@@ -483,6 +553,7 @@ def jump_to_target(target_ip):
                 pw_sent        = False   # track whether we have already sent a password
                                          # for this credential attempt
                 cred_failed    = False
+                fail_reason    = ""
 
                 while (time.time() - start) < cred_timeout:
                     if agg_shell.recv_ready():
@@ -522,14 +593,19 @@ def jump_to_target(target_ip):
                                 cred_failed = True
                                 break
 
-                            # Handle user-exec mode (> instead of #)
-                            if ">" in buf and "#" not in buf:
-                                agg_shell.send("enable\n"); time.sleep(0.5)
-                                agg_shell.send(
-                                    cred.get("enable", cred["password"]) + "\n")
-                                time.sleep(1)
-                                # Drain the enable response before proceeding
-                                buf += _drain(agg_shell)
+                            # Verify privileged-exec (#) — checks the real
+                            # prompt line, not the banner (banners often
+                            # contain '#' chars, which broke the old check)
+                            if not ensure_enable(agg_shell, cred):
+                                logger.warning(f"  Cred #{i}: stuck at user-exec "
+                                               f"('>') on {target_ip} — enable failed")
+                                # Drop the target session, back to the agg,
+                                # then try the next credential set
+                                agg_shell.send("exit\n"); time.sleep(1)
+                                _drain(agg_shell)
+                                cred_failed = True
+                                fail_reason = "Enable failed (stuck at >)"
+                                break
 
                             send_cmd(agg_shell, "terminal length 0", silent=True)
                             hostname = get_hostname(agg_shell)
@@ -541,7 +617,8 @@ def jump_to_target(target_ip):
                     time.sleep(0.2)
 
                 if cred_failed:
-                    stats.record(target_ip, i, False, error="Authentication rejected")
+                    stats.record(target_ip, i, False,
+                                 error=fail_reason or "Authentication rejected")
                     # Drain any lingering output before trying next credential
                     time.sleep(1); _drain(agg_shell)
                     continue   # next credential
@@ -576,10 +653,12 @@ def connect_direct(target_ip):
                 client.get_transport().set_keepalive(20)
                 shell = client.invoke_shell()
                 time.sleep(1)
-                banner = _drain(shell)
-                if ">" in banner and "#" not in banner:
-                    shell.send("enable\n"); time.sleep(0.5)
-                    shell.send(cred.get("enable", cred["password"]) + "\n"); time.sleep(1)
+                _drain(shell)
+                if not ensure_enable(shell, cred):
+                    logger.warning(f"  Cred #{i}: cannot reach privileged-exec on {target_ip}")
+                    stats.record(target_ip, i, False, error="Enable failed (stuck at >)")
+                    client.close()
+                    continue
                 send_cmd(shell, "terminal length 0", silent=True)
                 hostname = get_hostname(shell)
                 logger.info(f"  Connected to {hostname} ({target_ip})"
