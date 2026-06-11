@@ -1,75 +1,92 @@
-'''
-Purpose
-
-This script logs into a root Cisco switch, then SSH-hops to its LLDP neighbors (Cisco only). On the first visit to each device, it captures show running-config and saves it locally as:
-
-backups/YYYY-MM-DD_<management-ip>_<hostname>.txt
-
-
-It prevents loops with a visited set and returns to the parent device after each hop.
-
-Features
-
-Single Paramiko session to the root device; all other hops occur device-to-device.
-
-Auto-elevation to privileged EXEC (enable) on each device.
-
-Paging disabled (terminal length 0) before long outputs.
-
-Robust LLDP parsing heuristic to find management IP, system name, and system description.
-
-Skips:
-
-Devices already visited
-
-Neighbors without management IP
-
-Non-Cisco neighbors (based on system description)
-
-Backups are time-stamped and sanitized for filesystem safety.
-
-Requirements
-Environment
-
-Python 3.8+
-
-paramiko library
-
-pip install paramiko
-
-
-If your environment requires legacy KEX/ciphers (older Cisco images), you may need to adjust Paramiko’s SSH negotiation preferences in code or upgrade device crypto settings.
-
-Network Assumptions
-
-You can SSH to the root switch from your workstation.
-
-From that switch, you can SSH to neighbor switches (in-band device-to-device SSH is allowed).
-
-The enable password equals the login password (or adjust the code).
-
-show lldp neighbors detail is enabled and populated across your Cisco estate.'''
 #!/usr/bin/env python3
+"""
+show_tech_collector.py
+----------------------
+Purpose:
+    SSH into an aggregate switch, then hop from there into each access switch
+    listed in devices.txt. On each access switch, pulls "show tech-support"
+    and saves the bundle locally as:
+        backups/YYYY-MM-DD_<ip>_<hostname>_show-tech.txt
+
+    After each access switch the script exits back to the aggregate shell
+    before moving on to the next device in the list.
+
+Topology:
+    Workstation ──SSH──► Aggregate switch ──SSH hop──► Access switch (per device)
+                              ▲                               │
+                              └───────── exit ────────────────┘
+
+Retry / reconnect behaviour:
+    - connect_aggregate()  : retries up to AGG_CONNECT_RETRIES times with
+                             AGG_RETRY_DELAY seconds between attempts.
+    - is_agg_alive()       : probes the aggregate shell before every device.
+                             If the socket is dead, reconnects automatically.
+    - process_device()     : if the SSH hop to an access switch fails, retries
+                             up to HOP_RETRIES times (with HOP_RETRY_DELAY
+                             between attempts). On each retry the aggregate
+                             session health is checked and reconnected if needed.
+
+devices.txt format (one entry per line, lines starting with # are ignored):
+    192.168.1.10
+    192.168.1.11
+    10.0.0.50
+
+Requirements:
+    Python 3.8+
+    pip install paramiko
+"""
+
 import paramiko
+import socket
 import time
 import re
-import os
+import sys
 from pathlib import Path
 
 # ─── USER CONFIG ─────────────────────────────────────────────────────────────
-USERNAME  = "admin"
-PASSWORD  = "cisco"
-ROOT_IP   = "192.168.1.1"
-TIMEOUT   = 10
-MAX_READ  = 65535
-BACKUP_DIR = Path("backups")
-DATE_STR   = time.strftime("%Y-%m-%d")  # file date component
+USERNAME            = "admin"
+PASSWORD            = "cisco"
+ENABLE_PASSWORD     = PASSWORD      # change if enable password differs
+AGGREGATE_IP        = "192.168.1.11"   # ← IP of the aggregate (jump) switch
+DEVICES_FILE        = Path("devices.txt")
+BACKUP_DIR          = Path("backups")
+TIMEOUT             = 15            # general prompt wait (seconds)
+SHOW_TECH_TIMEOUT   = 300           # show tech-support wait (seconds, 10 min)
+MAX_READ            = 65535
+DATE_STR            = time.strftime("%Y-%m-%d")
+
+# ─── RETRY / DELAY CONFIG ────────────────────────────────────────────────────
+AGG_CONNECT_RETRIES  = 5            # attempts to (re)connect to aggregate
+AGG_RETRY_DELAY      = 10           # seconds between aggregate connect attempts
+HOP_RETRIES          = 3            # attempts to SSH-hop to an access switch
+HOP_RETRY_DELAY      = 8            # seconds between hop attempts
+POST_TECH_DRAIN_TIME = 30           # seconds to keep draining buffer after show
+                                    #   tech prompt arrives (device keeps sending)
+POST_DEVICE_DELAY    = 300          # seconds to wait between devices (5 min)
+                                    #   set to 0 to disable
 # ─────────────────────────────────────────────────────────────────────────────
 
-visited = set()
 
-def expect_prompt(shell, patterns, timeout=TIMEOUT):
-    buf, end = "", time.time() + timeout
+# ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+def load_devices(path: Path) -> list[str]:
+    """Read devices.txt; skip blank lines and comments (#)."""
+    if not path.exists():
+        print(f"[ERROR] {path} not found. Create it with one IP per line.")
+        sys.exit(1)
+    devices = []
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        devices.append(line)
+    return devices
+
+
+def expect_prompt(shell, patterns: tuple, timeout: int = TIMEOUT) -> str:
+    """Read from shell until one of the pattern strings appears, or timeout."""
+    buf = ""
+    end = time.time() + timeout
     while time.time() < end:
         if shell.recv_ready():
             data = shell.recv(MAX_READ).decode("utf-8", "ignore")
@@ -78,155 +95,395 @@ def expect_prompt(shell, patterns, timeout=TIMEOUT):
                 if p in buf:
                     return buf
         else:
-            time.sleep(0.1)
+            time.sleep(0.2)
     return buf
 
-def send_cmd(shell, cmd, patterns=("#", ">"), timeout=TIMEOUT, sensitive=False):
+
+def send_cmd(shell, cmd: str, patterns: tuple = ("#",),
+             timeout: int = TIMEOUT, sensitive: bool = False) -> str:
+    """Send a command and wait for a prompt pattern."""
     if not sensitive:
-        print(f"[CMD] {cmd}")
+        print(f"    [CMD] {cmd}")
     shell.send(cmd + "\n")
     out = expect_prompt(shell, patterns, timeout)
-    last = out.splitlines()[-1] if out else "<no output>"
     if not sensitive:
-        print(f"[OUT] {last}")
+        last = out.splitlines()[-1].strip() if out else "<no output>"
+        print(f"    [PROMPT] {last}")
     return out
 
-def connect_switch(ip):
-    """SSH from PC into the root switch, enable + disable paging."""
-    print(f"[CONNECT] → {ip}")
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(ip, username=USERNAME, password=PASSWORD,
-                   look_for_keys=False, allow_agent=False, timeout=10)
-    shell = client.invoke_shell()
-    expect_prompt(shell, ("#", ">"))
-    send_cmd(shell, "enable", patterns=("assword:", "#"))
-    send_cmd(shell, PASSWORD, patterns=("#",), sensitive=True)
-    send_cmd(shell, "terminal length 0", patterns=("#",))
-    return client, shell
 
-def hop_to_neighbor(shell, ip):
-    """SSH from inside current device shell into <ip>, then enable + disable paging."""
-    print(f"[HOP] ssh → {ip}")
-    out = send_cmd(shell, f"ssh -l {USERNAME} {ip}",
-                   patterns=("Destination","(yes/no)?","assword:","%","#",">"),
-                   timeout=20)
-    if "(yes/no)?" in out or "yes/no" in out:
-        out = send_cmd(shell, "yes", patterns=("assword:","%","#",">"), timeout=15)
+def elevate_and_init(shell):
+    """Enable + disable paging on whatever device the shell is currently on."""
+    out = send_cmd(shell, "enable", patterns=("assword:", "#"), timeout=10)
     if "assword:" in out:
-        out = send_cmd(shell, PASSWORD, patterns=("%","#",">"), timeout=15, sensitive=True)
-    if out.strip().endswith(">"):
-        send_cmd(shell, "enable", patterns=("assword:","#"), timeout=15)
-        send_cmd(shell, PASSWORD, patterns=("#",), timeout=15, sensitive=True)
+        send_cmd(shell, ENABLE_PASSWORD, patterns=("#",), timeout=10, sensitive=True)
     send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
-    print(f"[HOP] now at {ip}#\n")
 
-def get_hostname(shell):
-    """Extract the hostname from the current prompt (e.g. 'SW1#')."""
+
+def flush_buffer(shell, pause: float = 30.0):
+    """
+    Drain any stale data sitting in the receive buffer.
+    Called after exit_to_aggregate() to discard leftover show-tech output.
+
+    Uses a continuous-drain loop: keeps reading as long as data keeps
+    arriving, only stopping once the buffer has been empty for a full
+    `pause` seconds. This handles devices that trickle output slowly
+    after the prompt has appeared.
+    """
+    deadline = time.time() + pause
+    while time.time() < deadline:
+        if shell.recv_ready():
+            shell.recv(MAX_READ)
+            # Reset the deadline each time new data arrives
+            deadline = time.time() + pause
+        else:
+            time.sleep(0.2)
+
+
+def get_hostname(shell) -> str:
+    """
+    Extract hostname from the current CLI prompt (e.g. SW-ACCESS-01#).
+    Requires a proper Cisco-style hostname: letters/digits/dash/dot/underscore,
+    at least 2 chars, immediately followed by # or > with nothing after.
+    """
     shell.send("\n")
-    buff = expect_prompt(shell, ("#", ">"), timeout=5)
-    for line in reversed(buff.splitlines()):
-        if m := re.match(r"^([^#>]+)[#>]", line.strip()):
+    buf = expect_prompt(shell, ("#", ">"), timeout=8)
+    for line in reversed(buf.splitlines()):
+        stripped = line.strip()
+        m = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]{1,63})[#>]\s*$", stripped)
+        if m:
             return m.group(1)
     return "unknown"
 
-def parse_lldp_detail(raw):
-    """Parse 'show lldp neighbors detail' into a list of neighbor dicts."""
-    nbrs = []
-    blocks = re.split(r"^-{2,}", raw, flags=re.M)
-    for blk in blocks:
-        if "Local Intf:" not in blk:
-            continue
-        entry = {
-            "local_intf":    None,
-            "port_id":       None,
-            "remote_name":   None,
-            "mgmt_ip":       None,
-            "sys_descr":     ""
-        }
-        if m := re.search(r"Local Intf:\s*(\S+)", blk):
-            entry["local_intf"] = m.group(1)
-        if m := re.search(r"Port id:\s*(\S+)", blk, re.IGNORECASE):
-            entry["port_id"] = m.group(1)
-        if m := re.search(r"System Name:\s*(\S+)", blk, re.IGNORECASE):
-            entry["remote_name"] = m.group(1)
-        if m := re.search(r"System Description:\s*([\s\S]+?)\n\s*\n", blk, re.IGNORECASE):
-            entry["sys_descr"] = m.group(1).strip()
-        if m := re.search(
-            r"Management Addresses:[\s\S]*?IP:\s*(\d+\.\d+\.\d+\.\d+)",
-            blk, re.IGNORECASE
-        ):
-            entry["mgmt_ip"] = m.group(1)
-        nbrs.append(entry)
-    return nbrs
 
-def sanitize_filename(s: str) -> str:
+def sanitize(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_")
 
-def backup_running_config(shell, mgmt_ip: str, hostname: str):
-    """Run 'show running-config' and save to backups/YYYY-MM-DD_ip_hostname.txt."""
+
+# ─── AGGREGATE CONNECTION & HEALTH ───────────────────────────────────────────
+
+def _open_aggregate(ip: str):
+    """
+    Raw connect to aggregate: TCP + SSH + enable + paging.
+    Returns (SSHClient, shell). Raises on any failure.
+    """
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        ip,
+        username=USERNAME,
+        password=PASSWORD,
+        look_for_keys=False,
+        allow_agent=False,
+        timeout=10,
+    )
+    shell = client.invoke_shell()
+    expect_prompt(shell, ("#", ">"), timeout=15)
+    elevate_and_init(shell)
+    return client, shell
+
+
+def connect_aggregate(ip: str):
+    """
+    Connect to the aggregate switch with retry logic.
+    Tries up to AGG_CONNECT_RETRIES times, waiting AGG_RETRY_DELAY seconds
+    between each attempt. Exits the script if all attempts fail.
+    """
+    for attempt in range(1, AGG_CONNECT_RETRIES + 1):
+        try:
+            print(f"[AGGREGATE] Connecting to {ip} (attempt {attempt}/{AGG_CONNECT_RETRIES}) …")
+            client, shell = _open_aggregate(ip)
+            agg_host = get_hostname(shell)
+            print(f"[AGGREGATE] Connected — prompt: {agg_host}#\n")
+            return client, shell
+        except Exception as exc:
+            print(f"[AGGREGATE] Connection failed: {exc}")
+            if attempt < AGG_CONNECT_RETRIES:
+                print(f"[AGGREGATE] Retrying in {AGG_RETRY_DELAY}s …")
+                time.sleep(AGG_RETRY_DELAY)
+            else:
+                print(f"[AGGREGATE] All {AGG_CONNECT_RETRIES} attempts failed. Aborting.")
+                sys.exit(1)
+
+
+def is_agg_alive(client, shell) -> bool:
+    """
+    Check whether the aggregate SSH session is still usable by sending a
+    no-op newline and checking for a prompt within a short timeout.
+    Also checks the underlying transport layer.
+    """
+    try:
+        transport = client.get_transport()
+        if transport is None or not transport.is_active():
+            return False
+        shell.send("\n")
+        buf = expect_prompt(shell, ("#", ">"), timeout=5)
+        return "#" in buf or ">" in buf
+    except (socket.error, EOFError, paramiko.SSHException):
+        return False
+
+
+def ensure_aggregate(client, shell):
+    """
+    Verify the aggregate session is alive; reconnect if it is not.
+    Returns the (possibly new) (client, shell) tuple.
+    """
+    if is_agg_alive(client, shell):
+        return client, shell
+
+    print(f"[AGGREGATE] ⚠  Socket closed or unresponsive — reconnecting …")
+    try:
+        client.close()
+    except Exception:
+        pass
+
+    new_client, new_shell = connect_aggregate(AGGREGATE_IP)
+    return new_client, new_shell
+
+
+# ─── HOP LOGIC ───────────────────────────────────────────────────────────────
+
+def _attempt_hop(agg_shell, access_ip: str):
+    """
+    Single attempt to SSH-hop from aggregate to access_ip.
+    Raises RuntimeError on any detectable failure so the caller can retry.
+    """
+    print(f"    [HOP] aggregate → {access_ip}")
+    out = send_cmd(
+        agg_shell,
+        f"ssh -l {USERNAME} {access_ip}",
+        patterns=("Destination", "(yes/no)?", "yes/no", "assword:", "%", "#", ">"),
+        timeout=20,
+    )
+
+    if "(yes/no)?" in out or "yes/no" in out:
+        out = send_cmd(agg_shell, "yes",
+                       patterns=("assword:", "%", "#", ">"), timeout=15)
+
+    if "assword:" in out:
+        out = send_cmd(agg_shell, PASSWORD,
+                       patterns=("%", "#", ">"), timeout=15, sensitive=True)
+
+    if "%" in out and "#" not in out and ">" not in out:
+        raise RuntimeError(f"SSH hop failed: {out.strip().splitlines()[-1]}")
+
+    elevate_and_init(agg_shell)
+    print(f"    [HOP] now at {access_ip}#")
+
+
+def hop_to_access(client, shell, access_ip: str):
+    """
+    Hop from aggregate to access_ip with retry logic.
+
+    On each failed attempt:
+      - Checks whether the aggregate session is still alive and reconnects
+        if needed (socket-closed scenario).
+      - Waits HOP_RETRY_DELAY seconds before the next attempt.
+
+    Returns the (possibly reconnected) (client, shell) tuple.
+    Raises RuntimeError if all HOP_RETRIES attempts are exhausted.
+    """
+    last_exc = None
+    for attempt in range(1, HOP_RETRIES + 1):
+        # Ensure aggregate is alive before each hop attempt
+        client, shell = ensure_aggregate(client, shell)
+        try:
+            _attempt_hop(shell, access_ip)
+            return client, shell          # hop succeeded
+        except Exception as exc:
+            last_exc = exc
+            print(f"    [HOP] Attempt {attempt}/{HOP_RETRIES} failed: {exc}")
+            if attempt < HOP_RETRIES:
+                print(f"    [HOP] Retrying in {HOP_RETRY_DELAY}s …")
+                time.sleep(HOP_RETRY_DELAY)
+
+    raise RuntimeError(
+        f"All {HOP_RETRIES} hop attempts to {access_ip} failed. Last error: {last_exc}"
+    )
+
+
+def exit_to_aggregate(agg_shell):
+    """
+    Send 'exit' on the access switch shell to return to the aggregate.
+    Flushes residual show-tech bytes from the buffer afterwards.
+    """
+    print(f"    [EXIT] returning to aggregate …")
+    send_cmd(agg_shell, "exit", patterns=("#", ">"), timeout=10)
+    flush_buffer(agg_shell, pause=1.5)
+    send_cmd(agg_shell, "terminal length 0", patterns=("#",), timeout=5)
+
+
+# ─── SHOW TECH ────────────────────────────────────────────────────────────────
+
+def pull_show_tech(shell, ip: str, hostname: str) -> Path:
+    """
+    Run 'show tech-support' on the currently active shell and save output.
+
+    After the prompt (#) is detected, continues draining the buffer for
+    POST_TECH_DRAIN_TIME seconds — many Cisco platforms keep sending
+    output after the prompt appears, and cutting off early leaves garbage
+    in the buffer for the next command.
+
+    Returns the Path of the saved file.
+    """
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    safe_host = sanitize_filename(hostname) or "unknown"
-    fn = BACKUP_DIR / f"{DATE_STR}_{mgmt_ip}_{safe_host}.txt"
-    print(f"[BACKUP] {hostname} ({mgmt_ip}) → {fn}")
-    # Some devices page anyway; make sure paging is off before the dump
+    safe_host = sanitize(hostname) or "unknown"
+    fn = BACKUP_DIR / f"{DATE_STR}_{ip}_{safe_host}_show-tech.txt"
+
+    print(f"    [PULL] show tech-support  (timeout={SHOW_TECH_TIMEOUT}s — please wait…)")
     send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
-    # Running config can be long; allow generous timeout
-    raw = send_cmd(shell, "show running-config", patterns=("#",), timeout=90)
+
+    raw = send_cmd(
+        shell,
+        "show tech-support",
+        patterns=("#",),
+        timeout=SHOW_TECH_TIMEOUT,
+    )
+
+    # Continue draining — device may still be sending after the prompt
+    print(f"    [DRAIN] settling for {POST_TECH_DRAIN_TIME}s after prompt …")
+    deadline = time.time() + POST_TECH_DRAIN_TIME
+    while time.time() < deadline:
+        if shell.recv_ready():
+            chunk = shell.recv(MAX_READ).decode("utf-8", "ignore")
+            raw += chunk
+            deadline = time.time() + POST_TECH_DRAIN_TIME  # reset on new data
+        else:
+            time.sleep(0.2)
+
     with open(fn, "w", encoding="utf-8", errors="ignore") as f:
         f.write(raw)
-    print("[OK] Saved.\n")
 
-def crawl(shell, ip):
+    size_kb = fn.stat().st_size // 1024
+    print(f"    [SAVED] {fn}  ({size_kb} KB)")
+    return fn
+
+
+# ─── PER-DEVICE WORKFLOW ──────────────────────────────────────────────────────
+
+def process_device(client, shell, access_ip: str) -> tuple[dict, object, object]:
     """
-    From the current device shell:
-      - capture hostname
-      - if first time, back up running-config
-      - parse LLDP neighbors
-      - hop into unvisited Cisco neighbors and repeat
-      - 'exit' back one hop after each child
+    Using the persistent aggregate session:
+      1. Ensure aggregate is alive (reconnect if not)
+      2. Hop to the access switch (with retry + reconnect on failure)
+      3. Pull show tech-support
+      4. Exit back to aggregate
+
+    Returns (result_dict, client, shell) so the caller always has the
+    current (possibly reconnected) aggregate session.
     """
-    print(f"\n[INFO] Visiting {ip}")
-    hostname = get_hostname(shell)
+    result = {
+        "ip":       access_ip,
+        "hostname": "?",
+        "status":   "OK",
+        "file":     None,
+        "error":    None,
+    }
 
-    first_time = ip not in visited
-    if first_time:
-        visited.add(ip)
-        backup_running_config(shell, ip, hostname)
-    else:
-        print(f"[SKIP] Already backed up {ip}")
+    print(f"\n{'='*60}")
+    print(f"[DEVICE] {access_ip}")
+    print(f"{'='*60}")
 
-    lldp_raw = send_cmd(shell, "show lldp neighbors detail", patterns=("#",), timeout=15)
-    neighbors = parse_lldp_detail(lldp_raw)
+    hopped = False
+    try:
+        # Proactive health check before we start
+        client, shell = ensure_aggregate(client, shell)
 
-    for n in neighbors:
-        rem_ip   = n.get("mgmt_ip")
-        rem_name = n.get("remote_name") or "unknown"
-        sysdesc  = (n.get("sys_descr") or "").lower()
+        # Hop with retry + reconnect logic
+        client, shell = hop_to_access(client, shell, access_ip)
+        hopped = True
 
-        print(f"[FOUND] {rem_name} @ {rem_ip} via {n.get('local_intf')}")
-        if not rem_ip:
-            print("  [SKIP] no management IP")
-            continue
-        if rem_ip in visited:
-            print("  [SKIP] already visited")
-            continue
-        if "cisco" not in sysdesc:
-            print(f"  [SKIP] non-Cisco neighbor ({n.get('sys_descr', '')[:30]})")
-            continue
+        hostname = get_hostname(shell)
+        result["hostname"] = hostname
+        print(f"    [HOST] {hostname}")
 
-        print(f"  [HOP] → {rem_ip}")
-        hop_to_neighbor(shell, rem_ip)
-        try:
-            crawl(shell, rem_ip)
-        finally:
-            # Return to parent device
-            send_cmd(shell, "exit", patterns=("#", ">"), timeout=5)
+        out_file = pull_show_tech(shell, access_ip, hostname)
+        result["file"] = str(out_file)
+
+    except Exception as exc:
+        result["status"] = "FAILED"
+        result["error"]  = str(exc)
+        print(f"    [ERROR] {exc}")
+
+    finally:
+        if hopped:
+            try:
+                exit_to_aggregate(shell)
+            except Exception as exit_exc:
+                print(f"    [WARN] exit back to aggregate failed: {exit_exc}")
+                # If exit failed the session may be dead; reconnect so the
+                # next device starts from a clean aggregate shell
+                print(f"    [WARN] Attempting aggregate reconnect after failed exit …")
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                client, shell = connect_aggregate(AGGREGATE_IP)
+
+    return result, client, shell
+
+
+# ─── SUMMARY ─────────────────────────────────────────────────────────────────
+
+def print_summary(results: list[dict]):
+    ok     = [r for r in results if r["status"] == "OK"]
+    failed = [r for r in results if r["status"] != "OK"]
+
+    print(f"\n{'='*60}")
+    print(f"  SUMMARY  —  {DATE_STR}")
+    print(f"{'='*60}")
+    print(f"  Aggregate     : {AGGREGATE_IP}")
+    print(f"  Total devices : {len(results)}")
+    print(f"  Succeeded     : {len(ok)}")
+    print(f"  Failed        : {len(failed)}")
+
+    if ok:
+        print(f"\n  ✅ Successful:")
+        for r in ok:
+            print(f"     {r['ip']:<20}  {r['hostname']:<20}  {r['file']}")
+
+    if failed:
+        print(f"\n  ❌ Failed:")
+        for r in failed:
+            print(f"     {r['ip']:<20}  {r['error']}")
+
+    print(f"\n  Output directory: ./{BACKUP_DIR}/")
+    print(f"{'='*60}\n")
+
+
+# ─── ENTRY POINT ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    client, shell = connect_switch(ROOT_IP)
+    devices = load_devices(DEVICES_FILE)
+    print(f"[INFO] Loaded {len(devices)} device(s) from {DEVICES_FILE}")
+    print(f"[INFO] Aggregate jump host : {AGGREGATE_IP}")
+    print(f"[INFO] Output directory    : {BACKUP_DIR}/\n")
+
+    agg_client, agg_shell = connect_aggregate(AGGREGATE_IP)
+
+    results = []
     try:
-        crawl(shell, ROOT_IP)
+        for idx, ip in enumerate(devices, start=1):
+            res, agg_client, agg_shell = process_device(agg_client, agg_shell, ip)
+            results.append(res)
+
+            # Inter-device delay — gives slow devices time to fully settle
+            # before the next hop, and avoids hammering the aggregate.
+            if POST_DEVICE_DELAY > 0 and idx < len(devices):
+                print(f"\n[DELAY] Waiting {POST_DEVICE_DELAY}s before next device …")
+                remaining = POST_DEVICE_DELAY
+                while remaining > 0:
+                    step = min(30, remaining)
+                    time.sleep(step)
+                    remaining -= step
+                    if remaining > 0:
+                        print(f"[DELAY] {remaining}s remaining …")
+                print("[DELAY] Done — moving to next device.\n")
     finally:
-        client.close()
-    print("\n✅ Backups complete. Files are in ./backups/")
+        try:
+            agg_client.close()
+        except Exception:
+            pass
+        print("[AGGREGATE] Session closed.")
+
+    print_summary(results)
