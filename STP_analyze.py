@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-stp_audit.py — STP Diagnostic Script
-Connects via a jump/aggregate switch and runs STP health checks
+stp_audit.py — STP + PoE Diagnostic Script
+Connects via a jump/aggregate switch and runs STP + PoE health checks
 on all switches listed in devices.txt
 
 Usage:
     python3 stp_audit.py
     python3 stp_audit.py --devices devices.txt --output stp_results --soak 60
+    python3 stp_audit.py --no-poe          # skip PoE checks (STP only)
+    python3 stp_audit.py --poe-only        # skip STP checks (PoE only)
 """
 
 import argparse
@@ -54,6 +56,10 @@ RETRY_BACKOFF      = 3            # seconds to wait between retries (doubles eac
 OUTPUT_DIR   = "stp_results"
 DEVICES_FILE = "devices.txt"
 
+# ── Feature toggles (overridable via CLI) ────
+RUN_STP = True
+RUN_POE = True
+
 # ─────────────────────────────────────────────
 #  COMMANDS
 # ─────────────────────────────────────────────
@@ -84,6 +90,27 @@ STP_PER_VLAN_COMMANDS = [
     "show spanning-tree vlan {vlan} | include BLK|LIS|LRN|Altn|Desg|Root",
 ]
 
+# ─────────────────────────────────────────────
+#  POE COMMANDS
+# ─────────────────────────────────────────────
+
+# System-wide PoE state — run once per device.
+# Best-effort: a non-PoE switch will simply error these and be skipped.
+POE_BASE_COMMANDS = [
+    "terminal length 0",
+    "show power inline",                 # per-port summary + budget footer
+    "show power inline police",          # ports being policed/cut for over-draw
+    "show env power",                    # PSU presence/health/wattage
+    # PoE-specific syslog events (power granted/denied/cycling, controller faults)
+    "show logging | include ILPOWER|POWER_GRANTED|POWER_DENIED|CONTROLLER_PORT|IEEE_DISABLED|POE",
+]
+
+# Per-port PoE detail — run only for ports that show a connected PD.
+# {intf} gets substituted at runtime from the 'show power inline' parse.
+POE_PER_PORT_COMMANDS = [
+    "show power inline {intf} detail",
+]
+
 # Patterns that indicate a command produced bad/incomplete output
 CMD_ERROR_PATTERNS = [
     r"Invalid input detected",
@@ -94,6 +121,15 @@ CMD_ERROR_PATTERNS = [
     r"Connection timed out",
     r"ssh: connect to host",
     r"% Error",
+]
+
+# Errors that mean "this platform doesn't do PoE" — treated as benign skip,
+# NOT counted as command errors.
+POE_UNSUPPORTED_PATTERNS = [
+    r"Invalid input detected",
+    r"% Unknown command",
+    r"Ambiguous command",
+    r"power inline.*not",
 ]
 
 # Patterns that mean the SSH session dropped mid-hop
@@ -226,6 +262,11 @@ def has_cmd_error(output: str) -> tuple[bool, str]:
         if re.search(pattern, output, re.IGNORECASE):
             return True, pattern
     return False, ""
+
+
+def is_poe_unsupported(output: str) -> bool:
+    """Return True if the output indicates PoE isn't supported on this platform."""
+    return any(re.search(p, output, re.IGNORECASE) for p in POE_UNSUPPORTED_PATTERNS)
 
 
 def send_command(shell, command: str, timeout: int = CMD_TIMEOUT) -> str:
@@ -602,6 +643,134 @@ def run_stp_audit(shell, device_ip: str) -> dict:
     return results
 
 
+# ─────────────────────────────────────────────
+#  POE AUDIT
+# ─────────────────────────────────────────────
+
+def discover_poe_ports(poe_summary: str) -> list[str]:
+    """
+    Parse interface names of ports with a connected powered device (PD)
+    from 'show power inline' summary output.
+
+    Typical line formats (Cat 9300 / IE3x00):
+      Gi1/0/1   auto   on    12.0    AXIS ...    4    30.0
+      Gi1/0/2   auto   off   0.0     n/a         n/a  30.0
+
+    We collect ports whose oper state is 'on' (a PD is drawing power).
+    """
+    ports = []
+    for line in poe_summary.splitlines():
+        # Interface token at start: Gi1/0/1, Te1/1/1, Fa0/1, etc.
+        m = re.match(r"^\s*((?:Gi|Te|Fa|Tw|Twe|Fo|Hu)\S+)\s+", line)
+        if not m:
+            continue
+        intf = m.group(1)
+        # Oper state is the 3rd whitespace field on these platforms; look for
+        # standalone 'on' (avoid matching 'auto'/'faulty'/'denied' as 'on').
+        fields = line.split()
+        # fields ~= [intf, admin, oper, power, device, class, max]
+        if len(fields) >= 3 and fields[2].lower() == "on":
+            ports.append(intf)
+    # De-dup, keep order
+    seen = set()
+    uniq = []
+    for p in ports:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
+
+
+def run_poe_audit(shell, device_ip: str) -> dict:
+    """
+    Phase 1: system-wide PoE commands (summary, police, env power, PoE logs).
+    Phase 2: per-port 'detail' for every port with a connected PD.
+    Returns dict of {command_label: output}.
+    If the platform doesn't support PoE, returns a single benign marker entry.
+    """
+    results = {}
+    errors  = 0
+
+    print(f"  [POE]  Phase 1 — system-wide PoE commands ...")
+
+    poe_summary_output = ""
+    platform_has_poe   = True
+
+    for cmd in POE_BASE_COMMANDS:
+        if cmd.startswith("terminal"):
+            send_command(shell, cmd)
+            continue
+
+        output = send_command(shell, cmd, timeout=CMD_TIMEOUT)
+
+        if is_session_lost(output):
+            print(f"  [WARN] Session lost during PoE collection — stopping")
+            results[cmd] = f"[ERROR] session lost\n{output}"
+            return results
+
+        cleaned = strip_echo(output, cmd)
+
+        # 'show power inline' is the canary — if it's unsupported, this is a
+        # non-PoE switch (or PoE-incapable model). Skip the rest gracefully.
+        if cmd == "show power inline" and is_poe_unsupported(cleaned):
+            platform_has_poe = False
+            results["__poe_status__"] = "[INFO] Platform does not support PoE — skipped"
+            print(f"  [POE]  Platform reports no PoE support — skipping PoE audit")
+            return results
+
+        # For other PoE commands, an 'unsupported' result is benign-skip,
+        # not a hard error (e.g. 'show power inline police' missing on IE).
+        if is_poe_unsupported(cleaned):
+            results[cmd] = "[SKIPPED] not supported on this platform"
+            print(f"         ~ {cmd[:60]}  (not supported — skipping)")
+            continue
+
+        error, pattern = has_cmd_error(cleaned)
+        if error:
+            errors += 1
+            results[cmd] = f"[ERROR] {pattern}\n{cleaned}"
+            print(f"         ✗ {cmd[:60]}")
+        else:
+            results[cmd] = cleaned
+            print(f"         ✓ {cmd[:60]}")
+
+        if cmd == "show power inline":
+            poe_summary_output = cleaned
+
+    if not platform_has_poe:
+        return results
+
+    # ── Phase 2: per-port detail for connected PDs ─────────
+    poe_ports = discover_poe_ports(poe_summary_output)
+    if not poe_ports:
+        print(f"  [POE]  No ports with connected PDs found — skipping per-port detail")
+        results["__poe_ports__"] = "[INFO] No connected powered devices detected"
+        return results
+
+    print(f"  [POE]  Phase 2 — {len(poe_ports)} powered port(s): {', '.join(poe_ports)}")
+    for intf in poe_ports:
+        for template in POE_PER_PORT_COMMANDS:
+            cmd = template.replace("{intf}", intf)
+            output, ok = send_command_with_retry(shell, cmd, device_ip)
+            label = cmd
+            if not ok:
+                errors += 1
+                results[label] = f"[ERROR] Command failed\n{output}"
+                print(f"         ✗ {intf}: {cmd[:50]}")
+            else:
+                results[label] = strip_echo(output, cmd)
+                print(f"         ✓ {intf}: detail collected")
+
+            if is_session_lost(output):
+                print(f"  [WARN] Session lost during PoE detail — stopping")
+                return results
+
+    if errors:
+        print(f"  [WARN] {errors} PoE command(s) had errors on {device_ip}")
+
+    return results
+
+
 def strip_echo(output: str, command: str) -> str:
     lines    = output.splitlines()
     filtered = []
@@ -679,7 +848,7 @@ def analyze_results(device_ip: str, results: dict) -> list[str]:
                 findings.append("✅ ERR-DISABLED: no err-disabled ports found")
 
         # ── Log events ─────────────────────────────
-        if "logging" in cmd:
+        if "logging" in cmd and "ILPOWER" not in cmd:
             if "BPDUGUARD" in output:
                 count = output.upper().count("BPDUGUARD")
                 findings.append(f"🚨 BPDUGUARD: {count} event(s) in logs — rogue device or loop?")
@@ -690,8 +859,122 @@ def analyze_results(device_ip: str, results: dict) -> list[str]:
             if not any(k in output for k in ["BPDUGUARD", "MACFLAP", "MACMOVE", "SPANTREE"]):
                 findings.append("✅ LOGS: no STP/MAC-flap events in last 100 log entries")
 
+    # ── PoE analysis (separate pass; needs cross-command context) ──
+    findings.extend(analyze_poe(results))
+
     if not findings:
-        findings.append("✅ No STP anomalies detected")
+        findings.append("✅ No STP/PoE anomalies detected")
+
+    return findings
+
+
+def analyze_poe(results: dict) -> list[str]:
+    """
+    Analyze PoE command outputs. Looks at:
+      - per-port detail fault counters (the key CCTV brownout signal)
+      - power budget headroom from 'show power inline' footer
+      - policed/denied ports
+      - ILPOWER syslog events (power cycling = micro-reboots)
+    Returns a list of finding strings.
+    """
+    findings = []
+
+    # Platform-level skips
+    if results.get("__poe_status__", "").startswith("[INFO]"):
+        findings.append("ℹ️  POE: platform has no PoE — not applicable")
+        return findings
+
+    for cmd, output in results.items():
+        if "[ERROR]" in output or "[SKIPPED]" in output:
+            continue
+
+        # ── Per-port detail: fault counters + draw vs allocated ──
+        if "power inline" in cmd and "detail" in cmd:
+            intf_m = re.search(r"Interface:\s*(\S+)", output)
+            intf   = intf_m.group(1) if intf_m else cmd
+
+            # Fault counters — any non-zero is a real problem signal
+            for label, pat in [
+                ("Power-Denied",    r"Power Denied Counter:\s*(\d+)"),
+                ("Over-Current",    r"Over Current Counter:\s*(\d+)"),
+                ("Short-Circuit",   r"Short Current Counter:\s*(\d+)"),
+                ("Invalid-Sig",     r"Invalid Signature Counter:\s*(\d+)"),
+                ("Absent",          r"Absent Counter:\s*(\d+)"),
+            ]:
+                m = re.search(pat, output, re.IGNORECASE)
+                if m and int(m.group(1)) > 0:
+                    n = int(m.group(1))
+                    sev = "🚨" if label in ("Power-Denied", "Over-Current", "Short-Circuit") else "⚠️ "
+                    findings.append(f"{sev} POE FAULT [{intf}]: {label} counter = {n} — power instability/brownout")
+
+            # Draw vs allocated — flag if drawing near its ceiling
+            drawn_m = re.search(r"Power drawn from the source:\s*([\d.]+)", output, re.IGNORECASE)
+            alloc_m = re.search(r"Admin Value:\s*([\d.]+)", output, re.IGNORECASE)
+            peak_m  = re.search(r"Maximum Power drawn by the device since powered on:\s*([\d.]+)", output, re.IGNORECASE)
+            if drawn_m and alloc_m:
+                drawn = float(drawn_m.group(1))
+                alloc = float(alloc_m.group(1))
+                peak  = float(peak_m.group(1)) if peak_m else drawn
+                if alloc > 0 and (peak / alloc) >= 0.90:
+                    findings.append(f"⚠️  POE HEADROOM [{intf}]: peak {peak}W vs {alloc}W allocated (≥90% — at risk under load)")
+
+            # Perpetual / Fast PoE resilience (informational for CCTV)
+            if re.search(r"Perpetual POE Enabled:\s*FALSE", output, re.IGNORECASE):
+                findings.append(f"ℹ️  POE CONFIG [{intf}]: Perpetual PoE disabled — camera loses power on switch reload")
+
+        # ── Police: ports actively being cut for over-draw ──
+        if "police" in cmd:
+            # Lines marking a policed/cut port typically contain 'Cutoff' or 'Errdisable'
+            policed = re.findall(r"^\s*((?:Gi|Te|Fa|Tw|Twe|Fo|Hu)\S+).*(?:Cutoff|Errdisable|errdisable)",
+                                 output, re.IGNORECASE | re.MULTILINE)
+            if policed:
+                findings.append(f"🚨 POE POLICE: {len(policed)} port(s) cut for over-draw — {', '.join(policed[:5])}")
+
+        # ── Budget footer from 'show power inline' ──
+        if cmd.strip() == "show power inline":
+            # Footer: "Available:1100.0(w)  Used:680.0(w)  Remaining:420.0(w)"
+            avail_m = re.search(r"Available:\s*([\d.]+)", output, re.IGNORECASE)
+            used_m  = re.search(r"Used:\s*([\d.]+)",      output, re.IGNORECASE)
+            if avail_m and used_m:
+                avail = float(avail_m.group(1))
+                used  = float(used_m.group(1))
+                if avail > 0:
+                    pct = used / avail * 100
+                    if pct >= 90:
+                        findings.append(f"🚨 POE BUDGET: {used:.0f}W / {avail:.0f}W used ({pct:.0f}% — near exhaustion, brownout risk)")
+                    elif pct >= 75:
+                        findings.append(f"⚠️  POE BUDGET: {used:.0f}W / {avail:.0f}W used ({pct:.0f}% — getting tight)")
+                    else:
+                        findings.append(f"✅ POE BUDGET: {used:.0f}W / {avail:.0f}W used ({pct:.0f}%)")
+            # Faulty ports in the summary
+            faulty = re.findall(r"^\s*((?:Gi|Te|Fa|Tw|Twe|Fo|Hu)\S+)\s+\S+\s+faulty",
+                                output, re.IGNORECASE | re.MULTILINE)
+            if faulty:
+                findings.append(f"🚨 POE FAULTY: {len(faulty)} port(s) in faulty state — {', '.join(faulty[:5])}")
+
+        # ── env power: PSU health ──
+        if "env power" in cmd:
+            # Flag any PSU not OK
+            bad_psu = re.findall(r"^(.*(?:PS|Power Supply|PWR)\S*.*?)\b(?:fail|faulty|err|not present|absent)\b",
+                                 output, re.IGNORECASE | re.MULTILINE)
+            if bad_psu:
+                findings.append(f"🚨 PSU: power supply issue detected — review 'show env power' output")
+
+        # ── ILPOWER syslog: power cycling = micro-reboots ──
+        if "ILPOWER" in cmd:
+            denied = output.upper().count("POWER_DENIED")
+            granted = output.upper().count("POWER_GRANTED")
+            ctrl   = output.upper().count("CONTROLLER_PORT")
+            if denied > 0:
+                findings.append(f"🚨 ILPOWER: {denied} POWER_DENIED event(s) — switch refused power to a PD")
+            if granted > 2:
+                findings.append(f"🚨 ILPOWER: {granted} POWER_GRANTED events — port(s) power-cycling (camera micro-reboots → TCN churn)")
+            elif granted > 0:
+                findings.append(f"⚠️  ILPOWER: {granted} POWER_GRANTED event(s) — some power re-grants, monitor")
+            if ctrl > 0:
+                findings.append(f"⚠️  ILPOWER: {ctrl} controller-port event(s) — PoE controller faults")
+            if denied == 0 and granted == 0 and ctrl == 0:
+                findings.append("✅ ILPOWER: no PoE power events in logs (no cycling)")
 
     return findings
 
@@ -708,7 +991,7 @@ def save_report(device_ip: str, results: dict, findings: list[str], output_dir: 
 
     with open(filename, "w", encoding="utf-8") as f:
         f.write("=" * 70 + "\n")
-        f.write("  STP AUDIT REPORT\n")
+        f.write("  STP + POE AUDIT REPORT\n")
         f.write(f"  Device      : {device_ip}\n")
         f.write(f"  Date        : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"  Method      : clear counters -> {SOAK_PERIOD}s soak -> collect\n")
@@ -724,6 +1007,8 @@ def save_report(device_ip: str, results: dict, findings: list[str], output_dir: 
 
         f.write("── COMMAND OUTPUTS ────────────────────────────────────────────────\n\n")
         for cmd, output in results.items():
+            if cmd.startswith("__"):
+                continue   # internal markers, not real commands
             f.write(f">>> {cmd}\n")
             f.write(output + "\n")
             f.write("-" * 60 + "\n\n")
@@ -737,7 +1022,7 @@ def write_summary(summary_rows: list[dict], output_dir: str) -> str:
 
     with open(filename, "w", encoding="utf-8") as f:
         f.write("=" * 70 + "\n")
-        f.write("  STP AUDIT — NETWORK SUMMARY\n")
+        f.write("  STP + POE AUDIT — NETWORK SUMMARY\n")
         f.write(f"  Generated : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"  Devices   : {STATS.devices_attempted} attempted / "
                 f"{STATS.devices_success} success / {STATS.devices_failed} failed\n")
@@ -795,24 +1080,39 @@ def reconnect_jump(
 # ─────────────────────────────────────────────
 
 def main():
-    global SOAK_PERIOD   # must be declared before any reference to the variable
+    global SOAK_PERIOD, RUN_STP, RUN_POE   # must be declared before any reference
 
-    parser = argparse.ArgumentParser(description="STP Audit via Jump Switch")
+    parser = argparse.ArgumentParser(description="STP + PoE Audit via Jump Switch")
     parser.add_argument("--devices", default=DEVICES_FILE,  help="Path to devices.txt")
     parser.add_argument("--output",  default=OUTPUT_DIR,    help="Output directory")
     parser.add_argument("--jump",    default=JUMP_HOST_IP,  help="Jump switch IP")
     parser.add_argument("--user",    default=USERNAME,      help="SSH username")
     parser.add_argument("--soak",    default=SOAK_PERIOD,   type=int, help="Soak seconds after clear")
+    parser.add_argument("--no-poe",   action="store_true",  help="Skip PoE checks (STP only)")
+    parser.add_argument("--poe-only", action="store_true",  help="Skip STP checks (PoE only)")
     args = parser.parse_args()
 
     SOAK_PERIOD = args.soak
+
+    if args.poe_only and args.no_poe:
+        print("[FATAL] --poe-only and --no-poe are mutually exclusive")
+        sys.exit(1)
+    if args.no_poe:
+        RUN_POE = False
+    if args.poe_only:
+        RUN_STP = False
 
     os.makedirs(args.output, exist_ok=True)
     devices              = load_devices(args.devices)
     username, password   = prompt_credentials(args.user, PASSWORD)
 
+    mode = "STP + PoE"
+    if not RUN_POE: mode = "STP only"
+    if not RUN_STP: mode = "PoE only"
+
     print(f"\n{'='*60}")
-    print(f"  STP Audit")
+    print(f"  STP + PoE Audit")
+    print(f"  Mode        : {mode}")
     print(f"  Devices     : {len(devices)}")
     print(f"  Jump switch : {args.jump}")
     print(f"  Soak period : {SOAK_PERIOD}s")
@@ -837,6 +1137,7 @@ def main():
         # Attempt the device with jump-reconnect recovery
         jump_reconnects = 0
         device_done     = False
+        results         = {}   # ensure defined even if every phase bails
 
         while not device_done:
             try:
@@ -844,8 +1145,11 @@ def main():
 
                 if is_jump:
                     print("  [INFO] Jump switch — running commands directly on this session")
-                    clear_stp_counters(shell, device_ip)
-                    results = run_stp_audit(shell, device_ip)
+                    if RUN_STP:
+                        clear_stp_counters(shell, device_ip)
+                        results.update(run_stp_audit(shell, device_ip))
+                    if RUN_POE:
+                        results.update(run_poe_audit(shell, device_ip))
 
                 else:
                     connected = hop_to_device(shell, device_ip, username, password)
@@ -861,8 +1165,11 @@ def main():
                         device_done = True
                         continue
 
-                    clear_stp_counters(shell, device_ip)
-                    results = run_stp_audit(shell, device_ip)
+                    if RUN_STP:
+                        clear_stp_counters(shell, device_ip)
+                        results.update(run_stp_audit(shell, device_ip))
+                    if RUN_POE:
+                        results.update(run_poe_audit(shell, device_ip))
                     exit_device(shell)
                     print(f"  [EXIT] Returned to jump switch")
 
@@ -891,6 +1198,7 @@ def main():
                 print(f"  [JUMP] Reconnect attempt {jump_reconnects}/{MAX_JUMP_RECONNECTS} — retrying {device_ip} after reconnect ...")
                 # Reset the device stats so retry starts clean
                 STATS.start_device(device_ip)
+                results = {}
                 try:
                     jump_client, shell = reconnect_jump(args.jump, username, password, jump_client)
                 except SystemExit:
