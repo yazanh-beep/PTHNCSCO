@@ -16,6 +16,14 @@ Topology:
                               ▲                               │
                               └───────── exit ────────────────┘
 
+Credential cycling:
+    Multiple username/password pairs may be supplied in CREDENTIALS. The
+    script tries each pair in order:
+      - connect_aggregate() : cycles through all credentials per attempt.
+      - hop_to_access()     : cycles through all credentials per hop attempt.
+    The first pair that authenticates successfully is used; the working
+    enable password is taken from that pair (or its dedicated enable field).
+
 Retry / reconnect behaviour:
     - connect_aggregate()  : retries up to AGG_CONNECT_RETRIES times with
                              AGG_RETRY_DELAY seconds between attempts.
@@ -44,9 +52,14 @@ import sys
 from pathlib import Path
 
 # ─── USER CONFIG ─────────────────────────────────────────────────────────────
-USERNAME            = "admin"
-PASSWORD            = "cisco"
-ENABLE_PASSWORD     = PASSWORD      # change if enable password differs
+# Credential pairs are tried in order until one authenticates.
+# Each entry: {"username": ..., "password": ..., "enable": ...}
+#   - "enable" is optional; if omitted, the pair's password is used as enable.
+CREDENTIALS = [
+    {"username": "admin",    "password": "cisco",      "enable": None},
+    {"username": "admin", "password": "AG37jjYpnyB4@", "enable": None},
+]
+
 AGGREGATE_IP        = "192.168.1.11"   # ← IP of the aggregate (jump) switch
 DEVICES_FILE        = Path("devices.txt")
 BACKUP_DIR          = Path("backups")
@@ -62,12 +75,32 @@ HOP_RETRIES          = 3            # attempts to SSH-hop to an access switch
 HOP_RETRY_DELAY      = 8            # seconds between hop attempts
 POST_TECH_DRAIN_TIME = 30           # seconds to keep draining buffer after show
                                     #   tech prompt arrives (device keeps sending)
-POST_DEVICE_DELAY    = 300          # seconds to wait between devices (5 min)
+POST_DEVICE_DELAY    = 0          # seconds to wait between devices (5 min)
                                     #   set to 0 to disable
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Holds the credential pair confirmed working on the aggregate. Used as the
+# starting point (tried first) when hopping to access switches.
+ACTIVE_CRED = None
+
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+def enable_pw(cred: dict) -> str:
+    """Return the enable password for a credential pair (falls back to password)."""
+    return cred["enable"] if cred.get("enable") else cred["password"]
+
+
+def ordered_creds() -> list[dict]:
+    """
+    Credential list with the known-good ACTIVE_CRED first (if any),
+    so successful auth on the aggregate is reused for hops before others.
+    """
+    if ACTIVE_CRED is None:
+        return list(CREDENTIALS)
+    rest = [c for c in CREDENTIALS if c is not ACTIVE_CRED]
+    return [ACTIVE_CRED] + rest
+
 
 def load_devices(path: Path) -> list[str]:
     """Read devices.txt; skip blank lines and comments (#)."""
@@ -112,11 +145,11 @@ def send_cmd(shell, cmd: str, patterns: tuple = ("#",),
     return out
 
 
-def elevate_and_init(shell):
+def elevate_and_init(shell, cred: dict):
     """Enable + disable paging on whatever device the shell is currently on."""
     out = send_cmd(shell, "enable", patterns=("assword:", "#"), timeout=10)
     if "assword:" in out:
-        send_cmd(shell, ENABLE_PASSWORD, patterns=("#",), timeout=10, sensitive=True)
+        send_cmd(shell, enable_pw(cred), patterns=("#",), timeout=10, sensitive=True)
     send_cmd(shell, "terminal length 0", patterns=("#",), timeout=5)
 
 
@@ -162,48 +195,59 @@ def sanitize(s: str) -> str:
 
 # ─── AGGREGATE CONNECTION & HEALTH ───────────────────────────────────────────
 
-def _open_aggregate(ip: str):
+def _open_aggregate(ip: str, cred: dict):
     """
-    Raw connect to aggregate: TCP + SSH + enable + paging.
+    Raw connect to aggregate with a single credential pair:
+    TCP + SSH + enable + paging.
     Returns (SSHClient, shell). Raises on any failure.
     """
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(
         ip,
-        username=USERNAME,
-        password=PASSWORD,
+        username=cred["username"],
+        password=cred["password"],
         look_for_keys=False,
         allow_agent=False,
         timeout=10,
     )
     shell = client.invoke_shell()
     expect_prompt(shell, ("#", ">"), timeout=15)
-    elevate_and_init(shell)
+    elevate_and_init(shell, cred)
     return client, shell
 
 
 def connect_aggregate(ip: str):
     """
-    Connect to the aggregate switch with retry logic.
-    Tries up to AGG_CONNECT_RETRIES times, waiting AGG_RETRY_DELAY seconds
-    between each attempt. Exits the script if all attempts fail.
+    Connect to the aggregate switch with retry logic and credential cycling.
+    Each attempt tries every credential pair in order; the first that
+    authenticates wins and is recorded as ACTIVE_CRED. Tries up to
+    AGG_CONNECT_RETRIES times, waiting AGG_RETRY_DELAY seconds between attempts.
+    Exits the script if all attempts fail.
     """
+    global ACTIVE_CRED
     for attempt in range(1, AGG_CONNECT_RETRIES + 1):
-        try:
-            print(f"[AGGREGATE] Connecting to {ip} (attempt {attempt}/{AGG_CONNECT_RETRIES}) …")
-            client, shell = _open_aggregate(ip)
-            agg_host = get_hostname(shell)
-            print(f"[AGGREGATE] Connected — prompt: {agg_host}#\n")
-            return client, shell
-        except Exception as exc:
-            print(f"[AGGREGATE] Connection failed: {exc}")
-            if attempt < AGG_CONNECT_RETRIES:
-                print(f"[AGGREGATE] Retrying in {AGG_RETRY_DELAY}s …")
-                time.sleep(AGG_RETRY_DELAY)
-            else:
-                print(f"[AGGREGATE] All {AGG_CONNECT_RETRIES} attempts failed. Aborting.")
-                sys.exit(1)
+        print(f"[AGGREGATE] Connecting to {ip} (attempt {attempt}/{AGG_CONNECT_RETRIES}) …")
+        last_exc = None
+        for cred in ordered_creds():
+            try:
+                print(f"[AGGREGATE]   trying user '{cred['username']}' …")
+                client, shell = _open_aggregate(ip, cred)
+                ACTIVE_CRED = cred
+                agg_host = get_hostname(shell)
+                print(f"[AGGREGATE] Connected as '{cred['username']}' — prompt: {agg_host}#\n")
+                return client, shell
+            except Exception as exc:
+                last_exc = exc
+                print(f"[AGGREGATE]   user '{cred['username']}' failed: {exc}")
+
+        print(f"[AGGREGATE] All credentials failed this attempt. Last error: {last_exc}")
+        if attempt < AGG_CONNECT_RETRIES:
+            print(f"[AGGREGATE] Retrying in {AGG_RETRY_DELAY}s …")
+            time.sleep(AGG_RETRY_DELAY)
+        else:
+            print(f"[AGGREGATE] All {AGG_CONNECT_RETRIES} attempts failed. Aborting.")
+            sys.exit(1)
 
 
 def is_agg_alive(client, shell) -> bool:
@@ -243,15 +287,16 @@ def ensure_aggregate(client, shell):
 
 # ─── HOP LOGIC ───────────────────────────────────────────────────────────────
 
-def _attempt_hop(agg_shell, access_ip: str):
+def _attempt_hop(agg_shell, access_ip: str, cred: dict):
     """
-    Single attempt to SSH-hop from aggregate to access_ip.
-    Raises RuntimeError on any detectable failure so the caller can retry.
+    Single attempt to SSH-hop from aggregate to access_ip using one
+    credential pair. Raises RuntimeError on any detectable failure so the
+    caller can retry / try the next credential.
     """
-    print(f"    [HOP] aggregate → {access_ip}")
+    print(f"    [HOP] aggregate → {access_ip}  (user '{cred['username']}')")
     out = send_cmd(
         agg_shell,
-        f"ssh -l {USERNAME} {access_ip}",
+        f"ssh -l {cred['username']} {access_ip}",
         patterns=("Destination", "(yes/no)?", "yes/no", "assword:", "%", "#", ">"),
         timeout=20,
     )
@@ -261,41 +306,57 @@ def _attempt_hop(agg_shell, access_ip: str):
                        patterns=("assword:", "%", "#", ">"), timeout=15)
 
     if "assword:" in out:
-        out = send_cmd(agg_shell, PASSWORD,
-                       patterns=("%", "#", ">"), timeout=15, sensitive=True)
+        out = send_cmd(agg_shell, cred["password"],
+                       patterns=("assword:", "%", "#", ">"), timeout=15, sensitive=True)
+
+    # A re-prompt for password means the credential was rejected.
+    if "assword:" in out:
+        # Send a newline to clear the re-prompt so the shell returns to the
+        # aggregate prompt for the next credential attempt.
+        send_cmd(agg_shell, "", patterns=("%", "#", ">"), timeout=10)
+        raise RuntimeError(f"SSH hop auth rejected for user '{cred['username']}'")
 
     if "%" in out and "#" not in out and ">" not in out:
         raise RuntimeError(f"SSH hop failed: {out.strip().splitlines()[-1]}")
 
-    elevate_and_init(agg_shell)
-    print(f"    [HOP] now at {access_ip}#")
+    elevate_and_init(agg_shell, cred)
+    print(f"    [HOP] now at {access_ip}#  (user '{cred['username']}')")
 
 
 def hop_to_access(client, shell, access_ip: str):
     """
-    Hop from aggregate to access_ip with retry logic.
+    Hop from aggregate to access_ip with retry logic and credential cycling.
 
-    On each failed attempt:
+    On each attempt, every credential pair is tried in order (ACTIVE_CRED
+    first). On a failed attempt:
       - Checks whether the aggregate session is still alive and reconnects
         if needed (socket-closed scenario).
       - Waits HOP_RETRY_DELAY seconds before the next attempt.
 
-    Returns the (possibly reconnected) (client, shell) tuple.
+    Returns (client, shell, used_cred) where used_cred is the credential
+    pair that successfully authenticated to the access switch.
     Raises RuntimeError if all HOP_RETRIES attempts are exhausted.
     """
     last_exc = None
     for attempt in range(1, HOP_RETRIES + 1):
         # Ensure aggregate is alive before each hop attempt
         client, shell = ensure_aggregate(client, shell)
-        try:
-            _attempt_hop(shell, access_ip)
-            return client, shell          # hop succeeded
-        except Exception as exc:
-            last_exc = exc
-            print(f"    [HOP] Attempt {attempt}/{HOP_RETRIES} failed: {exc}")
-            if attempt < HOP_RETRIES:
-                print(f"    [HOP] Retrying in {HOP_RETRY_DELAY}s …")
-                time.sleep(HOP_RETRY_DELAY)
+
+        for cred in ordered_creds():
+            try:
+                _attempt_hop(shell, access_ip, cred)
+                return client, shell, cred          # hop succeeded
+            except Exception as exc:
+                last_exc = exc
+                print(f"    [HOP] user '{cred['username']}' failed: {exc}")
+                # Make sure we're back at an aggregate prompt before trying
+                # the next credential (in case the failed ssh left us mid-prompt).
+                client, shell = ensure_aggregate(client, shell)
+
+        print(f"    [HOP] Attempt {attempt}/{HOP_RETRIES} — all credentials failed.")
+        if attempt < HOP_RETRIES:
+            print(f"    [HOP] Retrying in {HOP_RETRY_DELAY}s …")
+            time.sleep(HOP_RETRY_DELAY)
 
     raise RuntimeError(
         f"All {HOP_RETRIES} hop attempts to {access_ip} failed. Last error: {last_exc}"
@@ -365,7 +426,7 @@ def process_device(client, shell, access_ip: str) -> tuple[dict, object, object]
     """
     Using the persistent aggregate session:
       1. Ensure aggregate is alive (reconnect if not)
-      2. Hop to the access switch (with retry + reconnect on failure)
+      2. Hop to the access switch (with retry + credential cycling)
       3. Pull show tech-support
       4. Exit back to aggregate
 
@@ -378,6 +439,7 @@ def process_device(client, shell, access_ip: str) -> tuple[dict, object, object]
         "status":   "OK",
         "file":     None,
         "error":    None,
+        "user":     None,
     }
 
     print(f"\n{'='*60}")
@@ -389,9 +451,10 @@ def process_device(client, shell, access_ip: str) -> tuple[dict, object, object]
         # Proactive health check before we start
         client, shell = ensure_aggregate(client, shell)
 
-        # Hop with retry + reconnect logic
-        client, shell = hop_to_access(client, shell, access_ip)
+        # Hop with retry + credential cycling
+        client, shell, used_cred = hop_to_access(client, shell, access_ip)
         hopped = True
+        result["user"] = used_cred["username"]
 
         hostname = get_hostname(shell)
         result["hostname"] = hostname
@@ -440,7 +503,8 @@ def print_summary(results: list[dict]):
     if ok:
         print(f"\n  ✅ Successful:")
         for r in ok:
-            print(f"     {r['ip']:<20}  {r['hostname']:<20}  {r['file']}")
+            user = r.get("user") or "?"
+            print(f"     {r['ip']:<20}  {r['hostname']:<20}  [{user}]  {r['file']}")
 
     if failed:
         print(f"\n  ❌ Failed:")
@@ -457,6 +521,8 @@ if __name__ == "__main__":
     devices = load_devices(DEVICES_FILE)
     print(f"[INFO] Loaded {len(devices)} device(s) from {DEVICES_FILE}")
     print(f"[INFO] Aggregate jump host : {AGGREGATE_IP}")
+    print(f"[INFO] Credential pairs    : {len(CREDENTIALS)} "
+          f"({', '.join(c['username'] for c in CREDENTIALS)})")
     print(f"[INFO] Output directory    : {BACKUP_DIR}/\n")
 
     agg_client, agg_shell = connect_aggregate(AGGREGATE_IP)
