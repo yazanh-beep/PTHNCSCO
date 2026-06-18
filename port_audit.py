@@ -6,6 +6,14 @@ Verified against C9500 (TwentyFiveGigE / HundredGigE / AppGigabitEthernet)
 running IOS-XE with dual-stack interface name formats.
 
 CHANGELOG (this revision):
+  - Added Input Queue Drops and Total Output Drops columns, parsed from the
+    'show interfaces' per-interface header line:
+        Input queue: 0/2000/0/0 (size/max/drops/flushes); Total output drops: N
+    These catch egress queue congestion (microburst / oversubscription tail
+    drops) that leave every hardware error counter at zero. Both feed the
+    drop flag and red highlighting.
+  - Added --clear-wait CLI argument to set the accumulation window per run
+    (default still CLEAR_WAIT). Useful for catching periodic bursts.
   - clear_counters() now answers the [confirm] prompt as soon as it appears
     and verifies the device prompt returns (saves ~15s per device, and logs
     a warning if the confirm was never seen).
@@ -19,6 +27,7 @@ Usage:
     python port_audit.py --targets devices.txt --agg 10.0.0.1
     python port_audit.py --targets devices.txt --no-jump
     python port_audit.py --targets devices.txt --out site_a_audit.xlsx
+    python port_audit.py --targets devices.txt --clear-wait 300
 """
 
 import paramiko
@@ -115,6 +124,8 @@ COLUMNS = [
     "Pkts In",
     "Bytes In",
     "No Buffer",
+    "Input Queue Drops",
+    "Total Output Drops",
     "Input Errors",
     "CRC",
     "Frame",
@@ -179,7 +190,8 @@ COLUMNS = [
 ]
 
 DROP_COLUMNS = {
-    "No Buffer", "Input Errors", "CRC", "Frame", "Overruns", "Ignored",
+    "No Buffer", "Input Queue Drops", "Total Output Drops",
+    "Input Errors", "CRC", "Frame", "Overruns", "Ignored",
     "Runts", "Giants", "Throttles", "Dribble",
     "Output Errors", "Collisions",
     "Unknown Proto Drops", "Out Buffer Failures", "Out Bufs Swapped",
@@ -752,6 +764,11 @@ def run_commands(shell):
     # (the confirm text is literal: it clears the "show interface" counters
     # only). We collect this table now and compute a delta after CLEAR_WAIT
     # so the sheet shows only errors accumulated during the measurement window.
+    #
+    # NOTE: 'clear counters' DOES reset the 'show interfaces' header counters,
+    # including 'Total output drops' and the Input queue drops, so those two
+    # are reported as absolute values after the wait — i.e. drops accumulated
+    # purely during the measurement window. No baseline/delta needed for them.
     logger.info("  [*] baseline: show interfaces counters errors")
     errs_baseline = send_cmd(shell, "show interfaces counters errors")
 
@@ -982,6 +999,28 @@ def parse_intf_full(intf_full_out, up_keys):
         # Description
         dm = re.search(r"Description:\s*(.*)", block)
         d["Description"] = dm.group(1).strip() if dm else ""
+
+        # Input queue drops + Total output drops
+        #   Input queue: <size>/<max>/<drops>/<flushes> (size/max/drops/flushes);
+        #       Total output drops: <n>
+        # On some IOS-XE versions 'Total output drops' wraps to the next line,
+        # so re.S lets '.' span the newline; '.*?' is non-greedy to stop at the
+        # first 'Total output drops'. The Input queue 3rd field is the drop count.
+        mq = re.search(
+            r"Input queue:\s*\d+/\d+/(\d+)/\d+.*?Total output drops:\s*(\d+)",
+            block, re.S)
+        if mq:
+            d["Input Queue Drops"]  = _int(mq.group(1))
+            d["Total Output Drops"] = _int(mq.group(2))
+        else:
+            # Fall back to matching each independently in case the line format
+            # differs (e.g. platforms that omit one of the two).
+            miq = re.search(r"Input queue:\s*\d+/\d+/(\d+)/\d+", block)
+            if miq:
+                d["Input Queue Drops"] = _int(miq.group(1))
+            mtod = re.search(r"Total output drops:\s*(\d+)", block)
+            if mtod:
+                d["Total Output Drops"] = _int(mtod.group(1))
 
         # Speed / Duplex from hardware capability line
         hw = re.search(
@@ -1776,6 +1815,7 @@ def assemble_rows(up_map, raw_cmds):
         for col in [
             "In Rate (bps)", "In Rate (pps)", "Out Rate (bps)", "Out Rate (pps)",
             "Pkts In", "Bytes In", "No Buffer",
+            "Input Queue Drops", "Total Output Drops",
             "Input Errors", "CRC", "Frame", "Overruns", "Ignored",
             "Runts", "Giants", "Throttles", "Dribble",
             "Pkts Out", "Bytes Out",
@@ -2060,20 +2100,27 @@ def load_targets(path):
 
 
 def main():
-    global logger, AGG_SWITCH_IP
+    global logger, AGG_SWITCH_IP, CLEAR_WAIT
 
     ap = argparse.ArgumentParser(description="Cisco Port Drop Auditor")
     ap.add_argument("--targets",  required=True)
     ap.add_argument("--agg",      default=AGG_SWITCH_IP)
     ap.add_argument("--no-jump",  action="store_true")
     ap.add_argument("--out",      default="")
+    ap.add_argument("--clear-wait", type=int, default=CLEAR_WAIT,
+                    help="Seconds to wait after 'clear counters' before "
+                         "collecting, so queue/output drops accumulate during "
+                         f"the window (default: {CLEAR_WAIT}). Raise to ~300 "
+                         "to catch periodic bursts.")
     args = ap.parse_args()
     AGG_SWITCH_IP = args.agg
+    CLEAR_WAIT    = args.clear_wait
 
     logger, log_file = setup_logging()
     logger.info("=" * 60)
     logger.info("Cisco Port Drop Auditor")
     logger.info("=" * 60)
+    logger.info(f"Counter accumulation window (CLEAR_WAIT): {CLEAR_WAIT}s")
 
     targets = load_targets(args.targets)
     logger.info(f"Loaded {len(targets)} target(s) from {args.targets}")
