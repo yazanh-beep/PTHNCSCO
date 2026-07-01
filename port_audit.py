@@ -21,6 +21,10 @@ CHANGELOG (this revision):
     clear counters, final after CLEAR_WAIT) and the sheet shows the DELTA.
     This handles Cat9k IOS-XE releases where 'clear counters' does NOT reset
     the hardware error-counter table behind that command.
+  - Added per-interface 'show interface <intf> human-readable' capture. The
+    full descriptive command output for every up/up interface is stored and
+    written verbatim into a new 'Show Interface Output' column, placed right
+    after the counters-errors group, wrapped so it stays readable.
 
 Usage:
     python port_audit.py --targets devices.txt
@@ -117,6 +121,33 @@ COLUMNS = [
     "Duplex",
     "Native VLAN",
     "Allowed VLANs",
+    # Line / protocol state and physical properties (from show interface <intf>)
+    "Line Status",
+    "Protocol Status",
+    "MAC Address",
+    "BIA",
+    "MTU (bytes)",
+    "BW (Kbit/s)",
+    "DLY (usec)",
+    "Reliability",
+    "TxLoad",
+    "RxLoad",
+    "Encapsulation",
+    "Loopback",
+    "Keepalive",
+    "Media Type",
+    "Link Type",
+    "Input Flow-Control",
+    "Output Flow-Control",
+    "ARP Type",
+    "ARP Timeout",
+    "Last Input",
+    "Last Output",
+    "Output Hang",
+    "Last Counter Clear",
+    "Queueing Strategy",
+    "Output Queue Size",
+    "Output Queue Max",
     "In Rate (bps)",
     "In Rate (pps)",
     "Out Rate (bps)",
@@ -124,6 +155,8 @@ COLUMNS = [
     "Pkts In",
     "Bytes In",
     "No Buffer",
+    "Rx Broadcasts",
+    "Rx Multicasts",
     "Input Queue Drops",
     "Total Output Drops",
     "Input Errors",
@@ -131,22 +164,29 @@ COLUMNS = [
     "Frame",
     "Overruns",
     "Ignored",
+    "Watchdog",
+    "Input Multicast",
+    "Pause Input",
     "Runts",
     "Giants",
     "Throttles",
     "Dribble",
     "Pkts Out",
     "Bytes Out",
+    "Tx Broadcasts",
+    "Tx Multicasts",
     "Output Errors",
     "Collisions",
     "Intf Resets",
     "Unknown Proto Drops",
     "Out Buffer Failures",
     "Out Bufs Swapped",
+    "Babbles",
     "Late Collision",
     "Deferred",
     "Lost Carrier",
     "No Carrier",
+    "Pause Output",
     # From show interfaces counters errors (DELTA over CLEAR_WAIT window)
     "Align Err",
     "FCS Err",
@@ -755,6 +795,40 @@ def clear_counters(shell):
     logger.warning(f"  [!] raw device output (last 300 chars): {buf[-300:]!r}")
 
 
+def collect_show_interface(shell, up_map):
+    """
+    Runs 'show interface <intf> human-readable' for every up/up interface and
+    returns {intf_key: raw_output_string}.
+
+    'human-readable' is a valid IOS-XE modifier that expands large counters
+    into K/M/G suffixes; if a platform rejects it the output still contains
+    the standard 'show interface' body, so we keep whatever comes back. The
+    raw text is captured verbatim (newlines preserved) so it can be written
+    into a single wrapped Excel cell.
+    """
+    result = {}
+    total  = len(up_map)
+    for idx, (key, display) in enumerate(up_map.items(), 1):
+        logger.info(f"    [show int {idx}/{total}] {display}")
+        out = send_cmd(shell, f"show interface {display} human-readable",
+                       timeout=30, silent=True)
+        # Strip the echoed command line and the trailing device prompt so the
+        # cell holds just the interface body.
+        lines = out.splitlines()
+        cleaned = []
+        for ln in lines:
+            low = ln.strip().lower()
+            # skip the echoed command
+            if low.startswith("show interface") and "human-readable" in low:
+                continue
+            # skip a trailing prompt line (HOST# / HOST>)
+            if re.match(r"^[^\r\n>\s][^\r\n>]*[>#]\s*$", ln.strip()):
+                continue
+            cleaned.append(ln.rstrip())
+        result[key] = "\n".join(cleaned).strip()
+    return result
+
+
 def run_commands(shell):
     # ── Step 0: clear counters then wait ─────────────────────────────────────
     clear_counters(shell)
@@ -788,33 +862,41 @@ def run_commands(shell):
                 raise
         time.sleep(1)
 
-    # ── Step 1-10: collect ───────────────────────────────────────────────────
-    logger.info("  [1/10] show ip interface brief")
+    # ── Step 1-11: collect ───────────────────────────────────────────────────
+    logger.info("  [1/11] show ip interface brief")
     ip_brief    = send_cmd(shell, "show ip interface brief")
-    logger.info("  [2/10] show interfaces")
+    logger.info("  [2/11] show interfaces")
     intf_full   = send_cmd(shell, "show interfaces", timeout=90)
-    logger.info("  [3/10] show interfaces status")
+    logger.info("  [3/11] show interfaces status")
     intf_status = send_cmd(shell, "show interfaces status")
-    logger.info("  [4/10] show interfaces trunk")
+    logger.info("  [4/11] show interfaces trunk")
     intf_trunk  = send_cmd(shell, "show interfaces trunk")
-    logger.info("  [5/10] show interfaces counters errors")
+    logger.info("  [5/11] show interfaces counters errors")
     intf_errs   = send_cmd(shell, "show interfaces counters errors")
-    logger.info("  [6/10] show interfaces transceiver")
+    logger.info("  [6/11] show interfaces transceiver")
     transceiver = send_cmd(shell, "show interfaces transceiver")
-    logger.info("  [7/10] show lldp neighbors detail")
+    logger.info("  [7/11] show lldp neighbors detail")
     lldp        = send_cmd(shell, "show lldp neighbors detail", timeout=60)
-    logger.info("  [8/10] show mac address-table dynamic")
+    logger.info("  [8/11] show mac address-table dynamic")
     mac_table   = send_cmd(shell, "show mac address-table dynamic", timeout=60)
-    logger.info("  [9/10] show interfaces transceiver detail")
+    logger.info("  [9/11] show interfaces transceiver detail")
     xcvr_detail  = send_cmd(shell, "show interfaces transceiver detail", timeout=60)
-    logger.info("  [10/10] show etherchannel summary")
+    logger.info("  [10/11] show etherchannel summary")
     etherchannel = send_cmd(shell, "show etherchannel summary")
+
+    # ── Step 11: per-interface 'show interface <intf> human-readable' ────────
+    # Parse the up/up interface list now so we know which interfaces to poll.
+    up_map = parse_up_interfaces(ip_brief)
+    logger.info(f"  [11/11] show interface <intf> human-readable "
+                f"({len(up_map)} up/up interfaces)")
+    show_intf = collect_show_interface(shell, up_map)
+
     return dict(ip_brief=ip_brief, intf_full=intf_full,
                 intf_status=intf_status, intf_trunk=intf_trunk,
                 intf_errs=intf_errs, intf_errs_base=errs_baseline,
                 transceiver=transceiver,
                 lldp=lldp, mac_table=mac_table, xcvr_detail=xcvr_detail,
-                etherchannel=etherchannel)
+                etherchannel=etherchannel, show_intf=show_intf)
 
 # ============================================================================
 # PARSERS
@@ -857,6 +939,22 @@ def _safe_val(val):
     s = _ILLEGAL_XML.sub("", s)            # strip illegal XML chars
     s = s.strip()
     return s
+
+
+def _safe_multiline(val):
+    """
+    Like _safe_val but PRESERVES newlines — used for the verbatim
+    'show interface' cell so the multi-line command output stays formatted.
+    Still strips ANSI codes and illegal XML control chars, and normalises
+    \r\n / \r to plain \n.
+    """
+    if val is None:
+        return ""
+    s = str(val)
+    s = _ANSI_ESC.sub("", s)
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = _ILLEGAL_XML.sub("", s)
+    return s.strip()
 
 
 def parse_up_interfaces(ip_brief_out):
@@ -975,149 +1073,310 @@ def parse_trunk_ports(intf_trunk_out):
     return result
 
 
-def parse_intf_full(intf_full_out, up_keys):
+def _parse_one_intf_block(block):
     """
-    Parses 'show interfaces'. Only processes interfaces whose key is in up_keys.
-    Returns {intf_key: {counter_name: value}}
+    Parses a single 'show interface <intf>' body (one interface) and returns a
+    dict of every field the command exposes. Works on both the per-interface
+    'show interface X human-readable' output and one interface-block of the
+    device-wide 'show interfaces' output.
     """
-    blocks = re.split(r"\n(?=[A-Za-z])", intf_full_out)
+    d = {}
+
+    # ── Line 1: <intf> is <line status>, line protocol is <proto> (reason) ──
+    m0 = re.match(
+        r"^\S+\s+is\s+(administratively down|up|down|deleted)"
+        r"(?:\s*,\s*line protocol is\s+(up|down)(?:\s*\(([^)]*)\))?)?",
+        block, re.I)
+    if m0:
+        line_stat = m0.group(1).strip()
+        proto     = (m0.group(2) or "").strip()
+        reason    = (m0.group(3) or "").strip()
+        d["Line Status"]     = line_stat
+        d["Protocol Status"] = (f"{proto} ({reason})" if reason else proto) or ""
+
+    # Description
+    dm = re.search(r"Description:\s*(.*)", block)
+    d["Description"] = dm.group(1).strip() if dm else ""
+
+    # Hardware / MAC / BIA:  Hardware is ..., address is aaaa.bbbb.cccc (bia dddd.eeee.ffff)
+    hwm = re.search(
+        r"address is\s+([0-9a-fA-F.:]+)\s*(?:\(bia\s+([0-9a-fA-F.:]+)\))?",
+        block, re.I)
+    if hwm:
+        d["MAC Address"] = hwm.group(1).strip()
+        d["BIA"]         = (hwm.group(2) or hwm.group(1)).strip()
+
+    # MTU / BW / DLY:  MTU 1500 bytes, BW 1000000 Kbit/sec, DLY 10 usec,
+    mtu = re.search(r"MTU\s+(\d+)\s*bytes", block, re.I)
+    if mtu:
+        d["MTU (bytes)"] = _int(mtu.group(1))
+    bw = re.search(r"BW\s+(\d+)\s*Kbit", block, re.I)
+    if bw:
+        d["BW (Kbit/s)"] = _int(bw.group(1))
+    dly = re.search(r"DLY\s+(\d+)\s*usec", block, re.I)
+    if dly:
+        d["DLY (usec)"] = _int(dly.group(1))
+
+    # reliability 255/255, txload 1/255, rxload 1/255
+    rel = re.search(r"reliability\s+(\d+/\d+)", block, re.I)
+    if rel:
+        d["Reliability"] = rel.group(1)
+    txl = re.search(r"txload\s+(\d+/\d+)", block, re.I)
+    if txl:
+        d["TxLoad"] = txl.group(1)
+    rxl = re.search(r"rxload\s+(\d+/\d+)", block, re.I)
+    if rxl:
+        d["RxLoad"] = rxl.group(1)
+
+    # Encapsulation ARPA, loopback not set
+    enc = re.search(r"Encapsulation\s+(\S+)", block, re.I)
+    if enc:
+        d["Encapsulation"] = enc.group(1).strip(",")
+    lb = re.search(r"loopback\s+(not set|set)", block, re.I)
+    if lb:
+        d["Loopback"] = lb.group(1)
+
+    # Keepalive set (10 sec)  /  Keepalive not set
+    kp = re.search(r"Keepalive\s+(set(?:\s*\([^)]*\))?|not set)", block, re.I)
+    if kp:
+        d["Keepalive"] = kp.group(1)
+
+    # media type / link type:  link type is auto, media type is unknown
+    lt = re.search(r"link type is\s+([^\r\n,]+)", block, re.I)
+    if lt:
+        d["Link Type"] = lt.group(1).strip()
+    mt = re.search(r"media type is\s+([^\r\n,]+)", block, re.I)
+    if mt:
+        d["Media Type"] = mt.group(1).strip()
+
+    # input/output flow-control:  input flow-control is off, output flow-control is unsupported
+    ifc = re.search(r"input flow-control is\s+(\S+)", block, re.I)
+    if ifc:
+        d["Input Flow-Control"] = ifc.group(1).strip(",")
+    ofc = re.search(r"output flow-control is\s+(\S+)", block, re.I)
+    if ofc:
+        d["Output Flow-Control"] = ofc.group(1).strip(",")
+
+    # ARP type: ARPA, ARP Timeout 04:00:00
+    at = re.search(r"ARP type:\s*(\S+)", block, re.I)
+    if at:
+        d["ARP Type"] = at.group(1).strip(",")
+    ato = re.search(r"ARP Timeout\s+(\S+)", block, re.I)
+    if ato:
+        d["ARP Timeout"] = ato.group(1)
+
+    # Last input never, output never, output hang never
+    li = re.search(r"Last input\s+(\S+),\s*output\s+(\S+),\s*output hang\s+(\S+)",
+                   block, re.I)
+    if li:
+        d["Last Input"]  = li.group(1)
+        d["Last Output"] = li.group(2)
+        d["Output Hang"] = li.group(3)
+
+    # Last clearing of "show interface" counters 1w5d
+    lc = re.search(r'Last clearing of\s+"?show interface"?\s+counters\s+(\S+)',
+                   block, re.I)
+    if lc:
+        d["Last Counter Clear"] = lc.group(1)
+
+    # Input queue: 0/375/0/0 (size/max/drops/flushes); Total output drops: 0
+    mq = re.search(
+        r"Input queue:\s*\d+/\d+/(\d+)/\d+.*?Total output drops:\s*(\d+)",
+        block, re.S)
+    if mq:
+        d["Input Queue Drops"]  = _int(mq.group(1))
+        d["Total Output Drops"] = _int(mq.group(2))
+    else:
+        miq = re.search(r"Input queue:\s*\d+/\d+/(\d+)/\d+", block)
+        if miq:
+            d["Input Queue Drops"] = _int(miq.group(1))
+        mtod = re.search(r"Total output drops:\s*(\d+)", block)
+        if mtod:
+            d["Total Output Drops"] = _int(mtod.group(1))
+
+    # Queueing strategy: fifo
+    qs = re.search(r"Queueing strategy:\s*(\S+)", block, re.I)
+    if qs:
+        d["Queueing Strategy"] = qs.group(1)
+
+    # Output queue: 0/40 (size/max)
+    oq = re.search(r"Output queue:\s*(\d+)/(\d+)", block, re.I)
+    if oq:
+        d["Output Queue Size"] = _int(oq.group(1))
+        d["Output Queue Max"]  = _int(oq.group(2))
+
+    # Speed / Duplex from hardware capability line
+    hw = re.search(
+        r"((?:Full|Half|Auto|a-full|a-half)[- ]duplex),\s*"
+        r"((?:Auto-speed|[\d.]+\s*\S+b/s|[\d.]+\S*))",
+        block, re.I)
+    if hw:
+        d["Duplex"] = hw.group(1)
+        d["Speed"]  = hw.group(2)
+
+    # 5-minute rates — input then output
+    rates = re.findall(r"(\d[\d,]*)\s+bits/sec,\s+(\d[\d,]*)\s+packets/sec", block)
+    if len(rates) >= 1:
+        d["In Rate (bps)"]  = _int(rates[0][0])
+        d["In Rate (pps)"]  = _int(rates[0][1])
+    if len(rates) >= 2:
+        d["Out Rate (bps)"] = _int(rates[1][0])
+        d["Out Rate (pps)"] = _int(rates[1][1])
+
+    # Input packets / bytes / no-buffer
+    m2 = re.search(
+        r"(\d[\d,]*)\s+packets input,\s+(\d[\d,]*)\s+bytes,\s+(\d[\d,]*)\s+no buffer",
+        block)
+    if m2:
+        d["Pkts In"]   = _int(m2.group(1))
+        d["Bytes In"]  = _int(m2.group(2))
+        d["No Buffer"] = _int(m2.group(3))
+
+    # Received N broadcasts (M multicasts)
+    rb = re.search(r"Received\s+(\d[\d,]*)\s+broadcasts\s*\(\s*(\d[\d,]*)\s+multicasts?\)",
+                   block, re.I)
+    if rb:
+        d["Rx Broadcasts"] = _int(rb.group(1))
+        d["Rx Multicasts"] = _int(rb.group(2))
+
+    # runts / giants / throttles
+    m5 = re.search(
+        r"(\d[\d,]*)\s+runts,\s+(\d[\d,]*)\s+giants,\s+(\d[\d,]*)\s+throttles",
+        block)
+    if m5:
+        d["Runts"]     = _int(m5.group(1))
+        d["Giants"]    = _int(m5.group(2))
+        d["Throttles"] = _int(m5.group(3))
+
+    # input errors, CRC, frame, overrun, ignored
+    m4 = re.search(
+        r"(\d[\d,]*)\s+input errors,\s+(\d[\d,]*)\s+CRC,\s+"
+        r"(\d[\d,]*)\s+frame,\s+(\d[\d,]*)\s+overrun,\s+(\d[\d,]*)\s+ignored",
+        block)
+    if m4:
+        d["Input Errors"] = _int(m4.group(1))
+        d["CRC"]          = _int(m4.group(2))
+        d["Frame"]        = _int(m4.group(3))
+        d["Overruns"]     = _int(m4.group(4))
+        d["Ignored"]      = _int(m4.group(5))
+
+    # watchdog, multicast, pause input
+    m_wd = re.search(
+        r"(\d[\d,]*)\s+watchdog,\s+(\d[\d,]*)\s+multicast,\s+(\d[\d,]*)\s+pause input",
+        block, re.I)
+    if m_wd:
+        d["Watchdog"]        = _int(m_wd.group(1))
+        d["Input Multicast"] = _int(m_wd.group(2))
+        d["Pause Input"]     = _int(m_wd.group(3))
+
+    # input packets with dribble condition detected
+    m6 = re.search(r"(\d[\d,]*)\s+input packets with dribble", block)
+    if m6:
+        d["Dribble"] = _int(m6.group(1))
+
+    # Output packets / bytes
+    m3 = re.search(r"(\d[\d,]*)\s+packets output,\s+(\d[\d,]*)\s+bytes", block)
+    if m3:
+        d["Pkts Out"]  = _int(m3.group(1))
+        d["Bytes Out"] = _int(m3.group(2))
+
+    # Output N broadcasts (M multicasts)
+    ob = re.search(r"Output\s+(\d[\d,]*)\s+broadcasts\s*\(\s*(\d[\d,]*)\s+multicasts?\)",
+                   block, re.I)
+    if ob:
+        d["Tx Broadcasts"] = _int(ob.group(1))
+        d["Tx Multicasts"] = _int(ob.group(2))
+
+    # output errors, collisions, interface resets
+    m7 = re.search(
+        r"(\d[\d,]*)\s+output errors,\s+(\d[\d,]*)\s+collisions,\s+"
+        r"(\d[\d,]*)\s+interface resets",
+        block)
+    if m7:
+        d["Output Errors"] = _int(m7.group(1))
+        d["Collisions"]    = _int(m7.group(2))
+        d["Intf Resets"]   = _int(m7.group(3))
+
+    # unknown protocol drops
+    m8 = re.search(r"(\d[\d,]*)\s+unknown protocol drops", block)
+    if m8:
+        d["Unknown Proto Drops"] = _int(m8.group(1))
+
+    # babbles, late collision, deferred
+    m10 = re.search(
+        r"(\d[\d,]*)\s+babbles,\s+(\d[\d,]*)\s+late collision,\s+(\d[\d,]*)\s+deferred",
+        block, re.I)
+    if m10:
+        d["Babbles"]        = _int(m10.group(1))
+        d["Late Collision"] = _int(m10.group(2))
+        d["Deferred"]       = _int(m10.group(3))
+
+    # lost carrier, no carrier, pause output
+    m11 = re.search(
+        r"(\d[\d,]*)\s+lost carrier,\s+(\d[\d,]*)\s+no carrier"
+        r"(?:,\s+(\d[\d,]*)\s+pause output)?",
+        block, re.I)
+    if m11:
+        d["Lost Carrier"] = _int(m11.group(1))
+        d["No Carrier"]   = _int(m11.group(2))
+        if m11.group(3) is not None:
+            d["Pause Output"] = _int(m11.group(3))
+
+    # output buffer failures, output buffers swapped out
+    m9 = re.search(
+        r"(\d[\d,]*)\s+output buffer failures,\s+(\d[\d,]*)\s+output buffers swapped out",
+        block)
+    if m9:
+        d["Out Buffer Failures"] = _int(m9.group(1))
+        d["Out Bufs Swapped"]    = _int(m9.group(2))
+
+    return d
+
+
+def parse_intf_full(intf_full_out, up_keys, show_intf_map=None):
+    """
+    Parses per-interface 'show interface <intf>' output for every interface in
+    up_keys.  Returns {intf_key: {field: value}}.
+
+    Preference order for each interface's source block:
+      1. The per-interface 'show interface X human-readable' output in
+         show_intf_map (richer / cleaner — the primary source).
+      2. Fallback: that interface's block sliced from the device-wide
+         'show interfaces' dump (intf_full_out), for anything missing.
+    """
+    show_intf_map = show_intf_map or {}
     result = {}
 
+    # First: parse each per-interface human-readable block (primary source).
+    for key, text in show_intf_map.items():
+        if key not in up_keys:
+            continue
+        if text and text.strip():
+            result[key] = _parse_one_intf_block(text)
+
+    # Second: parse the device-wide 'show interfaces' dump to fill any gaps
+    # (interfaces missing from show_intf_map, or fields the per-intf output
+    # somehow lacked).
+    blocks = re.split(r"\n(?=[A-Za-z])", intf_full_out)
     for block in blocks:
         lines = block.splitlines()
         if not lines:
             continue
-        m = re.match(r"^(\S+)\s+is\s+(up|down|administratively down)", lines[0], re.I)
+        m = re.match(r"^(\S+)\s+is\s+(up|down|administratively down|deleted)",
+                     lines[0], re.I)
         if not m:
             continue
         key = intf_key(m.group(1))
         if key not in up_keys:
             continue
-
-        d = {}
-
-        # Description
-        dm = re.search(r"Description:\s*(.*)", block)
-        d["Description"] = dm.group(1).strip() if dm else ""
-
-        # Input queue drops + Total output drops
-        #   Input queue: <size>/<max>/<drops>/<flushes> (size/max/drops/flushes);
-        #       Total output drops: <n>
-        # On some IOS-XE versions 'Total output drops' wraps to the next line,
-        # so re.S lets '.' span the newline; '.*?' is non-greedy to stop at the
-        # first 'Total output drops'. The Input queue 3rd field is the drop count.
-        mq = re.search(
-            r"Input queue:\s*\d+/\d+/(\d+)/\d+.*?Total output drops:\s*(\d+)",
-            block, re.S)
-        if mq:
-            d["Input Queue Drops"]  = _int(mq.group(1))
-            d["Total Output Drops"] = _int(mq.group(2))
+        parsed = _parse_one_intf_block(block)
+        if key in result:
+            # Fill only missing / empty fields, keep human-readable values.
+            for f, v in parsed.items():
+                if f not in result[key] or result[key][f] in ("", None):
+                    result[key][f] = v
         else:
-            # Fall back to matching each independently in case the line format
-            # differs (e.g. platforms that omit one of the two).
-            miq = re.search(r"Input queue:\s*\d+/\d+/(\d+)/\d+", block)
-            if miq:
-                d["Input Queue Drops"] = _int(miq.group(1))
-            mtod = re.search(r"Total output drops:\s*(\d+)", block)
-            if mtod:
-                d["Total Output Drops"] = _int(mtod.group(1))
-
-        # Speed / Duplex from hardware capability line
-        hw = re.search(
-            r"((?:Full|Half|Auto|a-full|a-half)[- ]duplex),\s*([\d.]+\s*\S+b/s)",
-            block, re.I)
-        if hw:
-            d["Duplex"] = hw.group(1)
-            d["Speed"]  = hw.group(2)
-
-        # 5-minute rates — two occurrences (input then output)
-        rates = re.findall(r"(\d[\d,]*)\s+bits/sec,\s+(\d[\d,]*)\s+packets/sec", block)
-        if len(rates) >= 1:
-            d["In Rate (bps)"]  = _int(rates[0][0])
-            d["In Rate (pps)"]  = _int(rates[0][1])
-        if len(rates) >= 2:
-            d["Out Rate (bps)"] = _int(rates[1][0])
-            d["Out Rate (pps)"] = _int(rates[1][1])
-
-        # Input packets / bytes / no-buffer
-        m2 = re.search(
-            r"(\d[\d,]*)\s+packets input,\s+(\d[\d,]*)\s+bytes,\s+(\d[\d,]*)\s+no buffer",
-            block)
-        if m2:
-            d["Pkts In"]   = _int(m2.group(1))
-            d["Bytes In"]  = _int(m2.group(2))
-            d["No Buffer"] = _int(m2.group(3))
-
-        # Output packets / bytes
-        m3 = re.search(r"(\d[\d,]*)\s+packets output,\s+(\d[\d,]*)\s+bytes", block)
-        if m3:
-            d["Pkts Out"]  = _int(m3.group(1))
-            d["Bytes Out"] = _int(m3.group(2))
-
-        # Input errors
-        m4 = re.search(
-            r"(\d[\d,]*)\s+input errors,\s+(\d[\d,]*)\s+CRC,\s+"
-            r"(\d[\d,]*)\s+frame,\s+(\d[\d,]*)\s+overrun,\s+(\d[\d,]*)\s+ignored",
-            block)
-        if m4:
-            d["Input Errors"] = _int(m4.group(1))
-            d["CRC"]          = _int(m4.group(2))
-            d["Frame"]        = _int(m4.group(3))
-            d["Overruns"]     = _int(m4.group(4))
-            d["Ignored"]      = _int(m4.group(5))
-
-        # Runts / giants / throttles
-        m5 = re.search(
-            r"(\d[\d,]*)\s+runts,\s+(\d[\d,]*)\s+giants,\s+(\d[\d,]*)\s+throttles",
-            block)
-        if m5:
-            d["Runts"]     = _int(m5.group(1))
-            d["Giants"]    = _int(m5.group(2))
-            d["Throttles"] = _int(m5.group(3))
-
-        # Dribble
-        m6 = re.search(r"(\d[\d,]*)\s+input packets with dribble", block)
-        if m6:
-            d["Dribble"] = _int(m6.group(1))
-
-        # Output errors / collisions / resets
-        m7 = re.search(
-            r"(\d[\d,]*)\s+output errors,\s+(\d[\d,]*)\s+collisions,\s+"
-            r"(\d[\d,]*)\s+interface resets",
-            block)
-        if m7:
-            d["Output Errors"] = _int(m7.group(1))
-            d["Collisions"]    = _int(m7.group(2))
-            d["Intf Resets"]   = _int(m7.group(3))
-
-        # Unknown protocol drops
-        m8 = re.search(r"(\d[\d,]*)\s+unknown protocol drops", block)
-        if m8:
-            d["Unknown Proto Drops"] = _int(m8.group(1))
-
-        # Output buffer failures / swapped
-        m9 = re.search(
-            r"(\d[\d,]*)\s+output buffer failures,\s+(\d[\d,]*)\s+output buffers swapped out",
-            block)
-        if m9:
-            d["Out Buffer Failures"] = _int(m9.group(1))
-            d["Out Bufs Swapped"]    = _int(m9.group(2))
-
-        # Babbles / late collision / deferred
-        m10 = re.search(
-            r"(\d[\d,]*)\s+babbles,\s+(\d[\d,]*)\s+late collision,\s+(\d[\d,]*)\s+deferred",
-            block)
-        if m10:
-            d["Late Collision"] = _int(m10.group(2))
-            d["Deferred"]       = _int(m10.group(3))
-
-        # Lost / no carrier
-        m11 = re.search(r"(\d[\d,]*)\s+lost carrier,\s+(\d[\d,]*)\s+no carrier", block)
-        if m11:
-            d["Lost Carrier"] = _int(m11.group(1))
-            d["No Carrier"]   = _int(m11.group(2))
-
-        result[key] = d
+            result[key] = parsed
 
     return result
 
@@ -1185,6 +1444,79 @@ def parse_intf_counters_errors(intf_errs_out):
         elif section == 3 and len(parts) >= 2:
             result[key]["Oversize"] = _int(parts[1])
 
+    return result
+
+
+def slice_counters_errors(intf_errs_out):
+    """
+    Produces a VERBATIM per-interface slice of 'show interfaces counters errors'.
+
+    The command output is device-wide with up to three sub-tables (Align-Err,
+    Single-Col, OverSize). For each interface we stitch together the header line
+    of every sub-table plus that interface's own data line from each sub-table,
+    so the cell reads like a mini per-port version of the original command:
+
+        Port      Align-Err  FCS-Err  Xmit-Err  Rcv-Err  UnderSize  OutDiscards
+        Twe1/0/1          0        0         0        0          0            0
+
+        Port      Single-Col  Multi-Col  Late-Col  Excess-Col  Carri-Sen  Runts
+        Twe1/0/1           0          0         0           0          0      0
+
+        Port      OverSize
+        Twe1/0/1         0
+
+    Returns { intf_key: "verbatim multi-line slice" }.
+    Lines are kept exactly as the device printed them (no re-formatting).
+    """
+    # Detect the header line that introduces each sub-table.
+    HDR1 = re.compile(r"Align-Err",  re.I)
+    HDR2 = re.compile(r"Single-Col", re.I)
+    HDR3 = re.compile(r"^\s*Port\s+OverSize\s*$", re.I)
+
+    # First pass: capture each sub-table's header line and its per-port data
+    # lines, keyed by the interface on that line.
+    sections = []            # list of (header_line, {intf_key: data_line})
+    cur_header = None
+    cur_rows   = {}
+
+    def _flush():
+        if cur_header is not None:
+            sections.append((cur_header, cur_rows))
+
+    for raw in intf_errs_out.splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        if HDR1.search(s) or HDR2.search(s) or HDR3.match(s):
+            # New sub-table header — flush the previous one
+            _flush()
+            cur_header = raw.rstrip()
+            cur_rows   = {}
+            continue
+        if re.match(r"^-+$", s):
+            continue
+        parts = s.split()
+        if len(parts) < 2:
+            continue
+        # A data line: first token is the port
+        key = intf_key(parts[0])
+        if cur_header is not None:
+            cur_rows[key] = raw.rstrip()
+    _flush()
+
+    # Second pass: for every interface seen anywhere, assemble its slice.
+    all_keys = set()
+    for _hdr, rows in sections:
+        all_keys.update(rows.keys())
+
+    result = {}
+    for key in all_keys:
+        blocks = []
+        for hdr, rows in sections:
+            if key in rows:
+                blocks.append(f"{hdr}\n{rows[key]}")
+        if blocks:
+            result[key] = "\n\n".join(blocks)
     return result
 
 
@@ -1729,7 +2061,8 @@ def assemble_rows(up_map, raw_cmds):
     """
     status_map  = parse_intf_status(raw_cmds["intf_status"])
     trunk_map   = parse_trunk_ports(raw_cmds["intf_trunk"])
-    counter_map = parse_intf_full(raw_cmds["intf_full"], set(up_map.keys()))
+    counter_map = parse_intf_full(raw_cmds["intf_full"], set(up_map.keys()),
+                                  raw_cmds.get("show_intf", {}))
 
     # ── Error counters: DELTA between final and baseline snapshots ──────────
     # On Cat9k IOS-XE 'clear counters' does NOT reset the hardware table
@@ -1811,17 +2144,35 @@ def assemble_rows(up_map, raw_cmds):
             row["Native VLAN"]   = ""
             row["Allowed VLANs"] = st.get("vlan", "")
 
-        # Counters from show interfaces
+        # Line / protocol state + physical properties (from show interface <intf>)
+        for col in [
+            "Line Status", "Protocol Status", "MAC Address", "BIA",
+            "MTU (bytes)", "BW (Kbit/s)", "DLY (usec)",
+            "Reliability", "TxLoad", "RxLoad",
+            "Encapsulation", "Loopback", "Keepalive",
+            "Media Type", "Link Type",
+            "Input Flow-Control", "Output Flow-Control",
+            "ARP Type", "ARP Timeout",
+            "Last Input", "Last Output", "Output Hang", "Last Counter Clear",
+            "Queueing Strategy", "Output Queue Size", "Output Queue Max",
+        ]:
+            row[col] = ctr.get(col, "")
+
+        # Counters from show interface <intf> (numeric — default 0)
         for col in [
             "In Rate (bps)", "In Rate (pps)", "Out Rate (bps)", "Out Rate (pps)",
             "Pkts In", "Bytes In", "No Buffer",
+            "Rx Broadcasts", "Rx Multicasts",
             "Input Queue Drops", "Total Output Drops",
             "Input Errors", "CRC", "Frame", "Overruns", "Ignored",
+            "Watchdog", "Input Multicast", "Pause Input",
             "Runts", "Giants", "Throttles", "Dribble",
             "Pkts Out", "Bytes Out",
+            "Tx Broadcasts", "Tx Multicasts",
             "Output Errors", "Collisions", "Intf Resets",
             "Unknown Proto Drops", "Out Buffer Failures", "Out Bufs Swapped",
-            "Late Collision", "Deferred", "Lost Carrier", "No Carrier",
+            "Babbles", "Late Collision", "Deferred",
+            "Lost Carrier", "No Carrier", "Pause Output",
         ]:
             row[col] = ctr.get(col, 0)
 
